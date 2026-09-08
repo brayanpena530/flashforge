@@ -317,3 +317,225 @@ def plot_cache(sweep: pd.DataFrame, *, total_slots: int | None = None):
         fig, ax, "Cache hit rate vs capacity  ·  belady is the ceiling", ncols=len(present)
     )
     return fig
+
+
+def plot_predictability_groups(
+    by_group: pd.DataFrame,
+    top_k: int,
+    *,
+    budget_mult: int = 1,
+    required_lookahead: int | None = None,
+):
+    """Q3, split by layer band. One panel per band, lines per predictor.
+
+    The reason this exists beside `plot_predictability` is that the stack-wide
+    average is the wrong summary when the bands disagree. Panels share a y-axis
+    so the bands can be compared by eye.
+
+    `required_lookahead` draws Q8's answer on top: how many layers of compute
+    it takes to hide one disk read. Where a band's curve has already collapsed
+    by that line, per-layer prediction cannot cover a disk tier there.
+    """
+    subset = by_group[by_group["budget_mult"] == budget_mult]
+    groups = [g for g in ("input", "middle", "output") if g in set(subset["src_group"])]
+    if not groups:
+        groups = sorted(set(subset["src_group"]))
+
+    fig, axes = plt.subplots(
+        1, len(groups), figsize=(4.4 * len(groups), 4.1), sharey=True, squeeze=False
+    )
+    order = ["prior", "identity", "stale_router", "probe"]
+    present = [name for name in order if name in set(subset["predictor"])]
+    offsets = sorted(subset["offset"].unique())
+
+    handles: list = []
+    for column, group in enumerate(groups):
+        ax = axes[0][column]
+        band = subset[subset["src_group"] == group]
+        labels = []
+        for slot, name in enumerate(present):
+            series = band[band["predictor"] == name].sort_values("offset")
+            if series.empty:
+                continue
+            color = viz.SERIES[slot % len(viz.SERIES)]
+            line, = ax.plot(
+                series["offset"], series["recall"], color=color, marker="o", label=name
+            )
+            if column == 0:
+                handles.append(line)
+            labels.append(
+                (series["offset"].to_numpy()[-1], series["recall"].to_numpy()[-1], name, color)
+            )
+
+        if required_lookahead and offsets and required_lookahead >= min(offsets):
+            ax.axvline(
+                required_lookahead, color=viz.BASELINE, linewidth=1.0, linestyle=(0, (4, 3))
+            )
+            # Only the first panel gets the words; three copies would crowd the
+            # lines without adding anything. Horizontal and pinned to the floor
+            # of the axes: rotated text here runs straight up through the band
+            # where the end-labels sit. Side is chosen so the text stays inside
+            # the panel when the line lands near the right edge.
+            if column == 0:
+                near_right = required_lookahead >= max(offsets)
+                ax.annotate(
+                    f"disk read ≈ {required_lookahead} layers",
+                    xy=(required_lookahead, 0.015),
+                    xytext=(-6 if near_right else 6, 0),
+                    textcoords="offset points",
+                    ha="right" if near_right else "left",
+                    va="bottom",
+                    fontsize=9,
+                    color=viz.INK_MUTED,
+                )
+
+        ax.set_xlabel("lookahead (layers ahead predicted)")
+        ax.set_title(f"{group} layers")
+        ax.set_ylim(0, 1.02)
+        ax.set_xticks(offsets)
+        ax.margins(x=0.28)
+        viz.label_line_ends(ax, labels)
+        if column == 0:
+            ax.set_ylabel("recall of true top-k")
+
+    fig.legend(
+        handles=handles,
+        loc="outside upper left",
+        ncols=max(1, len(handles)),
+        frameon=False,
+        columnspacing=1.6,
+        handlelength=1.6,
+    )
+    return fig
+
+
+def plot_cost_model(
+    cpu_curve: pd.DataFrame,
+    fit,
+    *,
+    gpu_path_ms: float | None = None,
+    break_even: float | None = None,
+    gpu_curve: pd.DataFrame | None = None,
+):
+    """Q7. CPU cost rising with token count against a flat GPU path.
+
+    The crossing is the chart's whole content: left of it an expert is cheaper
+    computed in place, right of it cheaper shipped across the bus. The right
+    panel is there to let you judge whether the linear fit deserves belief —
+    per-token cost should flatten out, and a kink means a regime change inside
+    the range that a single beta cannot represent.
+    """
+    fig, (left, right) = plt.subplots(1, 2, figsize=(10.4, 4.0))
+
+    tokens = cpu_curve["tokens"].to_numpy(float)
+
+    left.plot(tokens, cpu_curve["ms"].to_numpy(float),
+              color=viz.SERIES[0], marker="o", label="CPU, measured")
+    left.plot(
+        tokens, fit.beta_ms_per_token * tokens + fit.const_ms,
+        color=viz.SERIES[0], linewidth=1.2, linestyle=(0, (4, 3)),
+        label=f"fit  r2={fit.r_squared:.3f}",
+    )
+
+    if gpu_curve is not None and not gpu_curve.empty:
+        left.plot(gpu_curve["tokens"], gpu_curve["ms"],
+                  color=viz.SERIES[2], marker="o", label="GPU compute")
+
+    if gpu_path_ms is not None:
+        left.axhline(gpu_path_ms, color=viz.SERIES[1], linewidth=2.0)
+        left.annotate(
+            f"GPU path (transfer + compute)  {gpu_path_ms:.2f} ms",
+            xy=(tokens[0], gpu_path_ms),
+            xytext=(4, 6),
+            textcoords="offset points",
+            fontsize=9,
+            color=viz.INK_SECONDARY,
+        )
+
+    if break_even and np.isfinite(break_even) and tokens.min() <= break_even <= tokens.max():
+        left.axvline(break_even, color=viz.BASELINE, linewidth=1.0, linestyle=(0, (4, 3)))
+        left.plot([break_even], [fit.predict(break_even)],
+                  marker="o", markersize=6, color=viz.INK_PRIMARY, zorder=6)
+        left.annotate(
+            f"break-even\nm* = {break_even:.0f} tokens",
+            xy=(break_even, fit.predict(break_even)),
+            xytext=(8, -4),
+            textcoords="offset points",
+            va="top",
+            fontsize=9,
+            color=viz.INK_SECONDARY,
+        )
+
+    left.set_xscale("log", base=2)
+    left.set_yscale("log")
+    left.set_xlabel("tokens routed to this expert (m)")
+    left.set_ylabel("milliseconds")
+    left.set_title("CPU cost is linear in m; the GPU path is flat")
+    left.legend(loc="upper left", fontsize=9)
+
+    right.plot(cpu_curve["tokens"], cpu_curve["ms_per_token"],
+               color=viz.SERIES[0], marker="o")
+    right.set_xscale("log", base=2)
+    right.set_yscale("log")
+    right.set_xlabel("tokens routed to this expert (m)")
+    right.set_ylabel("ms per token")
+    right.set_title("Per-token CPU cost — flattening means the fit holds")
+    return fig
+
+
+def plot_storage(curve: pd.DataFrame, knees: pd.DataFrame | None = None):
+    """Q8. Read bandwidth and latency against queue depth, per request size.
+
+    Bandwidth against queue depth is the diagnostic that separates a disk tier
+    from a PCIe tier. A flat line means depth-1 already saturates the device and
+    a serial cost model is fine. A rising line means it does not, and a
+    prefetcher issuing one expert at a time will leave most of the device unused
+    however good its predictions are.
+    """
+    fig, (left, right) = plt.subplots(1, 2, figsize=(10.4, 4.0))
+    sizes = sorted(curve["read_bytes"].unique())
+    depths = sorted(curve["queue_depth"].unique())
+
+    labels = []
+    for slot, size in enumerate(sizes):
+        series = curve[curve["read_bytes"] == size].sort_values("queue_depth")
+        color = viz.SERIES[slot % len(viz.SERIES)]
+        name = f"{size / (1 << 20):g} MiB"
+        left.plot(series["queue_depth"], series["gbps"], color=color, marker="o", label=name)
+        right.plot(series["queue_depth"], series["mean_ms"], color=color, marker="o", label=name)
+        labels.append(
+            (series["queue_depth"].to_numpy()[-1], series["gbps"].to_numpy()[-1], name, color)
+        )
+
+    if knees is not None and not knees.empty:
+        for size in sizes:
+            row = knees[knees["read_bytes"] == size]
+            if row.empty:
+                continue
+            knee = int(row["knee_queue_depth"].iloc[0])
+            match = curve[(curve["read_bytes"] == size) & (curve["queue_depth"] == knee)]
+            if match.empty:
+                continue
+            left.plot(
+                [knee], [float(match["gbps"].iloc[0])],
+                marker="s", markersize=9, markerfacecolor="none",
+                markeredgecolor=viz.INK_PRIMARY, markeredgewidth=1.2, zorder=6,
+            )
+
+    left.set_xscale("log", base=2)
+    left.set_xlabel("queue depth (concurrent reads)")
+    left.set_ylabel("GB/s")
+    left.set_title("Bandwidth vs queue depth  ·  squares mark 90% of peak")
+    left.set_xticks(depths)
+    left.margins(x=0.26)
+    left.set_ylim(bottom=0)
+    viz.label_line_ends(left, labels)
+
+    right.set_xscale("log", base=2)
+    right.set_yscale("log")
+    right.set_xlabel("queue depth (concurrent reads)")
+    right.set_ylabel("mean latency per read (ms)")
+    right.set_title("Latency is the price of depth")
+    right.set_xticks(depths)
+    right.legend(loc="upper left", fontsize=9, title="request size", title_fontsize=9)
+    return fig

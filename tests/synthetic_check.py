@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import matplotlib
 matplotlib.use("Agg")
 
-from flashforge import analysis, cachesim, plots, viz  # noqa: E402
+from flashforge import analysis, cachesim, hardware, plots, viz  # noqa: E402
 
 ROOT = Path(__file__).parent / "_synth_traces"
 E, K, L, H = 64, 8, 16, 128
@@ -55,8 +55,17 @@ for domain in DOMAINS:
 
         logits_by_layer, hidden_by_layer = {}, {}
         for layer in range(L):
-            # Layer-specific drift: correlated with, but not equal to, its neighbours.
-            drift = rng.normal(0, 0.12, (T, H)).astype(np.float32) * (layer + 1) ** 0.5
+            # Layer-specific drift: correlated with, but not equal to, its
+            # neighbours. The scale is U-shaped in depth — edge layers wander
+            # further from the shared base than middle layers do — which plants
+            # the layer-group structure Q3's band split exists to detect.
+            # Middle layers should therefore come out more cross-layer
+            # predictable than either end.
+            # The spread has to be wide to be visible: stale_router is also
+            # blind to the per-layer popularity term, and that error floor is
+            # layer-invariant. A narrow drift range gets lost underneath it.
+            edge = abs(layer / max(1, L - 1) - 0.5) * 2  # 1 at the ends, 0 mid-stack
+            drift = rng.normal(0, 0.05 + 1.0 * edge, (T, H)).astype(np.float32)
             hidden = base + drift
             logits = hidden @ gates[layer].T + popularity[layer] + domain_bias[domain][layer]
             hidden_by_layer[str(layer)] = hidden.astype(np.float16)
@@ -141,6 +150,62 @@ check("2x budget raises recall", at2["stale_router"] >= at1["stale_router"],
       f"1x {at1['stale_router']:.3f} -> 2x {at2['stale_router']:.3f}")
 check("all four predictors present", len(at1) == 4, f"{sorted(at1.index)}")
 plots.plot_predictability(summary, K).savefig(out / "q3.png")
+
+print("\nQ3 layer bands")
+bands = analysis.layer_groups(list(range(L)))
+check("bands partition the stack", set(bands) == set(range(L)),
+      f"{len(bands)} layers assigned")
+check("all three bands populated", set(bands.values()) == {"input", "middle", "output"},
+      f"{ {g: sum(v == g for v in bands.values()) for g in ('input','middle','output')} }")
+check("bands are contiguous in depth",
+      [bands[i] for i in range(L)] == sorted([bands[i] for i in range(L)],
+                                             key=lambda g: {"input": 0, "middle": 1, "output": 2}[g]),
+      "input -> middle -> output, no interleaving")
+check("short stacks degrade gracefully",
+      set(analysis.layer_groups([0, 1]).values()) == {"middle"},
+      "a 2-layer stack is all middle rather than an empty band")
+
+by_group = analysis.predictability_by_group(detail)
+check("group summary carries every band", set(by_group["src_group"]) <= {"input", "middle", "output"},
+      f"{sorted(set(by_group['src_group']))}")
+stale1 = by_group[(by_group.predictor == "stale_router") & (by_group.offset == 1)
+                  & (by_group.budget_mult == 1)].set_index("src_group")["recall"]
+# The generator plants exactly this: middle layers drift least, so they should
+# be the most predictable band. This is the positive control for the split —
+# without it, bucketing by band could be pure noise and nothing would notice.
+check("planted band structure recovered",
+      stale1["middle"] > max(stale1["input"], stale1["output"]),
+      f"middle {stale1['middle']:.3f} vs input {stale1['input']:.3f} / "
+      f"output {stale1['output']:.3f}")
+
+deep = analysis.cross_layer_predictability(store, offsets=(1, 2, 4, 8), max_tokens=6000)
+deep_summary = analysis.predictability_summary(deep)
+stale_by_offset = deep_summary[(deep_summary.predictor == "stale_router")
+                               & (deep_summary.budget_mult == 1)].set_index("offset")["recall"]
+check("deeper lookahead is reachable", 8 in stale_by_offset.index,
+      f"offsets measured: {sorted(stale_by_offset.index)}")
+check("accuracy decays with lookahead depth",
+      stale_by_offset[1] > stale_by_offset[8],
+      f"k=1 {stale_by_offset[1]:.3f} -> k=8 {stale_by_offset[8]:.3f}")
+
+reach = analysis.deepest_usable_lookahead(
+    analysis.predictability_by_group(deep), threshold=0.5)
+check("reach table covers every band", len(reach) == 3, f"{list(reach['src_group'])}")
+check("reach is bounded by the offsets swept",
+      bool((reach["deepest_offset"] <= 8).all()),
+      f"max {int(reach['deepest_offset'].max())}")
+# The output band physically cannot have an 8-layer-ahead pair — there is no
+# layer 8 past the end of the stack. That has to be reported as missing data,
+# not as a prediction failure, or the disk-tier verdict manufactures a ceiling
+# out of arithmetic.
+check("output band is limited by coverage, not accuracy",
+      reach.set_index("src_group").loc["output", "limited_by"] == "coverage",
+      f"output measured only to offset "
+      f"{int(reach.set_index('src_group').loc['output', 'deepest_offset_measured'])} of 8")
+check("mid-stack bands are judged on accuracy",
+      reach.set_index("src_group").loc["input", "limited_by"] in {"accuracy", "none"},
+      f"input limited_by={reach.set_index('src_group').loc['input', 'limited_by']}")
+plots.plot_predictability_groups(by_group, K, required_lookahead=4).savefig(out / "q3_groups.png")
 
 print("\nQ4 domain")
 # Positive and negative controls. The main synthetic trace gives every sequence
@@ -267,6 +332,94 @@ check("full capacity ~ perfect", pivot.loc[total_slots, "belady"] > 0.99,
 check("bytes/token column present", "fetch_bytes_per_token" in sweep.columns,
       f"{sweep['fetch_bytes_per_token'].min()/1e6:.1f}-{sweep['fetch_bytes_per_token'].max()/1e6:.1f} MB/token")
 plots.plot_cache(sweep, total_slots=total_slots).savefig(out / "q5.png")
+
+print("\nQ7 cost model")
+# The fit is checked against a curve with known coefficients, not against a
+# live measurement. A microbenchmark on a busy desktop is genuinely noisy —
+# asserting r2 on it would be testing whether the machine happened to be quiet,
+# which flakes and tells us nothing about the code.
+known = pd.DataFrame({"tokens": [1, 2, 4, 8, 16, 32, 64, 128, 256]})
+known["ms"] = 0.05 * known["tokens"] + 2.0
+exact = hardware.fit_linear_cost(known)
+check("fit recovers known coefficients",
+      abs(exact.beta_ms_per_token - 0.05) < 1e-9 and abs(exact.const_ms - 2.0) < 1e-9,
+      f"beta {exact.beta_ms_per_token:.6f} (0.05), const {exact.const_ms:.6f} (2.0)")
+check("noiseless fit is exact", abs(exact.r_squared - 1.0) < 1e-9, f"r2 {exact.r_squared:.6f}")
+
+noisy = known.copy()
+noisy["ms"] += np.random.default_rng(3).normal(0, 0.05, len(noisy))
+jittered = hardware.fit_linear_cost(noisy)
+check("fit is robust to small noise",
+      abs(jittered.beta_ms_per_token - 0.05) < 0.005 and jittered.r_squared > 0.99,
+      f"beta {jittered.beta_ms_per_token:.5f}, r2 {jittered.r_squared:.4f}")
+
+# The live curve is here to prove the harness runs and the shape is right, so
+# it is asserted only on direction — never on goodness of fit.
+cpu_curve = hardware.cpu_expert_curve(
+    256, 512, token_counts=(1, 4, 16, 64, 256), repeats=5, warmup=2)
+fit = hardware.fit_linear_cost(cpu_curve)
+check("cpu curve covers every token count", len(cpu_curve) == 5, f"{list(cpu_curve['tokens'])}")
+check("cost rises with token count",
+      bool(np.all(np.diff(cpu_curve["ms"].to_numpy()) > 0)),
+      f"{[round(v, 3) for v in cpu_curve['ms']]} ms")
+check("beta is positive", fit.beta_ms_per_token > 0,
+      f"beta {fit.beta_ms_per_token:.5f} ms/token, const {fit.const_ms:.4f} ms")
+print(f"        (live r2 {fit.r_squared:.4f} — reported, not asserted; "
+      f"ff-bench warns below 0.95 on real shapes)")
+
+# Break-even is pure arithmetic, so it can be asserted exactly rather than
+# measured. t_c = 0.1m + 1.0 crosses a 5 ms GPU path at m = 40.
+synthetic_fit = hardware.LinearCost(0.1, 1.0, 1.0)
+check("break-even solves the crossing",
+      abs(hardware.break_even_tokens(synthetic_fit, 5.0) - 40.0) < 1e-9,
+      f"m* {hardware.break_even_tokens(synthetic_fit, 5.0):.1f} for t_c=0.1m+1 vs 5ms")
+check("break-even clamps at zero when the GPU always wins",
+      hardware.break_even_tokens(synthetic_fit, 0.5) == 0.0,
+      "a GPU path cheaper than the CPU's startup cost yields m*=0")
+check("expert bytes match the SwiGLU triple",
+      hardware.expert_bytes(2048, 1024, 2.0) == 3 * 2048 * 1024 * 2,
+      f"{hardware.expert_bytes(2048, 1024, 2.0) / 1e6:.1f} MB for OLMoE at fp16")
+plots.plot_cost_model(cpu_curve, fit, gpu_path_ms=float(cpu_curve["ms"].median()),
+                      break_even=hardware.break_even_tokens(
+                          fit, float(cpu_curve["ms"].median()))
+                      ).savefig(out / "q7.png")
+
+print("\nQ8 storage curve")
+scratch = ROOT / "scratch.bin"
+storage = hardware.storage_read_curve(
+    scratch,
+    file_size_bytes=64 << 20,
+    read_sizes=(64 << 10, 1 << 20),
+    queue_depths=(1, 2, 4),
+    target_bytes_per_point=8 << 20,
+)
+knees = hardware.saturation_knee(storage)
+check("curve covers every size x depth", len(storage) == 6,
+      f"{len(storage)} rows, peak {storage['gbps'].max():.2f} GB/s")
+check("bandwidth is positive everywhere", bool((storage["gbps"] > 0).all()),
+      f"min {storage['gbps'].min():.2f} GB/s")
+check("latency rises with request size",
+      storage[storage.read_bytes == (1 << 20)]["mean_ms"].mean()
+      > storage[storage.read_bytes == (64 << 10)]["mean_ms"].mean(),
+      "1 MiB reads take longer than 64 KiB reads")
+check("percentiles are ordered", bool((storage["p99_ms"] >= storage["p50_ms"]).all()),
+      "p99 >= p50 on every row")
+check("knee is one of the depths swept",
+      bool(knees["knee_queue_depth"].isin([1, 2, 4]).all()),
+      f"knees {list(knees['knee_queue_depth'])}")
+check("knee row exists per read size", len(knees) == 2, f"{list(knees['read_mib'])}")
+
+disk_ms, provenance = hardware.disk_time_for_expert(storage, 12.6e6)
+check("disk time is positive and attributed", disk_ms > 0 and "queue_depth" in provenance,
+      f"{disk_ms:.2f} ms for a 12.6 MB expert, from "
+      f"{provenance['measured_read_bytes'] >> 10} KiB reads")
+check("required lookahead rounds up",
+      hardware.required_lookahead(10.0, 3.0) == 4,
+      "10 ms hidden behind 3 ms layers needs 4 layers, not 3")
+check("required lookahead is zero when the layer time is unknown",
+      hardware.required_lookahead(10.0, 0.0) == 0, "no division by zero")
+plots.plot_storage(storage, knees).savefig(out / "q8.png")
+scratch.unlink(missing_ok=True)
 
 print("\n" + "=" * 62)
 if failures:

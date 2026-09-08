@@ -36,6 +36,10 @@ class MoESpec:
     top_k: int
     hidden_size: int
     norm_topk_prob: bool
+    # Inner dimension of a single expert's FFN. Distinct from the dense
+    # intermediate_size on models that carry both; Q7 needs it to build an
+    # expert of the right shape, and it sets bytes-per-expert.
+    intermediate_size: int | None = None
     # (model layer index, the nn.Linear that produces router logits)
     gates: list[tuple[int, nn.Module]] = field(repr=False, default_factory=list)
 
@@ -47,10 +51,22 @@ class MoESpec:
     def n_moe_layers(self) -> int:
         return len(self.gates)
 
+    def expert_bytes(self, bytes_per_param: float = 2.0) -> float | None:
+        """Size of one expert's weights, or None if the FFN width is unknown.
+
+        Assumes the SwiGLU triple every model on the dev ladder uses:
+        gate_proj and up_proj are (intermediate x hidden), down_proj is
+        (hidden x intermediate).
+        """
+        if self.intermediate_size is None:
+            return None
+        return 3.0 * self.hidden_size * self.intermediate_size * bytes_per_param
+
     def describe(self) -> str:
+        ffn = f" | expert FFN {self.intermediate_size}" if self.intermediate_size else ""
         return (
             f"{self.n_moe_layers} MoE layers | {self.num_experts} experts/layer | "
-            f"top-{self.top_k} | hidden {self.hidden_size} | "
+            f"top-{self.top_k} | hidden {self.hidden_size}{ffn} | "
             f"{self.num_experts * self.n_moe_layers} distinct (layer, expert) slots"
         )
 
@@ -71,6 +87,12 @@ def discover_moe(model: nn.Module) -> MoESpec:
     top_k = _cfg_attr(config, ("num_experts_per_tok", "top_k", "moe_top_k"))
     hidden_size = _cfg_attr(config, ("hidden_size", "d_model"))
     norm_topk_prob = bool(_cfg_attr(config, ("norm_topk_prob",), default=False))
+    # moe_intermediate_size first: Qwen3-MoE and DeepSeek carry both, and the
+    # bare intermediate_size on those is the *dense* width, which is much
+    # larger and would overstate bytes-per-expert several-fold.
+    intermediate_size = _cfg_attr(
+        config, ("moe_intermediate_size", "expert_intermediate_size", "intermediate_size", "ffn_dim")
+    )
 
     if num_experts is None or top_k is None:
         raise ValueError(
@@ -107,6 +129,7 @@ def discover_moe(model: nn.Module) -> MoESpec:
         top_k=int(top_k),
         hidden_size=int(hidden_size),
         norm_topk_prob=norm_topk_prob,
+        intermediate_size=int(intermediate_size) if intermediate_size else None,
         gates=gates,
     )
 

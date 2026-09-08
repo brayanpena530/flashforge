@@ -23,7 +23,9 @@ changed rather than the design.
 
 ## Stage 0 — instrumentation
 
-Answers six questions, each of which gates a later design decision:
+Answers eight questions, each of which gates a later design decision. Q1–Q6
+measure the **model** and need a trace; Q7–Q8 measure the **machine** and need
+neither a trace nor a checkpoint.
 
 | | Question | Decides |
 |---|---|---|
@@ -33,6 +35,8 @@ Answers six questions, each of which gates a later design decision:
 | **Q4** | Does usage cluster by domain? | whether per-conversation cache warming pays |
 | **Q5** | Hit rate vs capacity, incl. Belady | how much headroom any online policy has |
 | **Q6** | How fast does the expert set grow with block size? | whether batching/speculation amortises loads |
+| **Q7** | What does one expert cost on CPU, GPU and PCIe? | where the CPU/GPU placement line falls |
+| **Q8** | How fast is a read off disk, and at what queue depth? | whether a disk tier can ever be hidden |
 
 **Q3 is the one that decides the project.** Prefetch only pays if you have lead
 time: predicting layer *N+k* at layer *N* buys *k* layers of compute to hide the
@@ -49,6 +53,23 @@ Four predictors are compared, cheapest first:
   one to beat, and often the one to ship.
 - `probe` — ridge regression from hidden state to routing probabilities. An
   approximate ceiling on a learned predictor of this size.
+
+Q3 reports recall **per layer band**, not as one stack-wide average.
+Predictability is not uniform with depth: near-input and near-output layers
+have skewed routing weights and hidden states that shift sharply between
+layers, while middle layers hold a nearly stable hidden state and lean on a
+small set of hot experts. A single averaged number blends those regimes, and a
+predictor that is strong through the middle half with weak ends looks merely
+mediocre — which is the wrong conclusion, and points at the wrong fix. Band
+boundaries are a parameter (`--edge-fraction`), because no published rule fixes
+them.
+
+The offset sweep runs to 8 by default rather than 4. Lookahead depth is not a
+free choice; it is set by what you are hiding behind it. One layer of compute
+covers a PCIe transfer, which is why a one-layer horizon is enough today. A
+disk read is several times slower and needs a proportionally deeper horizon.
+**Q8 measures that ratio and Q3 says whether prediction survives out that far** —
+see the disk-tier section below.
 
 Q5 includes **Belady's optimal** because it bounds every online policy. If LRU
 already sits near Belady, eviction is a dead end and the effort belongs in
@@ -70,6 +91,60 @@ Q3 and Q6 together set the shape of Stage 1:
 |---|---|---|
 | **predictable** | block-ahead prefetch, large lookahead | per-token prefetch, small lookahead |
 | **unpredictable** | batch anyway — reuse carries it | eviction and pinning only |
+
+## Q7 and Q8 — measuring the machine
+
+Q1–Q6 answer "does the model's routing have exploitable structure?". Neither
+answers "what does exploiting it actually cost here?", and every scheduling
+decision in Stage 1 turns on constants that are properties of *this* box.
+
+**Q7 — the cost model.** A hybrid CPU/GPU runtime chooses, per expert, between
+shipping it across PCIe and running it in place on the CPU. GPU cost is roughly
+flat in token count (the transfer dominates); CPU cost is linear,
+`t_c = β·m + C`. Those lines cross at some **m\***, and m\* is the number the
+whole placement policy resolves against. Below it, an expert is cheaper
+computed in place — and every expert you keep on the CPU frees a PCIe slot for
+a prefetch, which is what makes prefetching a budgeted decision rather than a
+heuristic.
+
+Q7 also measures the transfer three ways — pageable, pinned, and split across
+three CUDA streams — because a scheduler that plans against `t_io` needs
+`t_io` to be a number it can trust.
+
+**Q8 — the storage curve.** Read bandwidth and latency against request size and
+queue depth. The headline is not peak bandwidth, it is **the queue depth at
+which you reach peak**. PCIe saturates at depth 1, which is why serial-I/O cost
+models work for it. NVMe does not: a single outstanding read leaves the device
+mostly idle. If the knee is at 8, a prefetcher that issues one expert at a time
+cannot use the drive no matter how good its predictions are, and the disk tier
+needs batched requests — a different scheduling shape, not the same one scaled
+down.
+
+The two combine into one number: `t_disk / t_layer`, rounded up, is how many
+layers of lookahead a disk read needs to hide behind. `ff-bench` writes it to
+`hardware.json`, `ff-analyze` picks it up automatically and draws it on the Q3
+chart. Where a band's curve has already collapsed by that line, per-layer
+routing prediction cannot cover a disk tier there, and the disk→RAM decision
+needs a longer-horizon signal instead — block-level speculation, or Q4's domain
+warming.
+
+Two ways to be misled, both of which the tooling shouts about:
+
+- **The page cache.** A scratch file smaller than your RAM is read from DRAM,
+  and the resulting figure lands comfortably inside the plausible range for a
+  good NVMe drive. `ff-bench` compares the file size against physical RAM and
+  marks the run untrusted in both the console output and `hardware.json`. Pass
+  `--file-size-gb` above your RAM for numbers you intend to design against.
+- **Bands that ran out of layers.** You cannot look 8 layers past the end of
+  the stack, so the output band has no deep-offset pairs. That is missing data,
+  not a prediction failure; the reach table reports it as `limited_by=coverage`
+  and the disk verdict excludes those bands rather than manufacturing a ceiling
+  out of arithmetic.
+
+β is measured in fp32, since CPU fp16 GEMM is emulated in most builds and would
+time the emulation. A production CPU path would use a quantised kernel and beat
+it, so the fitted β is an **upper bound** — which makes any "CPU execution is
+worth it" conclusion drawn from it conservative.
 
 ## Setup
 
@@ -100,8 +175,18 @@ uv run ff-collect --out traces/olmoe
 ```
 
 ```bash
+uv run ff-bench --traces traces/olmoe --file-size-gb 48
+```
+
+```bash
 uv run ff-analyze --traces traces/olmoe --bytes-per-expert 12.6e6
 ```
+
+Run `ff-bench` before `ff-analyze`: it drops `hardware.json` in the report
+directory, and `ff-analyze` reads the required lookahead depth from it so Q3
+and Q8 can be read against each other without copying numbers by hand. It needs
+no trace of its own — `--traces` is only there to pick up the expert's shape,
+and `--hidden-size` / `--intermediate-size` work instead.
 
 `ff-analyze` writes CSVs and charts to `traces/olmoe/report/` and prints a
 verdict line for each question. `--bytes-per-expert` turns hit rates into
@@ -110,12 +195,19 @@ per token — the number that actually matters.
 
 Useful flags:
 
-| Flag | Effect |
-|---|---|
-| `--gen-tokens N` | also capture real greedy decode steps (true serving access pattern) |
-| `--load-4bit` | ~4GB instead of ~14GB, much faster iteration, **perturbs routing** |
-| `--no-hidden` | skip hidden states, disables Q3 |
-| `--prompts file.jsonl` | your own corpus: `{"id":…, "domain":…, "text":…}` per line |
+| Flag | Command | Effect |
+|---|---|---|
+| `--gen-tokens N` | collect | also capture real greedy decode steps (true serving access pattern) |
+| `--load-4bit` | collect | ~4GB instead of ~14GB, much faster iteration, **perturbs routing** |
+| `--no-hidden` | collect | skip hidden states, disables Q3 |
+| `--prompts file.jsonl` | collect | your own corpus: `{"id":…, "domain":…, "text":…}` per line |
+| `--q3-offsets 1,2,4,8` | analyze | lookahead depths to sweep |
+| `--edge-fraction 0.25` | analyze | share of layers in each of the input/output bands |
+| `--required-lookahead N` | analyze | draw this depth on the Q3 chart (default: from `hardware.json`) |
+| `--file-size-gb N` | bench | scratch file size. **Must exceed your RAM** or Q8 measures the page cache |
+| `--layer-time-ms X` | bench | measured per-layer decode time; without it, a conservative floor is used |
+| `--skip-q7` / `--skip-q8` | bench | run one half only |
+| `--remove-scratch` | bench | delete the scratch file afterwards (recreated next run) |
 
 The built-in prompt set is a starting point sized for a few thousand tokens.
 For numbers you intend to trust, point `--prompts` at a real corpus — a couple
@@ -128,9 +220,20 @@ uv run python tests/synthetic_check.py
 ```
 
 Builds a synthetic trace with known planted structure and asserts each analysis
-recovers it — no download, no GPU, ~2 minutes. Q4 runs a positive **and** a
-negative control, so the metric has to discriminate rather than always answer
-"yes". Run it after touching `analysis.py`, `cachesim.py`, or `plots.py`.
+recovers it — no download, no GPU, ~2 minutes. Run it after touching
+`analysis.py`, `hardware.py`, `cachesim.py`, or `plots.py`.
+
+The controls are the point. Q4 runs a positive **and** a negative control, so
+the metric has to discriminate rather than always answer "yes". Q3's band split
+has a planted U-shaped drift — edge layers wander further from the shared base
+than middle ones — so the split has to recover a known ordering rather than
+bucket noise. Q6 has an i.i.d. control that must land *on* the random-routing
+null rather than below it.
+
+Q7's fitting is asserted against a curve with known coefficients rather than a
+live measurement: a microbenchmark on a busy desktop is genuinely noisy, and
+asserting goodness-of-fit on it tests whether the machine happened to be quiet.
+The live curve is still exercised, but only for direction.
 
 ### One thing it already found
 
@@ -151,7 +254,8 @@ flashforge/
   models.py    model loading + structural MoE router discovery
   tracing.py   forward hooks; captures router logits + gate-input hidden states
   prompts.py   domain-tagged prompt set
-  analysis.py  the five questions
+  analysis.py  Q1-Q6 — the routing questions, from a trace
+  hardware.py  Q7-Q8 — the cost model and storage curve, from the machine
   cachesim.py  Belady / LRU / LFU / static sweep
   plots.py     charts
   viz.py       validated palette + matplotlib style
@@ -169,12 +273,13 @@ is a custom module and will need its own branch in `discover_moe()`.
 - **Stage 0** — instrumentation and routing analysis *(current; runs on existing hardware)*
 - **Stage 1** — expert cache + async prefetch in pure PyTorch, pinned RAM, separate CUDA stream. Most of the wall-clock win lives here.
 - **Stage 2** — Triton kernels: fused gather-GEMM, dequant, fused router. *Needs sm_80+.*
-- **Stage 3** — scale to V4-Flash. *Needs RAM and NVMe headroom.*
+- **Stage 3** — scale to V4-Flash, where the routed pool may not fit in RAM either and experts stream disk→RAM→GPU. *Needs RAM and NVMe headroom.* Q8 is the go/no-go: if `t_disk` needs more lookahead than Q3 shows prediction surviving, the disk tier has to be driven by a longer-horizon signal rather than per-layer routing prediction.
 
 ### Prior art worth reading before Stage 1
 
 - Mixtral-offloading — LRU expert cache + speculative prefetch from the prior layer's hidden state. The Stage 1 baseline.
-- [LayerScope](https://arxiv.org/pdf/2509.23638) — predictive cross-layer scheduling. Directly relevant to Q3.
+- [LayerScope](https://arxiv.org/pdf/2509.23638) — predictive cross-layer scheduling. Directly relevant to Q3 (its layer-group finding is why Q3 reports per band) and to Q7 (its `t_c = β·m + C` is the cost model Q7 calibrates).
+- [DraftExpert](https://arxiv.org/abs/2607.24434) — self-speculative decoding costed in expert loads rather than tokens. Relevant to Q6, and the source of the block-level lookahead a disk tier would need.
 - [PIPO](https://arxiv.org/pdf/2504.03664) — pipelined offloading on consumer devices.
 - [CPU-GPU hybrid MoE SLOs](https://arxiv.org/pdf/2606.10493), [activation sparsity](https://arxiv.org/pdf/2509.00454).
 

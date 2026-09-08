@@ -1,4 +1,4 @@
-"""The five Stage 0 questions.
+"""The Stage 0 questions about routing behaviour.
 
 Every function returns a DataFrame. Plots are separate and optional — the
 numbers are the deliverable, the charts are for reading them quickly.
@@ -8,10 +8,20 @@ numbers are the deliverable, the charts are for reading them quickly.
   Q3 predictability  can layer N predict layer N+k's routing? -> is prefetch viable
   Q4 domain          does usage cluster by domain? -> is cache warming viable
   Q5 cache           hit rate vs capacity, incl. Belady -> how much headroom exists
+  Q6 expansion       how fast does the expert set grow with block size?
+
+Q7 (cost model) and Q8 (storage curve) live in `hardware.py` — they measure the
+machine rather than the model, and need neither a trace nor a checkpoint.
 
 Q3 is the one that decides the project. Prefetch only pays if you have lead
 time: predicting layer N+k at layer N buys you k layers of compute to hide the
 transfer behind. If accuracy collapses at k=1, the design has to change.
+
+Two refinements to Q3 that Q7/Q8 make necessary. Recall is reported per layer
+*band*, because predictability is not uniform with depth and a stack-wide
+average hides the shape. And the offset sweep runs deeper than one layer,
+because a disk tier needs more lead time than a PCIe tier — Q8 says how much,
+and Q3 says whether prediction lasts that long.
 """
 
 from __future__ import annotations
@@ -247,14 +257,55 @@ def _recall_at(pred_idx: np.ndarray, true_matrix: np.ndarray, top_k: int) -> flo
     return float((hits / top_k).mean())
 
 
+def layer_groups(moe_layers: list[int], *, edge_fraction: float = 0.25) -> dict[int, str]:
+    """Split the MoE stack into input / middle / output bands.
+
+    Routing predictability is not uniform with depth: near-input and
+    near-output layers have skewed routing weights and hidden states that shift
+    sharply between layers, while middle layers hold a nearly stable hidden
+    state and lean on a small set of hot experts. Averaging recall over the
+    whole stack blends those regimes and can make a usable predictor look
+    mediocre.
+
+    No published rule fixes the boundaries, so they are a parameter here.
+    `edge_fraction` is the share of layers assigned to *each* edge band; the
+    default puts the outer quarter at each end into input/output and leaves the
+    middle half. Vary it if the resulting curves do not separate.
+    """
+    n = len(moe_layers)
+    if n == 0:
+        return {}
+    if n < 3:
+        return {int(layer): "middle" for layer in moe_layers}
+
+    edge = max(1, int(round(n * edge_fraction)))
+    if 2 * edge >= n:  # keep a non-empty middle band on short stacks
+        edge = max(1, n // 3)
+
+    groups: dict[int, str] = {}
+    for position, layer in enumerate(moe_layers):
+        if position < edge:
+            band = "input"
+        elif position >= n - edge:
+            band = "output"
+        else:
+            band = "middle"
+        groups[int(layer)] = band
+    return groups
+
+
+GROUP_ORDER = ("input", "middle", "output")
+
+
 def cross_layer_predictability(
     store: TraceStore,
     *,
-    offsets: tuple[int, ...] = (1, 2, 4),
+    offsets: tuple[int, ...] = (1, 2, 3, 4, 6, 8),
     budget_multipliers: tuple[int, ...] = (1, 2),
     max_tokens: int = 20000,
     train_fraction: float = 0.6,
     ridge_alpha: float = 1.0,
+    edge_fraction: float = 0.25,
     seed: int = 0,
 ) -> pd.DataFrame:
     """Can layer N's hidden state predict which experts layer N+k will route to?
@@ -273,6 +324,16 @@ def cross_layer_predictability(
 
     budget_multipliers models over-prefetching: at 2x you fetch 2*top_k experts
     and hope the true top_k are among them. Recall is capped at 1.0.
+
+    The offsets run out to 8 because lookahead depth is not a free choice: it
+    is set by what you are hiding behind it. One layer of compute covers a PCIe
+    transfer; a disk read is several times slower and needs a proportionally
+    deeper horizon. Q8 measures that ratio, and the accuracy-vs-offset curve
+    here is what says whether prediction survives out that far.
+
+    Rows carry `src_group` and `tgt_group` so recall can be read per layer
+    band rather than averaged into one number. Grouping is by *source* layer:
+    the question a scheduler asks is "standing here, how far ahead can I see?"
     """
     rng = np.random.default_rng(seed)
     layers = store.moe_layers
@@ -303,9 +364,25 @@ def cross_layer_predictability(
         store.routing.groupby(["layer", "expert"], observed=True).size().rename("count").reset_index()
     )
 
-    def stack(seq_subset, layer: int, source: dict) -> np.ndarray:
-        parts = [source[s][layer] for s in seq_subset if s in source and layer in source[s]]
-        return np.concatenate(parts, axis=0) if parts else np.empty((0, 0), np.float32)
+    groups = layer_groups(layers, edge_fraction=edge_fraction)
+    train_seqs = [s for s in loaded if s in train_ids]
+    test_seqs = [s for s in loaded if s in test_ids]
+    if not test_seqs:
+        return pd.DataFrame()
+
+    # Memoised because the same (split, layer) stack is now reused across every
+    # offset. With offsets out to 8 that is the difference between
+    # concatenating each layer's arrays once and doing it six times over.
+    _cache: dict[tuple[str, int, str], np.ndarray] = {}
+
+    def stack(split: str, layer: int, kind: str) -> np.ndarray:
+        key = (split, layer, kind)
+        if key not in _cache:
+            source = hidden_by_seq if kind == "hidden" else logits_by_seq
+            subset = train_seqs if split == "train" else test_seqs
+            parts = [source[s][layer] for s in subset if s in source and layer in source[s]]
+            _cache[key] = np.concatenate(parts, axis=0) if parts else np.empty((0, 0), np.float32)
+        return _cache[key]
 
     rows = []
     for offset in offsets:
@@ -315,14 +392,9 @@ def cross_layer_predictability(
                 continue
             tgt_layer = layers[j]
 
-            train_seqs = [s for s in loaded if s in train_ids]
-            test_seqs = [s for s in loaded if s in test_ids]
-            if not test_seqs:
-                continue
-
-            h_test = stack(test_seqs, src_layer, hidden_by_seq)
-            tgt_test = stack(test_seqs, tgt_layer, logits_by_seq)
-            src_test = stack(test_seqs, src_layer, logits_by_seq)
+            h_test = stack("test", src_layer, "hidden")
+            tgt_test = stack("test", tgt_layer, "logits")
+            src_test = stack("test", src_layer, "logits")
             if h_test.size == 0 or tgt_test.size == 0:
                 continue
 
@@ -341,8 +413,8 @@ def cross_layer_predictability(
 
             # learned probe
             probe_scores = None
-            h_train = stack(train_seqs, src_layer, hidden_by_seq)
-            y_train = stack(train_seqs, tgt_layer, logits_by_seq)
+            h_train = stack("train", src_layer, "hidden")
+            y_train = stack("train", tgt_layer, "logits")
             if h_train.shape[0] >= 64 and h_train.shape[0] == y_train.shape[0]:
                 targets = np.exp(y_train - y_train.max(axis=1, keepdims=True))
                 targets /= targets.sum(axis=1, keepdims=True)
@@ -365,6 +437,8 @@ def cross_layer_predictability(
                             "offset": offset,
                             "src_layer": int(src_layer),
                             "tgt_layer": int(tgt_layer),
+                            "src_group": groups.get(int(src_layer), "middle"),
+                            "tgt_group": groups.get(int(tgt_layer), "middle"),
                             "predictor": name,
                             "budget_mult": multiplier,
                             "recall": _recall_at(pred_idx, true_matrix, top_k),
@@ -382,6 +456,109 @@ def predictability_summary(detail: pd.DataFrame) -> pd.DataFrame:
         .mean()
         .reset_index()
         .sort_values(["budget_mult", "offset", "recall"], ascending=[True, True, False])
+        .reset_index(drop=True)
+    )
+
+
+def predictability_by_group(detail: pd.DataFrame) -> pd.DataFrame:
+    """Same averages, split by the source layer's band.
+
+    The split is the point. A single stack-wide number hides the case that
+    matters most for design: a predictor that is excellent through the middle
+    half and poor at both ends is a usable predictor with a known weak spot,
+    not a mediocre one — and the fix for the weak spot (more capacity or a
+    different feature mix at the edges) is completely different from the fix
+    for uniform mediocrity.
+    """
+    if detail.empty:
+        return detail
+    summary = (
+        detail.groupby(
+            ["offset", "budget_mult", "predictor", "src_group"], observed=True
+        )["recall"]
+        .agg(["mean", "count"])
+        .reset_index()
+        .rename(columns={"mean": "recall", "count": "n_layer_pairs"})
+    )
+    order = {name: position for position, name in enumerate(GROUP_ORDER)}
+    summary["_order"] = summary["src_group"].map(order).fillna(len(GROUP_ORDER))
+    return (
+        summary.sort_values(["budget_mult", "_order", "offset", "recall"],
+                            ascending=[True, True, True, False])
+        .drop(columns="_order")
+        .reset_index(drop=True)
+    )
+
+
+def deepest_usable_lookahead(
+    by_group: pd.DataFrame,
+    *,
+    predictor: str = "stale_router",
+    budget_mult: int = 1,
+    threshold: float = 0.8,
+) -> pd.DataFrame:
+    """Largest offset where each band still clears `threshold` recall.
+
+    Pair this with Q8's `required_lookahead`. If the depth a disk read needs is
+    larger than the depth prediction survives to, per-layer routing prediction
+    cannot hide that tier and the design has to reach for a longer-horizon
+    signal instead — a speculative draft pass, or domain-level warming.
+
+    Read `limited_by` before trusting `deepest_offset`:
+
+      accuracy   recall fell below the threshold at the next depth. A real
+                 ceiling on how far ahead this band can see.
+      coverage   the band ran out of layer pairs first. Looking 8 layers past
+                 the output band is not a prediction failure, it is arithmetic
+                 — there is no layer there. Says nothing about accuracy.
+      none       recall held all the way to the deepest offset swept. The
+                 ceiling, if any, is beyond what was measured.
+    """
+    if by_group.empty:
+        return by_group
+    subset = by_group[
+        (by_group["predictor"] == predictor) & (by_group["budget_mult"] == budget_mult)
+    ]
+    if subset.empty:
+        return pd.DataFrame()
+    deepest_swept = int(subset["offset"].max())
+
+    rows = []
+    for group, frame in subset.groupby("src_group", observed=True):
+        ordered = frame.sort_values("offset")
+        passing = ordered[ordered["recall"] >= threshold]
+        # Take the last *contiguous* pass from the shallowest offset: recall
+        # rebounding at depth 6 after failing at 4 is noise, not lead time you
+        # can schedule against.
+        deepest = 0
+        limited_by = "none"
+        for _, row in ordered.iterrows():
+            if row["recall"] >= threshold:
+                deepest = int(row["offset"])
+            else:
+                limited_by = "accuracy"
+                break
+        if limited_by == "none" and int(ordered["offset"].max()) < deepest_swept:
+            limited_by = "coverage"
+        rows.append(
+            {
+                "src_group": group,
+                "deepest_offset": deepest,
+                "limited_by": limited_by,
+                "best_recall": float(ordered["recall"].max()),
+                "recall_at_1": float(
+                    ordered[ordered["offset"] == ordered["offset"].min()]["recall"].iloc[0]
+                ),
+                "n_offsets_passing": int(len(passing)),
+                "deepest_offset_measured": int(ordered["offset"].max()),
+            }
+        )
+    order = {name: position for position, name in enumerate(GROUP_ORDER)}
+    return (
+        pd.DataFrame(rows)
+        .assign(_order=lambda f: f["src_group"].map(order).fillna(len(GROUP_ORDER)))
+        .sort_values("_order")
+        .drop(columns="_order")
         .reset_index(drop=True)
     )
 
