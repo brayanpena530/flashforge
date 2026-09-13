@@ -599,6 +599,99 @@ def predictability_by_group(detail: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _reach(ordered: pd.DataFrame, threshold: float, deepest_swept: int) -> tuple[int, str]:
+    """Deepest contiguous offset clearing `threshold`, and what stopped it.
+
+    Contiguous from the shallowest offset on purpose: recall rebounding at
+    depth 6 after failing at 4 is noise, not lead time you can schedule
+    against.
+    """
+    deepest = 0
+    limited_by = "none"
+    for _, row in ordered.iterrows():
+        if row["recall"] >= threshold:
+            deepest = int(row["offset"])
+        else:
+            limited_by = "accuracy"
+            break
+    if limited_by == "none" and int(ordered["offset"].max()) < deepest_swept:
+        limited_by = "coverage"
+    return deepest, limited_by
+
+
+def lookahead_reach(
+    by_group: pd.DataFrame,
+    *,
+    budget_mult: int = 1,
+    threshold: float = 0.8,
+) -> pd.DataFrame:
+    """How far ahead *every* predictor stays usable, per layer band.
+
+    One row per (band, predictor). Evaluating only the cheapest predictor is
+    misleading once the offsets run deep: predictors do not merely differ in
+    accuracy, they differ in how fast accuracy *decays* with depth. A predictor
+    that starts lower can stay usable much further out, and the far-out
+    behaviour is exactly what a slow storage tier depends on.
+    """
+    if by_group.empty:
+        return pd.DataFrame()
+    subset = by_group[by_group["budget_mult"] == budget_mult]
+    if subset.empty:
+        return pd.DataFrame()
+    deepest_swept = int(subset["offset"].max())
+
+    rows = []
+    for (group, name), frame in subset.groupby(["src_group", "predictor"], observed=True):
+        ordered = frame.sort_values("offset")
+        deepest, limited_by = _reach(ordered, threshold, deepest_swept)
+        rows.append(
+            {
+                "src_group": group,
+                "predictor": name,
+                "deepest_offset": deepest,
+                "limited_by": limited_by,
+                "recall_at_1": float(
+                    ordered[ordered["offset"] == ordered["offset"].min()]["recall"].iloc[0]
+                ),
+                "recall_at_deepest_swept": float(ordered["recall"].iloc[-1]),
+                "best_recall": float(ordered["recall"].max()),
+                "deepest_offset_measured": int(ordered["offset"].max()),
+            }
+        )
+    order = {name: position for position, name in enumerate(GROUP_ORDER)}
+    return (
+        pd.DataFrame(rows)
+        .assign(_order=lambda f: f["src_group"].map(order).fillna(len(GROUP_ORDER)))
+        .sort_values(["_order", "deepest_offset", "recall_at_deepest_swept"],
+                     ascending=[True, False, False])
+        .drop(columns="_order")
+        .reset_index(drop=True)
+    )
+
+
+def best_lookahead_by_band(reach: pd.DataFrame) -> pd.DataFrame:
+    """The predictor that sees furthest in each band.
+
+    Ties on depth are broken by recall at the deepest offset swept, not by
+    recall at k=1: the question this answers is "what can still be trusted out
+    there", and a predictor that starts higher but falls off a cliff is the
+    wrong answer to it.
+    """
+    if reach.empty:
+        return reach
+    ranked = reach.sort_values(
+        ["deepest_offset", "recall_at_deepest_swept"], ascending=[False, False]
+    )
+    order = {name: position for position, name in enumerate(GROUP_ORDER)}
+    return (
+        ranked.groupby("src_group", observed=True).head(1)
+        .assign(_order=lambda f: f["src_group"].map(order).fillna(len(GROUP_ORDER)))
+        .sort_values("_order")
+        .drop(columns="_order")
+        .reset_index(drop=True)
+    )
+
+
 def deepest_usable_lookahead(
     by_group: pd.DataFrame,
     *,
@@ -623,51 +716,12 @@ def deepest_usable_lookahead(
       none       recall held all the way to the deepest offset swept. The
                  ceiling, if any, is beyond what was measured.
     """
-    if by_group.empty:
-        return by_group
-    subset = by_group[
-        (by_group["predictor"] == predictor) & (by_group["budget_mult"] == budget_mult)
-    ]
-    if subset.empty:
-        return pd.DataFrame()
-    deepest_swept = int(subset["offset"].max())
-
-    rows = []
-    for group, frame in subset.groupby("src_group", observed=True):
-        ordered = frame.sort_values("offset")
-        passing = ordered[ordered["recall"] >= threshold]
-        # Take the last *contiguous* pass from the shallowest offset: recall
-        # rebounding at depth 6 after failing at 4 is noise, not lead time you
-        # can schedule against.
-        deepest = 0
-        limited_by = "none"
-        for _, row in ordered.iterrows():
-            if row["recall"] >= threshold:
-                deepest = int(row["offset"])
-            else:
-                limited_by = "accuracy"
-                break
-        if limited_by == "none" and int(ordered["offset"].max()) < deepest_swept:
-            limited_by = "coverage"
-        rows.append(
-            {
-                "src_group": group,
-                "deepest_offset": deepest,
-                "limited_by": limited_by,
-                "best_recall": float(ordered["recall"].max()),
-                "recall_at_1": float(
-                    ordered[ordered["offset"] == ordered["offset"].min()]["recall"].iloc[0]
-                ),
-                "n_offsets_passing": int(len(passing)),
-                "deepest_offset_measured": int(ordered["offset"].max()),
-            }
-        )
-    order = {name: position for position, name in enumerate(GROUP_ORDER)}
+    reach = lookahead_reach(by_group, budget_mult=budget_mult, threshold=threshold)
+    if reach.empty:
+        return reach
     return (
-        pd.DataFrame(rows)
-        .assign(_order=lambda f: f["src_group"].map(order).fillna(len(GROUP_ORDER)))
-        .sort_values("_order")
-        .drop(columns="_order")
+        reach[reach["predictor"] == predictor]
+        .drop(columns="predictor")
         .reset_index(drop=True)
     )
 

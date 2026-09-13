@@ -251,6 +251,26 @@ check("output band is limited by coverage, not accuracy",
 check("mid-stack bands are judged on accuracy",
       reach.set_index("src_group").loc["input", "limited_by"] in {"accuracy", "none"},
       f"input limited_by={reach.set_index('src_group').loc['input', 'limited_by']}")
+
+deep_groups = analysis.predictability_by_group(deep)
+all_reach = analysis.lookahead_reach(deep_groups, threshold=0.5)
+check("reach covers every band x predictor pair",
+      len(all_reach) == 3 * deep_groups["predictor"].nunique(),
+      f"{len(all_reach)} rows for 3 bands x {deep_groups['predictor'].nunique()} predictors")
+check("single-predictor view agrees with the all-predictor view",
+      all_reach[all_reach.predictor == 'stale_router']
+        .set_index('src_group')['deepest_offset'].to_dict()
+      == reach.set_index('src_group')['deepest_offset'].to_dict(),
+      "deepest_usable_lookahead is a filtered view, not a second implementation")
+best = analysis.best_lookahead_by_band(all_reach)
+check("best-per-band picks one predictor per band", len(best) == 3,
+      ", ".join(f"{r.src_group}:{r.predictor}@{int(r.deepest_offset)}" for r in best.itertuples()))
+# The winner must genuinely be a winner: no other predictor may reach deeper.
+merged = all_reach.merge(best[['src_group','deepest_offset']], on='src_group',
+                         suffixes=('', '_best'))
+check("no predictor beats the chosen best",
+      bool((merged['deepest_offset'] <= merged['deepest_offset_best']).all()),
+      "selection is a true argmax over depth")
 plots.plot_predictability_groups(by_group, K, required_lookahead=4).savefig(out / "q3_groups.png")
 
 print("\nQ4 domain")

@@ -329,41 +329,52 @@ def analyze_main(argv: list[str] | None = None) -> int:
             print("\n[Q3] recall of the true top-k, averaged over layer pairs:")
             print(summary.to_string(index=False, float_format=lambda v: f"{v:.3f}"))
 
-            reach = analysis.deepest_usable_lookahead(by_group)
-            if not reach.empty:
-                save("q3_lookahead_reach", reach)
-                print("\n[Q3] how far ahead stale_router still clears 80% recall, by band:")
+            # Every predictor, not just the cheapest one. Predictors differ in
+            # how fast they *decay* with depth as much as in peak accuracy, and
+            # a slow storage tier lives or dies on the far end of that curve —
+            # judging it by one predictor understates what is reachable.
+            for budget in sorted(by_group["budget_mult"].unique()):
+                reach = analysis.lookahead_reach(by_group, budget_mult=int(budget))
+                if reach.empty:
+                    continue
+                best = analysis.best_lookahead_by_band(reach)
+                save(f"q3_lookahead_reach_{int(budget)}x", reach)
+
+                print(f"\n[Q3] deepest lookahead still clearing 80% recall "
+                      f"({int(budget)}x prefetch budget):")
                 note = {
-                    "accuracy": "recall fell off past here",
+                    "accuracy": "falls off past here",
                     "coverage": "ran out of layers, not accuracy",
                     "none": "still holding at the deepest offset swept",
                 }
-                for _, row in reach.iterrows():
+                for _, row in best.iterrows():
                     depth = int(row["deepest_offset"])
                     verdict = f"{depth} layer(s)" if depth else "not even 1 layer"
                     print(f"     {row['src_group']:>7}  {verdict:<16} "
-                          f"(k=1 recall {row['recall_at_1']:.3f}; "
+                          f"best: {row['predictor']:<13} "
+                          f"(k=1 {row['recall_at_1']:.3f} -> deepest {row['recall_at_deepest_swept']:.3f}; "
                           f"{note.get(row['limited_by'], row['limited_by'])})")
 
                 if required_lookahead:
                     # A band that ran out of layer pairs has not demonstrated a
                     # ceiling, so scoring it against the disk requirement would
                     # manufacture a failure out of arithmetic.
-                    real = reach[reach["limited_by"] != "coverage"]
+                    real = best[best["limited_by"] != "coverage"]
                     if real.empty:
-                        print(f"\n     a disk read needs {required_lookahead} layer(s) of lead "
-                              "time; no band was measured deep enough to judge that")
+                        print(f"     a disk read needs {required_lookahead} layer(s); no band "
+                              "was measured deep enough to judge that")
+                        continue
+                    worst = int(real["deepest_offset"].min())
+                    band = real.loc[real["deepest_offset"].idxmin(), "src_group"]
+                    who = real.loc[real["deepest_offset"].idxmin(), "predictor"]
+                    if worst >= required_lookahead:
+                        print(f"     -> covers a disk read ({required_lookahead} layers): even the "
+                              f"weakest band ({band}) reaches {worst} with {who}")
                     else:
-                        worst = int(real["deepest_offset"].min())
-                        band = real.loc[real["deepest_offset"].idxmin(), "src_group"]
-                        print(f"\n     a disk read needs {required_lookahead} layer(s) of lead "
-                              f"time; the weakest band ({band}) holds prediction for {worst}")
-                        print("     " + (
-                            "→ per-layer prediction can cover a disk tier"
-                            if worst >= required_lookahead else
-                            "→ per-layer prediction cannot cover a disk tier on its own. "
-                            "A longer-horizon signal (block-level speculation, or Q4 domain "
-                            "warming) has to carry the disk→RAM decision"))
+                        print(f"     -> short of a disk read ({required_lookahead} layers): the "
+                              f"{band} band tops out at {worst}, best predictor {who}")
+                        print("        a longer-horizon signal (block-level speculation, or Q4 "
+                              "domain warming) has to carry the disk->RAM decision")
         except FileNotFoundError as exc:
             log.warning("Skipping Q3: %s", exc)
     else:
