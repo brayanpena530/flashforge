@@ -17,6 +17,22 @@ import pandas as pd
 log = logging.getLogger("flashforge")
 
 
+def _force_utf8_stdout() -> None:
+    """Stop a Windows console from killing a finished run over an arrow glyph.
+
+    The default stdout encoding here is cp1252, which cannot represent the
+    arrows and dashes in the verdict lines. Printing one raised
+    UnicodeEncodeError *after* the analysis had completed, discarding it. Errors
+    are set to "replace" so an unrepresentable character degrades to "?" rather
+    than taking the process down.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
+
+
 def _setup_logging(verbose: bool = False) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -78,6 +94,7 @@ def collect_main(argv: list[str] | None = None) -> int:
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
+    _force_utf8_stdout()
     _setup_logging(args.verbose)
     _check_cache_space(args.cache_dir)
 
@@ -114,12 +131,25 @@ def collect_main(argv: list[str] | None = None) -> int:
 
         parquet_path = tracer.write_parquet()
 
-    np.savez(
-        out_dir / "gates.npz",
-        **{k: v.numpy() for k, v in gate_weight_matrices(spec).items()},
-    )
+    # Order matters. Tracing is the expensive part — minutes of forward passes —
+    # and everything after it is small bookkeeping. Writing the router gates
+    # first meant one failure there discarded a complete trace, so the cheap,
+    # never-fails write goes first and the fragile one is allowed to fail.
+    saved_gates = True
+    try:
+        np.savez(
+            out_dir / "gates.npz",
+            **{k: v.numpy() for k, v in gate_weight_matrices(spec).items()},
+        )
+    except RuntimeError as exc:
+        saved_gates = False
+        log.warning(
+            "Could not save router gates: %s\nThe trace is still complete and Q1, Q2, "
+            "Q4, Q5 and Q6 will run. Q3 loses its stale_router predictor.", exc,
+        )
 
     meta = {
+        "saved_gates": saved_gates,
         "model_id": args.model,
         "num_experts": spec.num_experts,
         "top_k": spec.top_k,
@@ -187,6 +217,7 @@ def analyze_main(argv: list[str] | None = None) -> int:
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
+    _force_utf8_stdout()
     _setup_logging(args.verbose)
     viz.use_style()
 
@@ -499,6 +530,7 @@ def bench_main(argv: list[str] | None = None) -> int:
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
+    _force_utf8_stdout()
     _setup_logging(args.verbose)
     viz.use_style()
 

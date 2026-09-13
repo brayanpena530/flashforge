@@ -134,6 +134,39 @@ def discover_moe(model: nn.Module) -> MoESpec:
     )
 
 
+def _materialize_weight(module: nn.Module, name: str) -> "torch.Tensor":
+    """Fetch a module's weight as a real CPU tensor, even when it is offloaded.
+
+    When accelerate splits a model across GPU and CPU it replaces the offloaded
+    parameters with **meta** tensors — correct shape and dtype, no storage — and
+    hangs the real data off the module in a hook, materialising it only for the
+    duration of a forward pass. Reading `.weight` directly then raises
+    "Cannot copy out of meta tensor; no data!".
+
+    This matters here because a 6GB card cannot hold a 13.8GB checkpoint, so the
+    offload path is the normal path, not an edge case.
+    """
+    weight = module.weight
+    if not weight.is_meta:
+        return weight.detach().to("cpu", torch.float32)
+
+    hook = getattr(module, "_hf_hook", None)
+    weights_map = getattr(hook, "weights_map", None)
+    if weights_map is not None:
+        try:
+            return torch.as_tensor(weights_map["weight"]).detach().to("cpu", torch.float32)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"{name} is offloaded and its accelerate hook did not yield a weight: {exc}"
+            ) from exc
+
+    raise RuntimeError(
+        f"{name} is on the meta device with no accelerate hook to recover it from. "
+        "Load the model with device_map=None (needs enough RAM for the whole "
+        "checkpoint) if you need its weights."
+    )
+
+
 def gate_weight_matrices(spec: MoESpec) -> dict[str, "torch.Tensor"]:
     """Router weight matrices keyed by layer index, as float32 CPU tensors.
 
@@ -142,7 +175,7 @@ def gate_weight_matrices(spec: MoESpec) -> dict[str, "torch.Tensor"]:
     reloading the model.
     """
     return {
-        str(layer_idx): gate.weight.detach().to("cpu", torch.float32)
+        str(layer_idx): _materialize_weight(gate, f"layers.{layer_idx}.mlp.gate")
         for layer_idx, gate in spec.gates
     }
 

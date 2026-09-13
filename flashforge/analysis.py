@@ -83,7 +83,13 @@ class TraceStore:
             return {int(k): data[k].astype(np.float32) for k in data.files}
 
     def gates(self) -> dict[int, np.ndarray]:
-        with np.load(self.root / "gates.npz") as data:
+        path = self.root / "gates.npz"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"No router gates at {path}. Q3's stale_router predictor needs them; "
+                "the other questions do not. Re-collect to regenerate."
+            )
+        with np.load(path) as data:
             return {int(k): data[k].astype(np.float32) for k in data.files}
 
 
