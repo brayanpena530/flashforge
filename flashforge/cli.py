@@ -214,6 +214,44 @@ def analyze_main(argv: list[str] | None = None) -> int:
     print(f"     mean Gini {skew['gini'].mean():.3f} | "
           f"never-routed experts: {int(skew['unused_experts'].sum())}")
 
+    # The stack-wide mean above hides the shape, and the shape is what picks the
+    # predictor: concentration and weight dominance are expected to move in
+    # opposite directions with depth.
+    weights = analysis.routing_weight_profile(frame, store.top_k)
+    profile = analysis.annotate_bands(
+        skew.merge(weights, on="layer", how="left") if not weights.empty else skew,
+        store.moe_layers, edge_fraction=args.edge_fraction,
+    )
+    bands = analysis.band_summary(
+        skew, weights, store.moe_layers, edge_fraction=args.edge_fraction
+    )
+    save("q1_layer_profile", profile)
+    save("q1_band_summary", bands)
+    plots.plot_layer_bands(profile, top_k=store.top_k).savefig(out_dir / "q1_layer_bands.png")
+
+    print("\n[Q1] by layer band:")
+    print(f"     {'band':>7}  {'layers':>6}  {'top-10% mass':>12}  {'gini':>6}  "
+          f"{'top-1 weight':>12}")
+    for _, row in bands.iterrows():
+        share = f"{row['top1_share']:.3f}" if "top1_share" in bands.columns else "n/a"
+        print(f"     {row['band']:>7}  {int(row['n_layers']):>6}  "
+              f"{row['top10pct_mass']:>11.1%}  {row['gini']:>6.3f}  {share:>12}")
+
+    if "top1_share" in bands.columns and len(bands) == 3:
+        keyed = bands.set_index("band")
+        edges = (keyed.loc["input", "top1_share"] + keyed.loc["output", "top1_share"]) / 2
+        mid = keyed.loc["middle", "top1_share"]
+        print("     " + (
+            "edge layers lean on one dominant expert, middle layers blend — "
+            "so edges want previous-layer expert IDs as the prefetch feature, "
+            "middle wants the hidden state"
+            if edges > mid + 0.02 else
+            "middle layers lean harder on one expert than the edges do — the "
+            "inverse of the published pattern, worth a second look"
+            if mid > edges + 0.02 else
+            "routing-weight dominance is flat across depth; the layer-band split "
+            "buys nothing on this model and one predictor should serve the stack"))
+
     # Q2 -------------------------------------------------------------
     log.info("Q2: temporal locality")
     overlap = analysis.consecutive_overlap(frame, store.num_experts, store.top_k)

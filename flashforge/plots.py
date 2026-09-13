@@ -85,6 +85,79 @@ def plot_skew(lorenz: pd.DataFrame, summary: pd.DataFrame):
     return fig
 
 
+def plot_layer_bands(profile: pd.DataFrame, *, top_k: int):
+    """Q1, by depth. Hot-expert concentration and routing-weight dominance.
+
+    Two panels rather than two lines on one: the quantities share no unit, and
+    the claim being tested is that they move in *opposite* directions across
+    depth. Overlaying them on a twin axis would let the axis scaling decide
+    whether that looks true.
+
+    Band boundaries are drawn as shaded regions rather than vertical rules so
+    they read as context for the series rather than as events in it.
+    """
+    has_weights = "top1_share" in profile.columns and profile["top1_share"].notna().any()
+    n_panels = 2 if has_weights else 1
+    fig, axes = plt.subplots(1, n_panels, figsize=(5.4 * n_panels, 4.0), squeeze=False)
+
+    def shade(ax) -> None:
+        for band, group in profile.groupby("band", observed=True):
+            if band == "middle":
+                continue
+            lo, hi = group["layer"].min(), group["layer"].max()
+            ax.axvspan(lo - 0.5, hi + 0.5, color=viz.GRIDLINE, alpha=0.55, zorder=0)
+        # Band labels go *outside* the axes. Inside, they sit in whichever
+        # corner the series happens to occupy — and the whole point of the
+        # chart is that the series moves around across depth.
+        for band, group in profile.groupby("band", observed=True):
+            ax.annotate(
+                band,
+                xy=((group["layer"].min() + group["layer"].max()) / 2, 1.0),
+                xycoords=("data", "axes fraction"),
+                xytext=(0, 5),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+                color=viz.INK_MUTED,
+                annotation_clip=False,
+            )
+
+    left = axes[0][0]
+    shade(left)
+    left.plot(profile["layer"], profile["top10pct_mass"],
+              color=viz.SERIES[0], marker="o", zorder=3)
+    uniform = 0.10
+    left.axhline(uniform, color=viz.BASELINE, linewidth=1.0, linestyle=(0, (4, 3)), zorder=1)
+    left.annotate("uniform routing", xy=(profile["layer"].min(), uniform),
+                  xytext=(2, 4), textcoords="offset points",
+                  fontsize=9, color=viz.INK_MUTED)
+    left.set_xlabel("MoE layer")
+    left.set_ylabel("share of accesses to the hottest 10%")
+    # Extra title pad reserves the strip the band labels occupy. Anchoring
+    # them inside the axes instead would depend on where the series sits.
+    left.set_title("Hot-expert concentration by depth", pad=24)
+    left.set_ylim(bottom=0)
+
+    if has_weights:
+        right = axes[0][1]
+        shade(right)
+        right.plot(profile["layer"], profile["top1_share"],
+                   color=viz.SERIES[1], marker="o", zorder=3)
+        even = 1.0 / top_k
+        right.axhline(even, color=viz.BASELINE, linewidth=1.0, linestyle=(0, (4, 3)), zorder=1)
+        right.annotate(f"even split across top-{top_k}",
+                       xy=(profile["layer"].min(), even),
+                       xytext=(2, 4), textcoords="offset points",
+                       fontsize=9, color=viz.INK_MUTED)
+        right.set_xlabel("MoE layer")
+        right.set_ylabel("top expert's share of routing weight")
+        right.set_title("Routing-weight dominance by depth", pad=24)
+        right.set_ylim(0, 1.02)
+
+    return fig
+
+
 def plot_locality(overlap: pd.DataFrame):
     """Q2. Expert-set overlap against token lag, per layer."""
     fig, ax = plt.subplots(figsize=(7.5, 4.0))

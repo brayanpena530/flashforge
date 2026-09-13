@@ -147,6 +147,109 @@ def skew_summary(freq: pd.DataFrame, num_experts: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def routing_weight_profile(frame: pd.DataFrame, top_k: int) -> pd.DataFrame:
+    """How much the top-ranked expert's routing weight dominates, per layer.
+
+    The tracer records the gate's weight for every selected expert; this is the
+    only analysis that reads it. The quantity matters because it separates two
+    regimes that look identical if you only count accesses:
+
+      dominant weights   one expert carries most of the output sum, so the
+                         block's output is close to that single expert's. Its
+                         routing decision propagates strongly to the next
+                         layer, which is what makes cross-layer routing
+                         correlation high.
+      balanced weights   the output is a genuine blend. The hidden state
+                         changes little from layer to layer, which is what
+                         makes *hidden-state* similarity high instead.
+
+    Those two properties want different predictors — previous-layer expert IDs
+    in the first case, the hidden state itself in the second — so knowing which
+    regime a layer is in tells you which feature to feed it.
+
+    Returns per-layer `top1_share` (the top expert's share of the routing mass)
+    and `weight_entropy` (normalised to [0, 1]; 1.0 is a perfectly even split
+    across the top-k).
+    """
+    if frame.empty or top_k <= 0:
+        return pd.DataFrame(columns=["layer", "top1_share", "weight_entropy", "n_tokens"])
+
+    ordered = frame.sort_values(["seq_id", "pos", "layer", "rank"], kind="stable")
+    if len(ordered) % top_k != 0:
+        # Every (seq, pos, layer) should contribute exactly top_k rows. A ragged
+        # trace would silently misalign the reshape below and produce numbers
+        # that look plausible, so refuse rather than guess.
+        raise ValueError(
+            f"Trace has {len(ordered)} rows, not a multiple of top_k={top_k}; "
+            "cannot group routing weights by token."
+        )
+
+    weights = ordered["weight"].to_numpy(np.float64).reshape(-1, top_k)
+    layers = ordered["layer"].to_numpy()[::top_k]
+
+    totals = weights.sum(axis=1, keepdims=True)
+    probs = np.divide(weights, totals, out=np.zeros_like(weights), where=totals > 0)
+    top1 = probs.max(axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        logs = np.where(probs > 0, np.log(probs), 0.0)
+    entropy = -(probs * logs).sum(axis=1) / np.log(top_k) if top_k > 1 else np.zeros(len(probs))
+
+    per_token = pd.DataFrame({"layer": layers, "top1_share": top1, "weight_entropy": entropy})
+    return (
+        per_token.groupby("layer", observed=True)
+        .agg(top1_share=("top1_share", "mean"),
+             weight_entropy=("weight_entropy", "mean"),
+             n_tokens=("top1_share", "size"))
+        .reset_index()
+    )
+
+
+def annotate_bands(
+    table: pd.DataFrame, moe_layers: list[int], *, edge_fraction: float = 0.25
+) -> pd.DataFrame:
+    """Add a `band` column to any per-layer table, using Q3's band definition."""
+    groups = layer_groups(moe_layers, edge_fraction=edge_fraction)
+    out = table.copy()
+    out["band"] = out["layer"].map(groups).fillna("middle")
+    return out
+
+
+def band_summary(
+    skew: pd.DataFrame,
+    weights: pd.DataFrame,
+    moe_layers: list[int],
+    *,
+    edge_fraction: float = 0.25,
+) -> pd.DataFrame:
+    """Skew and weight-dominance averaged per layer band.
+
+    Exists for the same reason `predictability_by_group` does: a stack-wide mean
+    blends regimes that behave differently, and the blended number points at the
+    wrong design. Here specifically, hot-expert concentration and routing-weight
+    dominance are expected to move in *opposite* directions across depth — so
+    averaging them over the whole stack can flatten both into "unremarkable".
+    """
+    merged = annotate_bands(skew, moe_layers, edge_fraction=edge_fraction)
+    if not weights.empty:
+        merged = merged.merge(weights, on="layer", how="left")
+
+    columns = [c for c in ("top10pct_mass", "gini", "top1_share", "weight_entropy")
+               if c in merged.columns]
+    summary = (
+        merged.groupby("band", observed=True)
+        .agg({**{c: "mean" for c in columns}, "layer": "count"})
+        .rename(columns={"layer": "n_layers"})
+        .reset_index()
+    )
+    order = {name: position for position, name in enumerate(GROUP_ORDER)}
+    return (
+        summary.assign(_order=lambda f: f["band"].map(order).fillna(len(GROUP_ORDER)))
+        .sort_values("_order")
+        .drop(columns="_order")
+        .reset_index(drop=True)
+    )
+
+
 def lorenz_curve(freq: pd.DataFrame) -> pd.DataFrame:
     """Cumulative access share vs cumulative expert share, pooled across layers."""
     counts = np.sort(freq["count"].to_numpy(np.float64))[::-1]

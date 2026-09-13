@@ -38,6 +38,27 @@ neither a trace nor a checkpoint.
 | **Q7** | What does one expert cost on CPU, GPU and PCIe? | where the CPU/GPU placement line falls |
 | **Q8** | How fast is a read off disk, and at what queue depth? | whether a disk tier can ever be hidden |
 
+Q1 is reported **per layer and per band**, not just pooled. Expert usage does
+not behave the same way at every depth, and two different things vary with it:
+
+- **Hot-expert concentration** — what share of accesses the hottest 10% serve.
+  Decides whether a small pinned cache pays, and where.
+- **Routing-weight dominance** — how much of the gate's output mass goes to the
+  top-ranked expert. This reads the `weight` column the tracer has always
+  written and nothing else touches.
+
+The second one matters because it separates two regimes that look identical if
+you only count accesses. When one expert's weight dominates, the block's output
+is close to that single expert's, so its routing decision propagates strongly
+to the next layer — which is what makes *cross-layer routing correlation* high.
+When weights are balanced the output is a genuine blend, the hidden state barely
+moves between layers, and it is *hidden-state similarity* that is high instead.
+
+Those two regimes want different prefetch features — previous-layer expert IDs
+in the first case, the hidden state itself in the second. So Q1's depth profile
+is what tells you which feature to feed Q3's predictor at which depth, and the
+two bands tables are meant to be read side by side.
+
 **Q3 is the one that decides the project.** Prefetch only pays if you have lead
 time: predicting layer *N+k* at layer *N* buys *k* layers of compute to hide the
 transfer behind. If accuracy collapses at *k*=1, the design has to change — so
