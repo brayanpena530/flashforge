@@ -17,6 +17,22 @@ import pandas as pd
 log = logging.getLogger("flashforge")
 
 
+def _force_utf8_stdout() -> None:
+    """Stop a Windows console from killing a finished run over an arrow glyph.
+
+    The default stdout encoding here is cp1252, which cannot represent the
+    arrows and dashes in the verdict lines. Printing one raised
+    UnicodeEncodeError *after* the analysis had completed, discarding it. Errors
+    are set to "replace" so an unrepresentable character degrades to "?" rather
+    than taking the process down.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
+
+
 def _setup_logging(verbose: bool = False) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -78,6 +94,7 @@ def collect_main(argv: list[str] | None = None) -> int:
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
+    _force_utf8_stdout()
     _setup_logging(args.verbose)
     _check_cache_space(args.cache_dir)
 
@@ -114,12 +131,25 @@ def collect_main(argv: list[str] | None = None) -> int:
 
         parquet_path = tracer.write_parquet()
 
-    np.savez(
-        out_dir / "gates.npz",
-        **{k: v.numpy() for k, v in gate_weight_matrices(spec).items()},
-    )
+    # Order matters. Tracing is the expensive part — minutes of forward passes —
+    # and everything after it is small bookkeeping. Writing the router gates
+    # first meant one failure there discarded a complete trace, so the cheap,
+    # never-fails write goes first and the fragile one is allowed to fail.
+    saved_gates = True
+    try:
+        np.savez(
+            out_dir / "gates.npz",
+            **{k: v.numpy() for k, v in gate_weight_matrices(spec).items()},
+        )
+    except RuntimeError as exc:
+        saved_gates = False
+        log.warning(
+            "Could not save router gates: %s\nThe trace is still complete and Q1, Q2, "
+            "Q4, Q5 and Q6 will run. Q3 loses its stale_router predictor.", exc,
+        )
 
     meta = {
+        "saved_gates": saved_gates,
         "model_id": args.model,
         "num_experts": spec.num_experts,
         "top_k": spec.top_k,
@@ -187,6 +217,7 @@ def analyze_main(argv: list[str] | None = None) -> int:
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
+    _force_utf8_stdout()
     _setup_logging(args.verbose)
     viz.use_style()
 
@@ -213,6 +244,44 @@ def analyze_main(argv: list[str] | None = None) -> int:
           f"{skew['top10pct_mass'].mean():.1%} of accesses (uniform would be 10.0%)")
     print(f"     mean Gini {skew['gini'].mean():.3f} | "
           f"never-routed experts: {int(skew['unused_experts'].sum())}")
+
+    # The stack-wide mean above hides the shape, and the shape is what picks the
+    # predictor: concentration and weight dominance are expected to move in
+    # opposite directions with depth.
+    weights = analysis.routing_weight_profile(frame, store.top_k)
+    profile = analysis.annotate_bands(
+        skew.merge(weights, on="layer", how="left") if not weights.empty else skew,
+        store.moe_layers, edge_fraction=args.edge_fraction,
+    )
+    bands = analysis.band_summary(
+        skew, weights, store.moe_layers, edge_fraction=args.edge_fraction
+    )
+    save("q1_layer_profile", profile)
+    save("q1_band_summary", bands)
+    plots.plot_layer_bands(profile, top_k=store.top_k).savefig(out_dir / "q1_layer_bands.png")
+
+    print("\n[Q1] by layer band:")
+    print(f"     {'band':>7}  {'layers':>6}  {'top-10% mass':>12}  {'gini':>6}  "
+          f"{'top-1 weight':>12}")
+    for _, row in bands.iterrows():
+        share = f"{row['top1_share']:.3f}" if "top1_share" in bands.columns else "n/a"
+        print(f"     {row['band']:>7}  {int(row['n_layers']):>6}  "
+              f"{row['top10pct_mass']:>11.1%}  {row['gini']:>6.3f}  {share:>12}")
+
+    if "top1_share" in bands.columns and len(bands) == 3:
+        keyed = bands.set_index("band")
+        edges = (keyed.loc["input", "top1_share"] + keyed.loc["output", "top1_share"]) / 2
+        mid = keyed.loc["middle", "top1_share"]
+        print("     " + (
+            "edge layers lean on one dominant expert, middle layers blend — "
+            "so edges want previous-layer expert IDs as the prefetch feature, "
+            "middle wants the hidden state"
+            if edges > mid + 0.02 else
+            "middle layers lean harder on one expert than the edges do — the "
+            "inverse of the published pattern, worth a second look"
+            if mid > edges + 0.02 else
+            "routing-weight dominance is flat across depth; the layer-band split "
+            "buys nothing on this model and one predictor should serve the stack"))
 
     # Q2 -------------------------------------------------------------
     log.info("Q2: temporal locality")
@@ -260,41 +329,52 @@ def analyze_main(argv: list[str] | None = None) -> int:
             print("\n[Q3] recall of the true top-k, averaged over layer pairs:")
             print(summary.to_string(index=False, float_format=lambda v: f"{v:.3f}"))
 
-            reach = analysis.deepest_usable_lookahead(by_group)
-            if not reach.empty:
-                save("q3_lookahead_reach", reach)
-                print("\n[Q3] how far ahead stale_router still clears 80% recall, by band:")
+            # Every predictor, not just the cheapest one. Predictors differ in
+            # how fast they *decay* with depth as much as in peak accuracy, and
+            # a slow storage tier lives or dies on the far end of that curve —
+            # judging it by one predictor understates what is reachable.
+            for budget in sorted(by_group["budget_mult"].unique()):
+                reach = analysis.lookahead_reach(by_group, budget_mult=int(budget))
+                if reach.empty:
+                    continue
+                best = analysis.best_lookahead_by_band(reach)
+                save(f"q3_lookahead_reach_{int(budget)}x", reach)
+
+                print(f"\n[Q3] deepest lookahead still clearing 80% recall "
+                      f"({int(budget)}x prefetch budget):")
                 note = {
-                    "accuracy": "recall fell off past here",
+                    "accuracy": "falls off past here",
                     "coverage": "ran out of layers, not accuracy",
                     "none": "still holding at the deepest offset swept",
                 }
-                for _, row in reach.iterrows():
+                for _, row in best.iterrows():
                     depth = int(row["deepest_offset"])
                     verdict = f"{depth} layer(s)" if depth else "not even 1 layer"
                     print(f"     {row['src_group']:>7}  {verdict:<16} "
-                          f"(k=1 recall {row['recall_at_1']:.3f}; "
+                          f"best: {row['predictor']:<13} "
+                          f"(k=1 {row['recall_at_1']:.3f} -> deepest {row['recall_at_deepest_swept']:.3f}; "
                           f"{note.get(row['limited_by'], row['limited_by'])})")
 
                 if required_lookahead:
                     # A band that ran out of layer pairs has not demonstrated a
                     # ceiling, so scoring it against the disk requirement would
                     # manufacture a failure out of arithmetic.
-                    real = reach[reach["limited_by"] != "coverage"]
+                    real = best[best["limited_by"] != "coverage"]
                     if real.empty:
-                        print(f"\n     a disk read needs {required_lookahead} layer(s) of lead "
-                              "time; no band was measured deep enough to judge that")
+                        print(f"     a disk read needs {required_lookahead} layer(s); no band "
+                              "was measured deep enough to judge that")
+                        continue
+                    worst = int(real["deepest_offset"].min())
+                    band = real.loc[real["deepest_offset"].idxmin(), "src_group"]
+                    who = real.loc[real["deepest_offset"].idxmin(), "predictor"]
+                    if worst >= required_lookahead:
+                        print(f"     -> covers a disk read ({required_lookahead} layers): even the "
+                              f"weakest band ({band}) reaches {worst} with {who}")
                     else:
-                        worst = int(real["deepest_offset"].min())
-                        band = real.loc[real["deepest_offset"].idxmin(), "src_group"]
-                        print(f"\n     a disk read needs {required_lookahead} layer(s) of lead "
-                              f"time; the weakest band ({band}) holds prediction for {worst}")
-                        print("     " + (
-                            "→ per-layer prediction can cover a disk tier"
-                            if worst >= required_lookahead else
-                            "→ per-layer prediction cannot cover a disk tier on its own. "
-                            "A longer-horizon signal (block-level speculation, or Q4 domain "
-                            "warming) has to carry the disk→RAM decision"))
+                        print(f"     -> short of a disk read ({required_lookahead} layers): the "
+                              f"{band} band tops out at {worst}, best predictor {who}")
+                        print("        a longer-horizon signal (block-level speculation, or Q4 "
+                              "domain warming) has to carry the disk->RAM decision")
         except FileNotFoundError as exc:
             log.warning("Skipping Q3: %s", exc)
     else:
@@ -461,6 +541,7 @@ def bench_main(argv: list[str] | None = None) -> int:
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
+    _force_utf8_stdout()
     _setup_logging(args.verbose)
     viz.use_style()
 

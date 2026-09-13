@@ -21,6 +21,75 @@ Qwen3-30B-A3B is structurally close to V4-Flash (fine-grained, high expert
 count, low top-k), so policies tuned there should port with the constants
 changed rather than the design.
 
+## Measured results
+
+Stage 0 has been run end to end. Everything below is measured, not estimated.
+
+**Setup.** OLMoE-1B-7B-0924-Instruct (16 MoE layers, 64 experts, top-8, 12.6 MB
+per expert at fp16) on an RTX 2060 6GB with the checkpoint split across GPU and
+system RAM, 8 CPU threads, 31.8 GB RAM, Samsung NVMe. Corpus of 48 sequences ×
+512 tokens = 24,576 tokens, 8 sequences in each of six domains.
+
+| | Result | What it means |
+|---|---|---|
+| **Q1** | hottest 10% serve **21.6%**, Gini 0.258, **zero** unused experts | mild skew — a small pinned cache helps, but every expert earns its keep |
+| **Q2** | **40.1%** consecutive overlap vs 12.5% random | strong temporal locality |
+| **Q3** | `stale_router` **0.835** at k=1; `probe` **0.726** at k=8 | prefetch works, and the two tiers want different predictors |
+| **Q4** | between-domain JS **24.8×** the within-domain floor | domains separate cleanly — cache warming has real signal |
+| **Q5** | Belady 83.9%, static 72.8%, LFU 72.4%, **LRU 65.2%** | 18.7% headroom, and LRU is the *worst* online policy |
+| **Q6** | union(4) = **2.48×** top-k → 1.61× fewer bytes/token | moderate; speculation needs high draft acceptance |
+| **Q7** | `t_c = 0.0358·m + 0.730` ms, PCIe 1.117 ms, **m\* = 17.4 tokens** | experts under ~17 tokens are cheaper on the CPU |
+| **Q8** | 2.39 GB/s peak, 8.27 ms/expert, **4 layers** of lookahead needed | a disk tier is reachable, at 2× prefetch budget |
+
+### The three findings that changed the design
+
+**Predictor choice is tier-dependent.** `stale_router` — running layer *N+k*'s
+real router on layer *N*'s hidden state, no training, no parameters — wins at
+one layer ahead. But it loses **41%** of its recall between k=1 and k=8, while
+a ridge probe loses **11%**. From k=2 onward the probe is simply better.
+
+```
+1x budget      k=1     k=2     k=4     k=8
+stale_router   0.835   0.775   0.669   0.495
+probe          0.814   0.792   0.762   0.726
+```
+
+RAM→GPU needs one layer, so use the free predictor. Disk→RAM needs four, where
+a flat decay curve is worth more than peak accuracy. Judging both by the same
+predictor hides the second case entirely.
+
+**LRU is the wrong default, and the cyclic access pattern is why.** MoE decode
+sweeps every layer before returning to layer 0, touching `top_k × n_layers` =
+128 distinct slots per token. Below that working set, LRU evicts each entry
+immediately before its next use — its textbook worst case. Measured at 25%
+capacity, LRU (65.2%) is beaten by LFU (72.4%) *and* by a static hot-expert
+table (72.8%). An earlier run on 2,727 tokens showed the opposite; the
+pathology only became visible with enough data.
+
+**The storage tier wants batched reads, not a deeper queue of single ones.**
+
+```
+request size   peak GB/s   knee QD   depth-1 penalty
+  0.0625 MiB       1.42        16        6.52x
+     1 MiB         1.97        16        1.77x
+    12 MiB         2.39         2        1.59x
+```
+
+PCIe saturates at queue depth 1, which is why serial I/O cost models work for
+it. NVMe does not: small reads need **16 concurrent requests** to reach peak,
+and issuing them one at a time costs 6.5×. Store experts contiguously, read
+them whole, and batch the prefetch — a scheduler fetching one expert at a time
+cannot use the drive however good its predictions are.
+
+### Caveats
+
+Single model, single machine. `m*`, the PCIe figures and the whole storage
+curve are properties of this hardware and have to be re-measured elsewhere —
+which is what `ff-bench` is for. The corpus is 48 sequences; large enough to
+make the probe well-determined (≈14,700 training samples against 2,048
+dimensions) but not a substitute for a real workload trace. All numbers are
+prefill-only; `--gen-tokens` captures decode and has not been run at this size.
+
 ## Stage 0 — instrumentation
 
 Answers eight questions, each of which gates a later design decision. Q1–Q6
@@ -37,6 +106,27 @@ neither a trace nor a checkpoint.
 | **Q6** | How fast does the expert set grow with block size? | whether batching/speculation amortises loads |
 | **Q7** | What does one expert cost on CPU, GPU and PCIe? | where the CPU/GPU placement line falls |
 | **Q8** | How fast is a read off disk, and at what queue depth? | whether a disk tier can ever be hidden |
+
+Q1 is reported **per layer and per band**, not just pooled. Expert usage does
+not behave the same way at every depth, and two different things vary with it:
+
+- **Hot-expert concentration** — what share of accesses the hottest 10% serve.
+  Decides whether a small pinned cache pays, and where.
+- **Routing-weight dominance** — how much of the gate's output mass goes to the
+  top-ranked expert. This reads the `weight` column the tracer has always
+  written and nothing else touches.
+
+The second one matters because it separates two regimes that look identical if
+you only count accesses. When one expert's weight dominates, the block's output
+is close to that single expert's, so its routing decision propagates strongly
+to the next layer — which is what makes *cross-layer routing correlation* high.
+When weights are balanced the output is a genuine blend, the hidden state barely
+moves between layers, and it is *hidden-state similarity* that is high instead.
+
+Those two regimes want different prefetch features — previous-layer expert IDs
+in the first case, the hidden state itself in the second. So Q1's depth profile
+is what tells you which feature to feed Q3's predictor at which depth, and the
+two bands tables are meant to be read side by side.
 
 **Q3 is the one that decides the project.** Prefetch only pays if you have lead
 time: predicting layer *N+k* at layer *N* buys *k* layers of compute to hide the
@@ -247,6 +337,11 @@ So a single global LRU is the wrong default here. If real traces show the same
 cliff, the fixes are per-layer cache partitioning or a frequency-biased policy.
 Check where LRU crosses LFU before designing Stage 1.
 
+**They did.** On the real 24,576-token trace LRU reaches 65.2% at 25% capacity
+against LFU's 72.4% and a static hot-expert table's 72.8% — the synthetic
+check called this one correctly, and an earlier 2,727-token run did not show
+it. Stage 1 should not build on recency.
+
 ## Layout
 
 ```
@@ -271,7 +366,7 @@ is a custom module and will need its own branch in `discover_moe()`.
 ## Roadmap
 
 - **Stage 0** — instrumentation and routing analysis *(current; runs on existing hardware)*
-- **Stage 1** — expert cache + async prefetch in pure PyTorch, pinned RAM, separate CUDA stream. Most of the wall-clock win lives here.
+- **Stage 1** — expert cache + async prefetch in pure PyTorch, pinned RAM, separate CUDA stream. Most of the wall-clock win lives here. Stage 0 says: use a frequency-biased or static policy rather than LRU (Q5), prefetch one layer ahead with `stale_router` (Q3), pin experts and skip the three-stream split since pinned already saturates this bus (Q7), and send experts with under ~17 routed tokens to the CPU to free a PCIe slot (Q7).
 - **Stage 2** — Triton kernels: fused gather-GEMM, dequant, fused router. *Needs sm_80+.*
 - **Stage 3** — scale to V4-Flash, where the routed pool may not fit in RAM either and experts stream disk→RAM→GPU. *Needs RAM and NVMe headroom.* Q8 is the go/no-go: if `t_disk` needs more lookahead than Q3 shows prediction surviving, the disk tier has to be driven by a longer-horizon signal rather than per-layer routing prediction.
 

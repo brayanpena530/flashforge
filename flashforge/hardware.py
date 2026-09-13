@@ -404,11 +404,19 @@ def ensure_scratch_file(path: Path, size_bytes: int, *, chunk: int = 32 << 20) -
     log.info("Creating scratch file %s (%.1f GiB) ...", path, size_bytes / (1 << 30))
     rng = np.random.default_rng(0)
     written = 0
+    last_logged = 0
     with open(path, "wb") as handle:
         while written < size_bytes:
             block = min(chunk, size_bytes - written)
-            handle.write(rng.integers(0, 256, size=block, dtype=np.uint8).tobytes())
+            # rng.bytes, not rng.integers(...).tobytes(): the file has to exceed
+            # RAM to be useful, so this loop runs tens of gigabytes and the
+            # integer path spends most of that time in the generator rather
+            # than the disk.
+            handle.write(rng.bytes(block))
             written += block
+            if written - last_logged >= (4 << 30):
+                log.info("  ... %.0f/%.0f GiB", written / (1 << 30), size_bytes / (1 << 30))
+                last_logged = written
         handle.flush()
         os.fsync(handle.fileno())
     return path

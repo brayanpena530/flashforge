@@ -71,7 +71,14 @@ for domain in DOMAINS:
             hidden_by_layer[str(layer)] = hidden.astype(np.float16)
             logits_by_layer[str(layer)] = logits.astype(np.float16)
 
-            probs = np.exp(logits - logits.max(axis=1, keepdims=True))
+            # Peaked routing at the edges, flat mid-stack: plants the
+            # weight-dominance pattern Q1's band split looks for. Top-k
+            # selection is invariant to a positive temperature scale, so this
+            # moves the `weight` column only and leaves every other question's
+            # input — which experts get chosen — exactly as it was.
+            temperature = 0.35 + 1.4 * (1 - edge)
+            scaled = logits / temperature
+            probs = np.exp(scaled - scaled.max(axis=1, keepdims=True))
             probs /= probs.sum(axis=1, keepdims=True)
             top = np.argpartition(-probs, K - 1, axis=1)[:, :K]
             order = np.argsort(-np.take_along_axis(probs, top, axis=1), axis=1)
@@ -125,7 +132,46 @@ check("planted skew detected", skew["top10pct_mass"].mean() > 0.10,
 check("gini in range", 0 <= skew["gini"].mean() <= 1, f"gini {skew['gini'].mean():.3f}")
 check("lorenz monotonic", bool(np.all(np.diff(lorenz["access_fraction"]) >= -1e-9)),
       f"ends at {lorenz['access_fraction'].iloc[-1]:.3f}")
+check("skew is reported per layer", len(skew) == L, f"{len(skew)} rows for {L} layers")
 plots.plot_skew(lorenz, skew).savefig(out / "q1.png")
+
+print("\nQ1 depth profile")
+wprof = analysis.routing_weight_profile(frame, K)
+check("weight profile covers every layer", len(wprof) == L, f"{len(wprof)} rows")
+check("top-1 share is a share", bool(wprof["top1_share"].between(1.0 / K, 1.0).all()),
+      f"range {wprof['top1_share'].min():.3f}-{wprof['top1_share'].max():.3f} "
+      f"(even split would be {1/K:.3f})")
+check("weight entropy is normalised", bool(wprof["weight_entropy"].between(0, 1).all()),
+      f"range {wprof['weight_entropy'].min():.3f}-{wprof['weight_entropy'].max():.3f}")
+check("every token contributed once per layer",
+      bool((wprof["n_tokens"] == seq_id * T).all()),
+      f"{int(wprof['n_tokens'].iloc[0])} tokens per layer")
+
+bands = analysis.band_summary(skew, wprof, list(range(L)))
+check("band summary has three rows", len(bands) == 3, f"{list(bands['band'])}")
+check("band layer counts sum to the stack", int(bands["n_layers"].sum()) == L,
+      f"{dict(zip(bands['band'], bands['n_layers']))}")
+# The generator plants peaked routing at the edges and flat routing mid-stack.
+# Recovering that ordering is what proves the weight column is being read
+# correctly — counting accesses alone cannot see this at all.
+keyed = bands.set_index("band")
+check("planted weight dominance recovered",
+      min(keyed.loc["input", "top1_share"], keyed.loc["output", "top1_share"])
+      > keyed.loc["middle", "top1_share"],
+      f"input {keyed.loc['input','top1_share']:.3f} / "
+      f"output {keyed.loc['output','top1_share']:.3f} vs "
+      f"middle {keyed.loc['middle','top1_share']:.3f}")
+
+ragged = frame.iloc[:-1]
+try:
+    analysis.routing_weight_profile(ragged, K)
+    check("ragged trace is rejected", False, "no error raised")
+except ValueError as exc:
+    check("ragged trace is rejected", True, f"{type(exc).__name__} raised, not silent misalignment")
+
+plots.plot_layer_bands(
+    analysis.annotate_bands(skew.merge(wprof, on="layer"), list(range(L))), top_k=K
+).savefig(out / "q1_bands.png")
 
 print("\nQ2 locality")
 overlap = analysis.consecutive_overlap(frame, E, K)
@@ -205,6 +251,26 @@ check("output band is limited by coverage, not accuracy",
 check("mid-stack bands are judged on accuracy",
       reach.set_index("src_group").loc["input", "limited_by"] in {"accuracy", "none"},
       f"input limited_by={reach.set_index('src_group').loc['input', 'limited_by']}")
+
+deep_groups = analysis.predictability_by_group(deep)
+all_reach = analysis.lookahead_reach(deep_groups, threshold=0.5)
+check("reach covers every band x predictor pair",
+      len(all_reach) == 3 * deep_groups["predictor"].nunique(),
+      f"{len(all_reach)} rows for 3 bands x {deep_groups['predictor'].nunique()} predictors")
+check("single-predictor view agrees with the all-predictor view",
+      all_reach[all_reach.predictor == 'stale_router']
+        .set_index('src_group')['deepest_offset'].to_dict()
+      == reach.set_index('src_group')['deepest_offset'].to_dict(),
+      "deepest_usable_lookahead is a filtered view, not a second implementation")
+best = analysis.best_lookahead_by_band(all_reach)
+check("best-per-band picks one predictor per band", len(best) == 3,
+      ", ".join(f"{r.src_group}:{r.predictor}@{int(r.deepest_offset)}" for r in best.itertuples()))
+# The winner must genuinely be a winner: no other predictor may reach deeper.
+merged = all_reach.merge(best[['src_group','deepest_offset']], on='src_group',
+                         suffixes=('', '_best'))
+check("no predictor beats the chosen best",
+      bool((merged['deepest_offset'] <= merged['deepest_offset_best']).all()),
+      "selection is a true argmax over depth")
 plots.plot_predictability_groups(by_group, K, required_lookahead=4).savefig(out / "q3_groups.png")
 
 print("\nQ4 domain")
