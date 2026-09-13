@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- flashforge ---
+# Routing traces and their reports: large (hidden states run to hundreds of MB
+# per run) and fully regenerable with ff-collect.
+traces/
+tests/_synth_traces/
+report/
+*.npz
+*.parquet
