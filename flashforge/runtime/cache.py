@@ -135,6 +135,30 @@ class ExpertCache:
     def down_proj(self, slot: int) -> torch.Tensor:
         return self._views["down_proj"][slot]
 
+    def gather(self, slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Stack several slots into batched weights: (E,I,H), (E,I,H), (E,H,I).
+
+        One `index_select` over the flat pool, not three over the per-projection
+        views, because the three projections of a slot are adjacent in the row —
+        the same argument that made a fill one `copy_` instead of three.
+
+        This *copies* the weights, which is the whole cost of the grouped path:
+        E x 12.58 MB read and written on-device per layer. It buys the removal
+        of 3E kernel launches, and Stage 1's profile said launches were 95% of
+        decode. Which of those two wins is a measurement, not an argument; see
+        `ff-serve --grouped/--no-grouped`.
+        """
+        rows = self._slots.index_select(0, slots)
+        shape = self.store.shape
+        m = shape.matrix_numel
+        # unflatten, not view: a column slice of `rows` is not contiguous. Same
+        # reason as the pool views above.
+        return (
+            rows[:, 0 * m : 1 * m].unflatten(1, (shape.intermediate_size, shape.hidden_size)),
+            rows[:, 1 * m : 2 * m].unflatten(1, (shape.intermediate_size, shape.hidden_size)),
+            rows[:, 2 * m : 3 * m].unflatten(1, (shape.hidden_size, shape.intermediate_size)),
+        )
+
     # -- the hot path ------------------------------------------------------
 
     def acquire(self, layer: int, experts: list[int]) -> dict[int, int]:

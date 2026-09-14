@@ -51,6 +51,19 @@ one sample from each bucket landing in a flattering order.
 it. If within-condition spread exceeds between-condition spread, say so in the
 output — don't let the reader infer a trend that isn't there.
 
+**A median printed without its spread is the same bug.** Stage 1b hit this
+immediately after the rule above was written. The decode column had a spread
+column; the prefill column did not. The first run showed prefill dropping 36%
+on the grouped path, with a *convincing mechanism* ready to explain it — a
+prefill batch routes to all 64 experts, so the gather copies 805 MB per layer
+to save launches the loop path was not wasting. The next run reversed the sign.
+Prefill is one short timed region per pass and its real spread is 63.3–94.9
+tok/s, which swallows the difference whole.
+
+The available explanation is the trap. A number that confirms a mechanism you
+already believe gets less scrutiny, not more. Put a spread on **every**
+reported median, not just the one you are currently arguing about.
+
 ### 1.3 Don't mix constants from different runs
 
 The README's Q7 row quoted `0.0338m + 0.774`, m\* = 18.0, disk ratio 40.1x from
@@ -206,6 +219,23 @@ prefetch is worth at most 5% and moved after it.
 
 **Rule:** docstrings and READMEs state what was measured. Predictions get labelled
 as predictions, in the future tense, with the experiment that would settle them.
+
+### 4.4 A tolerance in a unit test is not a tolerance in the model
+
+Stage 1b's grouped path is not bit-exact — one `index_add_` over every expert
+has no defined accumulation order. The test suite held it to `2e-19` in fp32 on
+a toy block, which is a fine test and answers the wrong question. In fp16 on a
+7B model one rounding difference can flip an argmax, and from that token on the
+two paths generate different text.
+
+So `ff-serve` decodes greedily on both paths and reports the first token id that
+differs. It was identical for 65 tokens, and *that* is why the grouped path is
+the default. Collect the ids as device tensors and convert after the timed
+region — an `.item()` per step forces a synchronize and makes the harness
+measure itself.
+
+**Rule:** when an optimisation trades exactness, the acceptance test has to run
+at the real dtype, the real scale, and on the observable the user actually sees.
 
 ---
 

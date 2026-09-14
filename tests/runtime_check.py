@@ -199,7 +199,9 @@ print("\nBlock parity against stock OlmoeSparseMoeBlock")
 
 for capacity, label in [(L * E, "everything resident"), (E, "thrashing")]:
     patched = copy.deepcopy(model)
-    report = install_expert_cache(patched, capacity=capacity, device="cpu")
+    # grouped=False explicitly: this is the bit-exact oracle, and it is the only
+    # assertion in the file that would silently weaken if the default flipped.
+    report = install_expert_cache(patched, capacity=capacity, device="cpu", grouped=False)
     with torch.no_grad():
         actual = patched(hidden_in)
     delta = (actual - expected).abs().max().item()
@@ -239,6 +241,70 @@ with torch.no_grad():
 check("a cache large enough to hold the model never misses twice",
       warm_report.cache.stats.hit_rate == 1.0,
       warm_report.cache.stats.describe())
+
+# ==========================================================================
+# Stage 1b — the grouped path
+# ==========================================================================
+
+print("\nGrouped path (Stage 1b)")
+
+# Not bit-exact by construction: one index_add_ over every expert at once has
+# no defined accumulation order. The tolerance is what this path costs, so it
+# is asserted rather than waved at. In fp32 the loop path's own rounding is
+# ~1e-7 relative, and these activations are O(1).
+for capacity, label in [(L * E, "everything resident"), (E, "thrashing")]:
+    grouped_model = copy.deepcopy(model)
+    grouped_report = install_expert_cache(
+        grouped_model, capacity=capacity, device="cpu", grouped=True
+    )
+    with torch.no_grad():
+        grouped_out = grouped_model(hidden_in)
+    delta = (grouped_out - expected).abs().max().item()
+    check(f"grouped matches stock within tolerance ({label})", delta < 1e-5,
+          f"max abs difference {delta:.3e} (loop path is exactly 0)")
+
+# Padding is the part most likely to be wrong and least likely to announce it:
+# a group shorter than the chunk's width is padded with rows that point at a
+# real token and must carry weight zero. An imbalanced batch is what exercises
+# it — one token routed alone alongside a full batch makes the group sizes
+# differ by an order of magnitude.
+lopsided = torch.randn(1, 1, H)
+solo_ref, solo_grouped = copy.deepcopy(model), copy.deepcopy(model)
+install_expert_cache(solo_ref, capacity=L * E, device="cpu", grouped=False)
+install_expert_cache(solo_grouped, capacity=L * E, device="cpu", grouped=True)
+with torch.no_grad():
+    delta = (solo_grouped(lopsided) - solo_ref(lopsided)).abs().max().item()
+check("single-token decode agrees with the loop path", delta < 1e-5,
+      f"max abs difference {delta:.3e} — every group is width 1, all padding")
+
+# Chunking for VRAM must not change the answer. Forcing one expert per chunk is
+# the pathological end of that: maximum chunks, minimum padding.
+chunked = copy.deepcopy(model)
+chunk_report = install_expert_cache(chunked, capacity=L * E, device="cpu", grouped=True)
+for block in chunk_report.blocks:
+    block.group_bytes = 1  # -> chunk size clamps to 1 expert
+with torch.no_grad():
+    delta = (chunked(hidden_in) - grouped_out).abs().max().item()
+check("chunking the gather does not change the result", delta < 1e-5,
+      f"max abs difference {delta:.3e} at one expert per chunk")
+
+# The gather is where a shape mistake would show as garbage rather than a raise,
+# because all three projections have the same element count in this config.
+gather_cache = ExpertCache(probe_store, capacity=8, device="cpu")
+gather_slots = gather_cache.acquire(0, [3, 7])
+slot_ids = torch.tensor([gather_slots[3], gather_slots[7]])
+check("the grouped path is the installed default",
+      all(block.grouped for block in warm_report.blocks),
+      "install_expert_cache defaults to grouped=True; the parity tests above opt "
+      "out explicitly so the bit-exact assertion cannot weaken silently")
+
+gate_w, up_w, down_w = gather_cache.gather(slot_ids)
+check("gather stacks the right experts in the right shapes",
+      gate_w.shape == (2, I, H) and down_w.shape == (2, H, I)
+      and torch.equal(gate_w[1], reference.layers[0].mlp.experts[7].gate_proj.weight)
+      and torch.equal(up_w[0], reference.layers[0].mlp.experts[3].up_proj.weight)
+      and torch.equal(down_w[1], reference.layers[0].mlp.experts[7].down_proj.weight),
+      f"gate {tuple(gate_w.shape)}, down {tuple(down_w.shape)} — down keeps its transpose")
 
 print("\nRouting is untouched")
 patched = copy.deepcopy(model)

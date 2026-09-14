@@ -796,6 +796,7 @@ def _run_phase(model, input_ids, gen_tokens: int, stats=None) -> dict:
             "decode_s": 0.0,
             "decode_tokens": 0,
             "decode_counts": (0, 0, 0),
+            "tokens": [],
         }
         if gen_tokens <= 0:
             return result
@@ -803,16 +804,26 @@ def _run_phase(model, input_ids, gen_tokens: int, stats=None) -> dict:
         past = out.past_key_values
         next_id = out.logits[:, -1:].argmax(-1)
 
+        # Decoding is greedy, so the token sequence is a deterministic function
+        # of the weights. Two execution paths that agree numerically produce the
+        # same ids; the first id they differ on is where the grouped path's lost
+        # bit-exactness became visible output rather than a rounding difference.
+        # The ids stay on the device inside the loop. Calling .item() per token
+        # would force a synchronize every step and make this harness measure
+        # itself instead of the model.
+        tokens = [next_id]
         _cuda_sync()
         start = time.perf_counter()
         for _ in range(gen_tokens):
             out = model(next_id, past_key_values=past, use_cache=True)
             past = out.past_key_values
             next_id = out.logits[:, -1:].argmax(-1)
+            tokens.append(next_id)
         _cuda_sync()
         result["decode_s"] = time.perf_counter() - start
         result["decode_tokens"] = gen_tokens
         result["decode_counts"] = tuple(a - b for a, b in zip(snapshot(), after_prefill))
+        result["tokens"] = [int(t.flatten()[0]) for t in tokens]
 
     return result
 
@@ -924,6 +935,13 @@ def serve_main(argv: list[str] | None = None) -> int:
         help="host RAM to page-lock for async DMA. Pinned pages cannot be swapped, "
              "so this is a hard claim on physical memory — see runtime/store.py",
     )
+    parser.add_argument(
+        "--path", default="both", choices=["loop", "grouped", "both"],
+        help="expert execution path. 'loop' is the bit-exact reference, one GEMM "
+             "per expert; 'grouped' is Stage 1b's batched bmm. 'both' times them "
+             "back to back on the same loaded model and the same warm cache, "
+             "which is the only way to attribute a difference to the path",
+    )
     parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16"])
     parser.add_argument(
         "--baseline", action="store_true",
@@ -950,6 +968,7 @@ def serve_main(argv: list[str] | None = None) -> int:
 
     model_id = args.model or DEFAULT_MODEL
     capacities = [int(c) for c in args.capacity.split(",") if c.strip()]
+    paths = ["loop", "grouped"] if args.path == "both" else [args.path]
 
     import gc
 
@@ -1034,68 +1053,130 @@ def serve_main(argv: list[str] | None = None) -> int:
                       "not the cache. Compare capacities across separate runs instead.")
 
         stats = report.cache.stats
-        for _ in range(args.warmup):
-            _run_phase(model, input_ids, min(4, args.gen_tokens))
+        # Both paths share this model and this cache. Flipping the flag on the
+        # already-installed blocks is what makes the comparison controlled: same
+        # weights, same slot pool, same residency, one variable.
+        for path in paths:
+            for block in report.blocks:
+                block.grouped = path == "grouped"
 
-        prefill_samples, decode_samples = [], []
-        for _ in range(max(1, args.repeats)):
-            stats.reset()
-            timing = _run_phase(model, input_ids, args.gen_tokens, stats)
-            if timing["prefill_s"]:
-                prefill_samples.append(timing["prefill_tokens"] / timing["prefill_s"])
-            if timing["decode_s"]:
-                decode_samples.append(timing["decode_tokens"] / timing["decode_s"])
+            for _ in range(args.warmup):
+                _run_phase(model, input_ids, min(4, args.gen_tokens))
 
-        # Counters come from the final pass. They are deterministic given the
-        # prompt — the same experts are routed to every time — so unlike the
-        # timings they need no aggregation.
-        p_hits, p_misses, p_bytes = timing["prefill_counts"]
-        d_hits, d_misses, d_bytes = timing["decode_counts"]
+            prefill_samples, decode_samples = [], []
+            for _ in range(max(1, args.repeats)):
+                stats.reset()
+                timing = _run_phase(model, input_ids, args.gen_tokens, stats)
+                if timing["prefill_s"]:
+                    prefill_samples.append(timing["prefill_tokens"] / timing["prefill_s"])
+                if timing["decode_s"]:
+                    decode_samples.append(timing["decode_tokens"] / timing["decode_s"])
 
-        rows.append({
-            "capacity": capacity,
-            "prefill_tok_s": _median(prefill_samples),
-            "decode_tok_s": _median(decode_samples),
-            "decode_lo": min(decode_samples) if decode_samples else 0.0,
-            "decode_hi": max(decode_samples) if decode_samples else 0.0,
-            "prefill_hit_rate": _rate(p_hits, p_misses),
-            "decode_hit_rate": _rate(d_hits, d_misses),
-            "decode_gb_per_token": d_bytes / 1e9 / max(1, timing["decode_tokens"]),
-            "vram_gb": report.resident_bytes / (1 << 30),
-        })
-        print(f"  prefill {_median(prefill_samples):8.1f} tok/s  "
-              f"hit {_rate(p_hits, p_misses):5.1%}  {p_bytes / 1e9:5.2f} GB")
-        print(f"  decode  {_median(decode_samples):8.2f} tok/s  "
-              f"({min(decode_samples):.2f}-{max(decode_samples):.2f} over "
-              f"{len(decode_samples)} passes)  hit {_rate(d_hits, d_misses):5.1%}  "
-              f"{d_bytes / 1e9:5.2f} GB")
+            # Counters come from the final pass. They are deterministic given the
+            # prompt — the same experts are routed to every time — so unlike the
+            # timings they need no aggregation.
+            p_hits, p_misses, p_bytes = timing["prefill_counts"]
+            d_hits, d_misses, d_bytes = timing["decode_counts"]
 
-    print("\n" + "=" * 78)
-    print(f"{'slots':>7} {'VRAM GB':>8} {'prefill t/s':>12} {'pf hit':>7} "
+            rows.append({
+                "capacity": capacity,
+                "path": path,
+                "prefill_tok_s": _median(prefill_samples),
+                # Prefill gets a spread too. It is one short timed region per
+                # pass, so it is the noisiest number here and the most likely
+                # to be read as a trend; a median with no spread beside it is
+                # how the first Stage 1b run appeared to show a 36% prefill
+                # regression that the next run reversed.
+                "prefill_lo": min(prefill_samples) if prefill_samples else 0.0,
+                "prefill_hi": max(prefill_samples) if prefill_samples else 0.0,
+                "decode_tok_s": _median(decode_samples),
+                "decode_lo": min(decode_samples) if decode_samples else 0.0,
+                "decode_hi": max(decode_samples) if decode_samples else 0.0,
+                "prefill_hit_rate": _rate(p_hits, p_misses),
+                "decode_hit_rate": _rate(d_hits, d_misses),
+                "decode_gb_per_token": d_bytes / 1e9 / max(1, timing["decode_tokens"]),
+                "vram_gb": report.resident_bytes / (1 << 30),
+                "tokens": timing["tokens"],
+            })
+            print(f"  [{path:>7}] prefill {_median(prefill_samples):8.1f} tok/s  "
+                  f"({min(prefill_samples):.1f}-{max(prefill_samples):.1f})  "
+                  f"hit {_rate(p_hits, p_misses):5.1%}  {p_bytes / 1e9:5.2f} GB")
+            print(f"  [{path:>7}] decode  {_median(decode_samples):8.2f} tok/s  "
+                  f"({min(decode_samples):.2f}-{max(decode_samples):.2f} over "
+                  f"{len(decode_samples)} passes)  hit {_rate(d_hits, d_misses):5.1%}  "
+                  f"{d_bytes / 1e9:5.2f} GB")
+
+    print("\n" + "=" * 100)
+    print(f"{'slots':>7} {'path':>8} {'VRAM GB':>8} {'prefill t/s':>12} {'spread':>13} "
           f"{'decode t/s':>11} {'spread':>13} {'dec hit':>8} {'GB/tok':>7}")
     for row in rows:
-        spread = f"{row['decode_lo']:.2f}-{row['decode_hi']:.2f}"
-        print(f"{row['capacity']:>7} {row['vram_gb']:>8.2f} {row['prefill_tok_s']:>12.1f} "
-              f"{row['prefill_hit_rate']:>6.1%} {row['decode_tok_s']:>11.2f} {spread:>13} "
+        print(f"{row['capacity']:>7} {row['path']:>8} {row['vram_gb']:>8.2f} "
+              f"{row['prefill_tok_s']:>12.1f} "
+              f"{row['prefill_lo']:.1f}-{row['prefill_hi']:<8.1f} "
+              f"{row['decode_tok_s']:>11.2f} "
+              f"{row['decode_lo']:.2f}-{row['decode_hi']:<8.2f} "
               f"{row['decode_hit_rate']:>7.1%} {row['decode_gb_per_token']:>7.3f}")
+
+    # Same rule as the capacity sweep: a path difference narrower than the
+    # machine's own run-to-run spread is not a result.
+    if len(paths) > 1:
+        print(f"\n{'slots':>7} {'phase':>8} {'loop t/s':>10} {'grouped t/s':>12} "
+              f"{'change':>9}  verdict")
+        for capacity in capacities:
+            pair = {r["path"]: r for r in rows if r["capacity"] == capacity}
+            loop, grouped = pair.get("loop"), pair.get("grouped")
+            if not (loop and grouped):
+                continue
+            for phase, key, lo, hi in [
+                ("prefill", "prefill_tok_s", "prefill_lo", "prefill_hi"),
+                ("decode", "decode_tok_s", "decode_lo", "decode_hi"),
+            ]:
+                if not loop[key]:
+                    continue
+                change = grouped[key] / loop[key] - 1.0
+                noise = max((r[hi] - r[lo]) / r[key] for r in (loop, grouped) if r[key])
+                verdict = ("real" if abs(change) > noise
+                           else f"inside the {noise:.0%} within-path spread — no finding")
+                print(f"{capacity:>7} {phase:>8} {loop[key]:>10.2f} "
+                      f"{grouped[key]:>12.2f} {change:>+8.0%}  {verdict}")
+
+            # A tolerance in fp32 on a toy block says nothing about fp16 on a
+            # 7B model, where a rounding difference can flip an argmax and the
+            # two paths then walk away from each other. This is the only check
+            # that speaks to whether the grouped path is the same *model*.
+            loop_ids, grouped_ids = loop["tokens"], grouped["tokens"]
+            if loop_ids and grouped_ids:
+                shared = min(len(loop_ids), len(grouped_ids))
+                diverged = next(
+                    (i for i in range(shared) if loop_ids[i] != grouped_ids[i]), None
+                )
+                if diverged is None:
+                    print(f"        greedy output identical for all {shared} tokens")
+                else:
+                    print(f"        greedy output diverges at token {diverged} of "
+                          f"{shared} — grouped is not bit-exact, and at fp16 that "
+                          "is visible in the text, not just the activations")
 
     # A capacity sweep is only informative if the differences it shows are
     # larger than the machine's own run-to-run variation. On this box they were
     # not, which is itself the answer: transfer volume is not what sets decode
     # speed here. Say it rather than leaving a 10% gap looking like a trend.
-    widest = max((r["decode_hi"] - r["decode_lo"]) / r["decode_tok_s"]
-                 for r in rows if r["decode_tok_s"]) if rows else 0.0
-    if len(rows) > 1:
-        span = max(r["decode_tok_s"] for r in rows) - min(r["decode_tok_s"] for r in rows)
-        relative = span / max(r["decode_tok_s"] for r in rows)
+    for path in paths:
+        same_path = [r for r in rows if r["path"] == path and r["decode_tok_s"]]
+        if len(same_path) < 2:
+            continue
+        widest = max((r["decode_hi"] - r["decode_lo"]) / r["decode_tok_s"] for r in same_path)
+        peak = max(r["decode_tok_s"] for r in same_path)
+        relative = (peak - min(r["decode_tok_s"] for r in same_path)) / peak
         if relative <= widest:
-            print(f"\n[serve] the spread across capacities ({relative:.0%}) is no wider than "
-                  f"the spread within one ({widest:.0%}).")
+            print(f"\n[serve] {path}: the spread across capacities ({relative:.0%}) is no "
+                  f"wider than the spread within one ({widest:.0%}).")
             print("        Capacity is not resolvably changing decode speed on this "
                   "machine — which is the finding, not a failed measurement.")
 
     best = max(rows, key=lambda r: r["decode_tok_s"])
     print(f"\n[serve] best decode {best['decode_tok_s']:.2f} tok/s at {best['capacity']} slots "
+          f"on the {best['path']} path "
           f"({best['vram_gb']:.2f} GB resident, {best['decode_hit_rate']:.1%} hit rate)")
     if baseline_tps:
         print(f"        {best['decode_tok_s'] / baseline_tps:.1f}x the accelerate-offload "

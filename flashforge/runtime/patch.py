@@ -61,11 +61,19 @@ def install_expert_cache(
     capacity: int,
     device: torch.device | str = "cuda",
     pin_gb: float = 0.0,
+    grouped: bool = True,
 ) -> PatchReport:
     """Move experts to host RAM, front them with a GPU cache, return the wiring.
 
     `capacity` is in experts, not bytes — it is the same unit Q5's sweep used,
     so a capacity chosen from the hit-rate curve transfers directly.
+
+    `grouped` selects Stage 1b's batched-GEMM path: decode 4.61 -> 5.93 tok/s
+    (+29%, against a 14% within-path spread over nine passes), prefill
+    unresolvable. It defaults **on** despite not being bit-exact, because on the
+    real model in fp16 the two paths produced identical greedy output for 65
+    tokens — the divergence is below the argmax. Pass `grouped=False` for the
+    bit-exact loop path, which is what the parity tests hold to zero.
     """
     device = torch.device(device)
     spec = discover_moe(model)
@@ -86,6 +94,7 @@ def install_expert_cache(
             top_k=spec.top_k,
             norm_topk_prob=spec.norm_topk_prob,
             act_fn=act_fn,
+            grouped=grouped,
         )
         _replace_module(model, f"layers.{layer_idx}.mlp", block)
         blocks.append(block)

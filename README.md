@@ -188,7 +188,8 @@ looks like: both sides doing bookkeeping rather than arithmetic.
 So the planned next step was wrong. **Prefetch would buy at most 5% here**,
 because at a workable cache size the transfers are already nearly free. The
 lever is collapsing the per-expert GEMMs into one grouped call — filed under
-Stage 2 as a kernel concern, actually the Stage 1 bottleneck.
+Stage 2 as a kernel concern, actually the Stage 1 bottleneck. Stage 1b below
+does that, and gets 27%.
 
 Note also that 384 slots is not the best configuration despite the best hit
 rate. 5.39 GB resident on a 6 GB card leaves little room for activations, and
@@ -226,6 +227,59 @@ just swapped, and produced a table where a *better* hit rate came with *worse*
 throughput (46.8% at 2.33 tok/s against 33.0% at 3.67). That reads exactly like
 a cache-policy finding and is not one. `ff-serve` now frees the old store
 first, and prints free host RAM at each step so the failure is visible.
+
+## Stage 1b — the grouped GEMM path
+
+Stage 1's profile said dispatch, not transfer. So `CachedMoEBlock` grew a
+second path: sort the (token, expert) pairs by expert, pad each expert's group
+to a common width, gather the routed experts' weights into one batched tensor,
+and run three `bmm` calls for the whole layer instead of 3E separate GEMMs.
+
+```bash
+uv run ff-serve --baseline --capacity 256 --path both --repeats 5 --gen-tokens 32
+```
+
+```
+  slots     path  VRAM GB  prefill t/s        spread  decode t/s        spread  dec hit
+    256     loop     3.89         92.3 63.3-94.9            4.69 4.17-4.69       46.8%
+    256  grouped     3.89         99.7 80.0-104.3           5.98 4.61-6.06       46.7%
+
+  slots    phase   loop t/s  grouped t/s    change  verdict
+    256  prefill      92.30        99.72      +8%  inside the 34% within-path spread — no finding
+    256   decode       4.69         5.98     +27%  real
+
+baseline                 48.7                0.40  0.39-0.40
+```
+
+**5.98 tok/s against a baseline of 0.40 measured in the same invocation —
+15.0x.** Decode gains 27% over the loop path, and reproduced at +39%, +35%,
++29% and +27% across four runs.
+
+Both paths are timed on the *same* loaded model, the same slot pool and the
+same warm cache — the flag flips on the already-installed blocks — so the only
+variable is the path. That matters more than it sounds: the identical hit rates
+and identical GB/token in the table are the evidence that nothing else moved.
+
+**Prefill is not a result.** The first Stage 1b run appeared to show a 36%
+prefill *regression*, with a plausible story attached — a prefill batch routes
+to all 64 experts, so the gather copies 805 MB per layer to save launches the
+loop path was not wasting. The next run reversed the sign. Prefill is one short
+timed region per pass and its spread is 63.3–94.9 tok/s on the loop path alone,
+which swallows the difference whole. `ff-serve` now prints a prefill spread
+column for exactly this reason, and says "no finding" rather than "+8%".
+
+### The grouped path is not bit-exact, and that was measured too
+
+One `index_add_` over every expert at once has no defined accumulation order,
+so the grouped path cannot be held to the zero-difference standard the loop
+path meets. `tests/runtime_check.py` holds it to a tolerance instead (`2e-19`
+in fp32 on the toy block) and keeps the loop path as the oracle.
+
+A tolerance on a toy block in fp32 says nothing about fp16 on a 7B model, where
+one rounding difference can flip an argmax and the two paths then walk away
+from each other. So `ff-serve` decodes greedily on both paths and reports the
+first token id where they differ: **identical for all 65 tokens**. That is why
+`grouped=True` is the default and `grouped=False` is still there.
 
 ## Stage 0 — instrumentation
 
@@ -525,8 +579,8 @@ is a custom module and will need its own branch in `discover_moe()`.
 ## Roadmap
 
 - **Stage 0** — instrumentation and routing analysis *(complete; see "Measured results")*
-- **Stage 1** — expert cache in pure PyTorch, experts in host RAM, LRU eviction. *(done: 12.1x over a measured offload baseline)*
-- **Stage 1b** — **grouped expert GEMM.** Promoted from Stage 2 by measurement: 95% of decode is per-expert dispatch, not transfer, so batching the 465 GEMMs a token issues is worth far more than anything scheduling-related. Does not need new kernels to start — `torch.bmm` over a gathered stack of cached experts is a pure-PyTorch first cut, since the cache already stores every expert at an identical stride.
+- **Stage 1** — expert cache in pure PyTorch, experts in host RAM, LRU eviction. *(done: 4.41 tok/s, 12.1x over a measured offload baseline. The Stage 1b run re-measured the same loop path at 4.69 against a 0.40 baseline, 11.8x — two runs, each internally consistent; do not cross them.)*
+- **Stage 1b** — grouped expert GEMM, promoted from Stage 2 because 95% of decode was per-expert dispatch rather than transfer. *(done: 5.98 tok/s, +27% on decode, 15.0x over the baseline measured in the same run. Prefill unchanged within noise.)*
 - **Stage 1c** — async prefetch on a side stream, one layer ahead with `stale_router` (Q3), plus the CPU path for experts under ~11 routed tokens (Q7). Worth at most ~5% until 1b lands, so it is sequenced after it rather than before.
 - **Stage 2** — Triton kernels: fused gather-GEMM, dequant, fused router. *Needs sm_80+.*
 - **Stage 3** — scale to V4-Flash, where the routed pool may not fit in RAM either and experts stream disk→RAM→GPU. *Needs RAM and NVMe headroom.* Q8 is the go/no-go: if `t_disk` needs more lookahead than Q3 shows prediction surviving, the disk tier has to be driven by a longer-horizon signal rather than per-layer routing prediction.
