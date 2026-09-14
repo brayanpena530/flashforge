@@ -822,6 +822,70 @@ def _rate(hits: int, misses: int) -> float:
     return hits / total if total else 0.0
 
 
+_BASELINE_MARKER = "[baseline-decode-tok-s]"
+
+
+def _measure_baseline_subprocess(args) -> float | None:
+    """Run the accelerate-offload baseline in a child process, and read it back.
+
+    A child rather than a function call, because the two configurations cannot
+    coexist. accelerate's offload keeps the weights it has moved to CPU alive
+    behind its hooks, and `del model` plus `empty_cache()` does not reliably
+    return them — measured here as a segfault when the 13.8 GB CPU load that
+    follows ran into what the baseline had not released. Process exit is the
+    only teardown that is actually guaranteed.
+
+    This is still a like-for-like comparison: same prompt, same harness, same
+    `_run_phase`, same repeat count. What made the *old* baseline incomparable
+    was the tracing hooks and a different prompt length, not the process
+    boundary.
+    """
+    import subprocess
+
+    forwarded = [
+        "--baseline-only",
+        "--model", args.model or "",
+        "--prompt-tokens", str(args.prompt_tokens),
+        "--gen-tokens", str(args.gen_tokens),
+        "--repeats", str(args.repeats),
+        "--dtype", args.dtype,
+        "--gpu-memory", args.gpu_memory,
+    ]
+    if not args.model:
+        forwarded = forwarded[:1] + forwarded[3:]
+    if args.cache_dir:
+        forwarded += ["--cache-dir", args.cache_dir]
+
+    command = [
+        sys.executable, "-c",
+        "import sys; from flashforge.cli import serve_main; sys.exit(serve_main())",
+        *forwarded,
+    ]
+    log.info("Measuring the baseline in a subprocess...")
+    completed = subprocess.run(command, capture_output=True, text=True)
+    sys.stdout.write(completed.stdout)
+    if completed.returncode != 0:
+        log.warning("Baseline subprocess failed (%d); continuing without it.\n%s",
+                    completed.returncode, completed.stderr[-2000:])
+        return None
+
+    for line in completed.stdout.splitlines():
+        if line.startswith(_BASELINE_MARKER):
+            return float(line.split()[-1])
+    log.warning("Baseline subprocess produced no result line; continuing without it.")
+    return None
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return 0.5 * (ordered[mid - 1] + ordered[mid])
+
+
 def serve_main(argv: list[str] | None = None) -> int:
     """Measure the Stage 1 offload runtime on a real model.
 
@@ -850,11 +914,27 @@ def serve_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gen-tokens", type=int, default=32)
     parser.add_argument("--warmup", type=int, default=1, help="untimed passes before measuring")
     parser.add_argument(
+        "--repeats", type=int, default=3,
+        help="timed passes per capacity. Reported as median (min-max): a single "
+             "pass on a desktop varies by tens of percent, which is wider than "
+             "the effect a capacity sweep is trying to resolve",
+    )
+    parser.add_argument(
         "--pin-gb", type=float, default=0.0,
         help="host RAM to page-lock for async DMA. Pinned pages cannot be swapped, "
              "so this is a hard claim on physical memory — see runtime/store.py",
     )
     parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16"])
+    parser.add_argument(
+        "--baseline", action="store_true",
+        help="also time accelerate's device_map='auto' offload on the same prompt "
+             "and the same harness, as a like-for-like comparison",
+    )
+    parser.add_argument(
+        "--baseline-only", action="store_true",
+        help=argparse.SUPPRESS,  # internal: the subprocess --baseline spawns
+    )
+    parser.add_argument("--gpu-memory", default="4.5GiB", help="accelerate's VRAM cap (--baseline)")
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
@@ -871,19 +951,53 @@ def serve_main(argv: list[str] | None = None) -> int:
     model_id = args.model or DEFAULT_MODEL
     capacities = [int(c) for c in args.capacity.split(",") if c.strip()]
 
-    # device_map=None loads everything to CPU. That is deliberate: with
-    # device_map="auto" accelerate would scatter experts across devices and
-    # meta tensors and then fight the runtime for control of placement.
-    log.info("Loading %s to CPU (%s)...", model_id, args.dtype)
-    model, tokenizer = load_model(
-        model_id, dtype=args.dtype, device_map=None, cache_dir=args.cache_dir
-    )
+    import gc
 
+    from transformers import AutoTokenizer
+
+    # The tokenizer is loaded on its own so the two model configurations below
+    # never need to be alive at the same time. Each is ~13.8 GB; this machine
+    # has 15 GB free.
+    tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir=args.cache_dir)
     prompt = "The history of computing is" * 64
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids[:, : args.prompt_tokens]
     input_ids = input_ids.to("cuda")
 
-    import gc
+    if args.baseline_only:
+        # Same prompt, same harness, no tracing hooks. The Stage 0 figure it is
+        # tempting to reuse (2.25 s/token) came from a *tracing* run that also
+        # wrote router logits and hidden states for 16 layers to disk on every
+        # token, at a different prompt length. A speedup quoted against that is
+        # partly measuring the hooks.
+        log.info("Baseline: loading %s with device_map='auto'...", model_id)
+        baseline_model, _ = load_model(
+            model_id, dtype=args.dtype, device_map="auto",
+            gpu_memory=args.gpu_memory, cache_dir=args.cache_dir,
+        )
+        _run_phase(baseline_model, input_ids, min(2, args.gen_tokens))
+        samples = []
+        for _ in range(max(1, args.repeats)):
+            timing = _run_phase(baseline_model, input_ids, args.gen_tokens)
+            if timing["decode_s"]:
+                samples.append(timing["decode_tokens"] / timing["decode_s"])
+        print(f"\n=== baseline (accelerate device_map='auto', {args.gpu_memory} VRAM cap)")
+        print(f"  prefill {timing['prefill_tokens'] / timing['prefill_s']:8.1f} tok/s")
+        print(f"  decode  {_median(samples):8.2f} tok/s "
+              f"({min(samples):.2f}-{max(samples):.2f} over {len(samples)} passes)")
+        print(f"{_BASELINE_MARKER} {_median(samples):.6f}")
+        return 0
+
+    baseline_tps = None
+    if args.baseline:
+        baseline_tps = _measure_baseline_subprocess(args)
+
+    # device_map=None loads everything to CPU. That is deliberate: with
+    # device_map="auto" accelerate would scatter experts across devices and
+    # meta tensors and then fight the runtime for control of placement.
+    log.info("Loading %s to CPU (%s)...", model_id, args.dtype)
+    model, _ = load_model(
+        model_id, dtype=args.dtype, device_map=None, cache_dir=args.cache_dir
+    )
 
     rows = []
     report = None
@@ -923,41 +1037,72 @@ def serve_main(argv: list[str] | None = None) -> int:
         for _ in range(args.warmup):
             _run_phase(model, input_ids, min(4, args.gen_tokens))
 
-        stats.reset()
-        timing = _run_phase(model, input_ids, args.gen_tokens, stats)
+        prefill_samples, decode_samples = [], []
+        for _ in range(max(1, args.repeats)):
+            stats.reset()
+            timing = _run_phase(model, input_ids, args.gen_tokens, stats)
+            if timing["prefill_s"]:
+                prefill_samples.append(timing["prefill_tokens"] / timing["prefill_s"])
+            if timing["decode_s"]:
+                decode_samples.append(timing["decode_tokens"] / timing["decode_s"])
 
+        # Counters come from the final pass. They are deterministic given the
+        # prompt — the same experts are routed to every time — so unlike the
+        # timings they need no aggregation.
         p_hits, p_misses, p_bytes = timing["prefill_counts"]
         d_hits, d_misses, d_bytes = timing["decode_counts"]
-        prefill_tps = timing["prefill_tokens"] / timing["prefill_s"] if timing["prefill_s"] else 0.0
-        decode_tps = timing["decode_tokens"] / timing["decode_s"] if timing["decode_s"] else 0.0
 
         rows.append({
             "capacity": capacity,
-            "prefill_tok_s": prefill_tps,
-            "decode_tok_s": decode_tps,
+            "prefill_tok_s": _median(prefill_samples),
+            "decode_tok_s": _median(decode_samples),
+            "decode_lo": min(decode_samples) if decode_samples else 0.0,
+            "decode_hi": max(decode_samples) if decode_samples else 0.0,
             "prefill_hit_rate": _rate(p_hits, p_misses),
             "decode_hit_rate": _rate(d_hits, d_misses),
             "decode_gb_per_token": d_bytes / 1e9 / max(1, timing["decode_tokens"]),
             "vram_gb": report.resident_bytes / (1 << 30),
         })
-        print(f"  prefill {prefill_tps:8.1f} tok/s  hit {_rate(p_hits, p_misses):5.1%}  "
-              f"{p_bytes / 1e9:5.2f} GB")
-        print(f"  decode  {decode_tps:8.2f} tok/s  hit {_rate(d_hits, d_misses):5.1%}  "
-              f"{d_bytes / 1e9:5.2f} GB  ({stats.evictions:,} evictions)")
+        print(f"  prefill {_median(prefill_samples):8.1f} tok/s  "
+              f"hit {_rate(p_hits, p_misses):5.1%}  {p_bytes / 1e9:5.2f} GB")
+        print(f"  decode  {_median(decode_samples):8.2f} tok/s  "
+              f"({min(decode_samples):.2f}-{max(decode_samples):.2f} over "
+              f"{len(decode_samples)} passes)  hit {_rate(d_hits, d_misses):5.1%}  "
+              f"{d_bytes / 1e9:5.2f} GB")
 
     print("\n" + "=" * 78)
     print(f"{'slots':>7} {'VRAM GB':>8} {'prefill t/s':>12} {'pf hit':>7} "
-          f"{'decode t/s':>11} {'dec hit':>8} {'GB/tok':>7}")
+          f"{'decode t/s':>11} {'spread':>13} {'dec hit':>8} {'GB/tok':>7}")
     for row in rows:
+        spread = f"{row['decode_lo']:.2f}-{row['decode_hi']:.2f}"
         print(f"{row['capacity']:>7} {row['vram_gb']:>8.2f} {row['prefill_tok_s']:>12.1f} "
-              f"{row['prefill_hit_rate']:>6.1%} {row['decode_tok_s']:>11.2f} "
+              f"{row['prefill_hit_rate']:>6.1%} {row['decode_tok_s']:>11.2f} {spread:>13} "
               f"{row['decode_hit_rate']:>7.1%} {row['decode_gb_per_token']:>7.3f}")
+
+    # A capacity sweep is only informative if the differences it shows are
+    # larger than the machine's own run-to-run variation. On this box they were
+    # not, which is itself the answer: transfer volume is not what sets decode
+    # speed here. Say it rather than leaving a 10% gap looking like a trend.
+    widest = max((r["decode_hi"] - r["decode_lo"]) / r["decode_tok_s"]
+                 for r in rows if r["decode_tok_s"]) if rows else 0.0
+    if len(rows) > 1:
+        span = max(r["decode_tok_s"] for r in rows) - min(r["decode_tok_s"] for r in rows)
+        relative = span / max(r["decode_tok_s"] for r in rows)
+        if relative <= widest:
+            print(f"\n[serve] the spread across capacities ({relative:.0%}) is no wider than "
+                  f"the spread within one ({widest:.0%}).")
+            print("        Capacity is not resolvably changing decode speed on this "
+                  "machine — which is the finding, not a failed measurement.")
 
     best = max(rows, key=lambda r: r["decode_tok_s"])
     print(f"\n[serve] best decode {best['decode_tok_s']:.2f} tok/s at {best['capacity']} slots "
           f"({best['vram_gb']:.2f} GB resident, {best['decode_hit_rate']:.1%} hit rate)")
-    print("        Stage 0 measured the accelerate-offload baseline at 0.44 tok/s "
-          "(2.25 s/token) on this model and card.")
+    if baseline_tps:
+        print(f"        {best['decode_tok_s'] / baseline_tps:.1f}x the accelerate-offload "
+              f"baseline's {baseline_tps:.2f} tok/s, same prompt and same harness")
+    else:
+        print("        no baseline measured — pass --baseline for a like-for-like "
+              "comparison rather than quoting a figure from another run")
     print("        Prefill's hit rate is low by construction, not by failure: a batch "
           "touches the union of its tokens' experts,")
     print("        which at these lengths is every expert in the layer. Only the "

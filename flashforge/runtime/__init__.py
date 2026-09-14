@@ -21,11 +21,12 @@ top-8 = 128 experts; at LRU's 54.5% hit rate that is ~58 misses, ~70 ms of PCIe
 traffic against ~33 ms of compute to hide it behind. An earlier version of this
 docstring said so, confidently, before `ff-serve` existed.
 
-It is wrong, and the sweep says so plainly. Going from 128 to 384 slots cut
-transfer volume by **9x** (1.080 -> 0.120 GB/token) and moved decode throughput
-by **10%** (3.94 -> 4.33 tok/s). At 384 slots the whole of the remaining
-transfer is 0.120 GB/token, which at the measured 10.4 GB/s is 11.5 ms of a
-231 ms token. A profiler agrees: `aten::copy_` is 4.95% of decode.
+It is wrong, and the sweep says so plainly. Going from 128 to 384 slots cuts
+transfer volume by **9x** (1.080 -> 0.120 GB/token) and does not reliably move
+decode speed at all: the medians over five passes are 3.84, 4.41 and 3.53
+tok/s, while a single capacity varies by 26% between its own passes. At 384
+slots the remaining 0.120 GB/token is, at the measured 10.4 GB/s, ~11 ms of a
+~230 ms token. A profiler agrees: `aten::copy_` is 4.95% of decode.
 
 The other 95% is dispatch. Decode issues **465 separate GEMMs per token** —
 16 layers x (8 experts x 3 projections + gate) + attention — each one
@@ -37,6 +38,10 @@ So the ordering in the roadmap was backwards. Prefetching perfectly would buy
 at most 5% here, because transfers are already nearly free at a workable cache
 size. The lever is batching the per-expert GEMMs into one grouped call, which
 was filed as a Stage 2 kernel concern and is really the Stage 1 bottleneck.
+
+Against a baseline measured through the same harness — accelerate's
+`device_map="auto"` on the same prompt — this runs decode at 4.41 tok/s
+against 0.36, or **12.1x**, on a model 2.3x larger than the card.
 """
 
 from __future__ import annotations

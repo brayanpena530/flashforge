@@ -143,44 +143,57 @@ MoE block pulls what it needs through that cache. LRU, because Q5 measured it
 12 points ahead of the frequency policies.
 
 ```bash
-uv run ff-serve --capacity 128,256,384 --prompt-tokens 128 --gen-tokens 32
+uv run ff-serve --baseline --capacity 128,256,384 --gen-tokens 32 --repeats 5
 ```
 
 ```
-  slots  VRAM GB  prefill t/s  pf hit  decode t/s  dec hit  GB/tok
-    128     2.39         73.6   1.2%        3.94   33.0%   1.080
-    256     3.89         62.5   8.9%        4.18   46.8%   0.858
-    384     5.39         97.2  25.3%        4.33   92.6%   0.120
+  slots  VRAM GB  prefill t/s  pf hit  decode t/s        spread  dec hit  GB/tok
+    128     2.39         78.6   1.2%        3.84     2.87-3.89   33.0%   1.080
+    256     3.89         82.4   8.3%        4.41     3.94-4.47   46.8%   0.858
+    384     5.39         86.2  26.5%        3.53     3.21-3.63   92.6%   0.120
+
+baseline                 45.3               0.36     0.34-0.38
 ```
 
-**4.33 tok/s against the accelerate-offload baseline's 0.44 — a 9.8x speedup**,
-on a model 2.3x larger than the card it runs on. The runtime is bit-exact
-against the stock block; `tests/runtime_check.py` asserts a max absolute
-difference of zero.
+**4.41 tok/s against a measured accelerate-offload baseline of 0.36 — 12.1x**,
+on a model 2.3x larger than the card it runs on. Decode figures are the median
+of five timed passes; the baseline runs the same prompt through the same
+harness. The runtime is bit-exact against the stock block —
+`tests/runtime_check.py` asserts a max absolute difference of zero.
 
 ### The finding that redirected Stage 1
 
 **Transfer is not the bottleneck, and the roadmap had the order wrong.**
 
-Look at the last two columns together. Between 128 and 384 slots the hit rate
-triples and transfer volume falls **9x** — and decode throughput moves **10%**.
-At 384 slots the remaining 0.120 GB/token is, at the measured 10.4 GB/s PCIe,
-11.5 ms of a 231 ms token. A profiler puts `aten::copy_` at **4.95%** of decode.
+Read the `spread` column before the `decode t/s` column. Across capacities the
+median moves 20%; *within* a single capacity, repeated passes move 26%. The
+sweep cannot resolve a difference between these three configurations at all —
+and that is the result, not a failed measurement. Transfer volume falls **9x**
+from 128 slots to 384 and decode speed does not reliably respond.
+
+The arithmetic agrees. At 384 slots the remaining 0.120 GB/token is, at the
+measured 10.4 GB/s PCIe, ~11 ms of a ~230 ms token. A profiler puts
+`aten::copy_` at **4.95%** of decode.
 
 The other 95% is dispatch. A decode token issues **465 separate GEMMs** —
 16 layers x (8 experts x 3 projections + gate) plus attention — each one
-multiplying a single token's activations against a 2048x1024 matrix. Self CPU
+multiplying a *single* token's activations against a 2048x1024 matrix. Self CPU
 time lands within 7% of self CUDA time, which is what a launch-bound workload
-looks like: both sides are doing bookkeeping rather than arithmetic.
+looks like: both sides doing bookkeeping rather than arithmetic.
 
 So the planned next step was wrong. **Prefetch would buy at most 5% here**,
 because at a workable cache size the transfers are already nearly free. The
 lever is collapsing the per-expert GEMMs into one grouped call — filed under
 Stage 2 as a kernel concern, actually the Stage 1 bottleneck.
 
-This is the second time in this project that a confident prediction from
-Stage 0's constants survived until something measured it. The constants were
-right; the inference from them was not.
+Note also that 384 slots is not the best configuration despite the best hit
+rate. 5.39 GB resident on a 6 GB card leaves little room for activations, and
+the median comes out *below* 256 slots. Whether that is real or more of the
+same variance, this sweep cannot say — but "give the cache everything spare"
+is not supported.
+
+This is the second time a confident prediction from Stage 0's constants stood
+until something measured it. The constants were right; the inference was not.
 
 ### Two things worth knowing before reading the table
 
@@ -190,6 +203,17 @@ expert in the layer — those misses are compulsory and no capacity removes them
 A decode step touches exactly top-k per layer. Only the decode column belongs
 next to Q5's simulated 54.5%, and at 256 slots it measures 46.8%, close enough
 that the simulator was doing its job.
+
+**Time more than one pass, and measure the baseline yourself.** The first
+version of this section reported single passes and quoted 9.8x against a figure
+lifted from Stage 0's decode *tracing* run — which had forward hooks writing
+router logits and hidden states for 16 layers to disk on every token, at a
+different prompt length. That is not a baseline, it is a different experiment.
+`--baseline` now runs `device_map="auto"` through the same harness on the same
+prompt, in a subprocess because accelerate's offload does not reliably release
+its CPU-side weights (measured as a segfault when the next model load ran into
+what it had kept). Single-pass timing also produced a tidy monotonic table,
+3.94 -> 4.18 -> 4.33, that five passes show was noise.
 
 **Sweep capacities in one process only if the RAM allows it.** The expert store
 is 12 GB against ~15 GB free. An early version of the sweep held the previous
@@ -408,6 +432,8 @@ Useful flags:
 | `--skip-q7` / `--skip-q8` | bench | run one half only |
 | `--remove-scratch` | bench | delete the scratch file afterwards (recreated next run) |
 | `--capacity 128,256` | serve | expert slots to cache; comma-separated to sweep |
+| `--baseline` | serve | also time accelerate's `device_map="auto"` offload, same prompt and harness |
+| `--repeats N` | serve | timed passes per capacity, reported as median (min–max). Default 3 |
 | `--pin-gb N` | serve | host RAM to page-lock for async DMA. Pinned pages cannot be swapped |
 
 The built-in prompt set is a starting point sized for a few thousand tokens.
@@ -495,7 +521,7 @@ is a custom module and will need its own branch in `discover_moe()`.
 ## Roadmap
 
 - **Stage 0** — instrumentation and routing analysis *(complete; see "Measured results")*
-- **Stage 1** — expert cache in pure PyTorch, experts in host RAM, LRU eviction. *(done: 9.8x over the offload baseline)*
+- **Stage 1** — expert cache in pure PyTorch, experts in host RAM, LRU eviction. *(done: 12.1x over a measured offload baseline)*
 - **Stage 1b** — **grouped expert GEMM.** Promoted from Stage 2 by measurement: 95% of decode is per-expert dispatch, not transfer, so batching the 465 GEMMs a token issues is worth far more than anything scheduling-related. Does not need new kernels to start — `torch.bmm` over a gathered stack of cached experts is a pure-PyTorch first cut, since the cache already stores every expert at an identical stride.
 - **Stage 1c** — async prefetch on a side stream, one layer ahead with `stale_router` (Q3), plus the CPU path for experts under ~11 routed tokens (Q7). Worth at most ~5% until 1b lands, so it is sequenced after it rather than before.
 - **Stage 2** — Triton kernels: fused gather-GEMM, dequant, fused router. *Needs sm_80+.*
