@@ -21,12 +21,29 @@ every entry exactly before its next use and its hit rate collapses — in the
 synthetic check it goes to *precisely zero* while LFU and static are still at
 25-40% on the same trace.
 
-So a single global LRU over all (layer, expert) pairs is the wrong default for
-this workload. If the sweep shows that cliff on real traces, the fixes are
+So a single global LRU is the wrong default *at that capacity*. The fixes are
 per-layer cache partitioning (each layer gets its own budget, so a layer's
 entries are not evicted by later layers in the same token), or a
 frequency-biased policy that does not treat the cyclic sweep as recency
-information. Look at where LRU crosses LFU before designing anything.
+information.
+
+Note the scope. On the real OLMoE trace, provisioned at 256 slots — twice one
+token's 128-slot sweep — LRU is comfortably the best online policy (54.5% vs
+LFU's 42.1%). The cliff is real but lives below any capacity worth
+provisioning. Look at where LRU crosses LFU before designing anything.
+
+MEASURE IT ON THE WHOLE CORPUS
+------------------------------
+That cliff is real below one token's working set, but above it the ranking
+turns on something else entirely: how many distinct *documents* the simulation
+sees. Inside a handful of topically consistent documents, expert usage is
+concentrated and frequency policies look excellent. Across a diverse corpus the
+same statistics dilute and recency wins instead. On a 48-sequence OLMoE trace
+at 25% capacity, a 300k-access prefix covered 5 documents and put LFU (72.4%)
+comfortably above LRU (65.2%); the full 48 reverses it to LRU 54.5%, LFU 42.1%.
+
+Which is why `subsample_sequences` exists: budget by dropping whole sequences,
+never by truncating the flattened key stream.
 """
 
 from __future__ import annotations
@@ -45,6 +62,36 @@ def build_access_sequence(frame: pd.DataFrame, num_experts: int) -> np.ndarray:
     ordered = frame.sort_values(["seq_id", "pos", "layer", "rank"], kind="stable")
     keys = ordered["layer"].to_numpy(np.int64) * num_experts + ordered["expert"].to_numpy(np.int64)
     return keys.astype(np.int32)
+
+
+def subsample_sequences(
+    frame: pd.DataFrame, max_accesses: int, *, seed: int = 0
+) -> tuple[pd.DataFrame, int, int]:
+    """Cut a trace to a budget by dropping whole sequences, not by truncating.
+
+    Truncating the flattened key stream to its first N entries looks harmless
+    and is not. The stream is ordered by (seq_id, pos, layer), so a prefix is
+    the first few *documents* rather than a sample of them — and the policy
+    ranking depends on how many documents are in view (see the module
+    docstring for the measured reversal).
+
+    Sampling whole sequences keeps each document's internal access pattern
+    intact while preserving corpus diversity. Returns the trimmed frame, how
+    many sequences were kept, and how many there were to begin with.
+    """
+    sequences = frame["seq_id"].drop_duplicates().to_numpy()
+    total = int(len(sequences))
+    if total == 0 or len(frame) <= max_accesses:
+        return frame, total, total
+
+    per_sequence = len(frame) / total
+    keep = max(1, int(max_accesses // per_sequence))
+    if keep >= total:
+        return frame, total, total
+
+    rng = np.random.default_rng(seed)
+    chosen = rng.choice(sequences, size=keep, replace=False)
+    return frame[frame["seq_id"].isin(chosen)], keep, total
 
 
 def _next_use(keys: np.ndarray) -> np.ndarray:

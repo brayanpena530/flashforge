@@ -36,12 +36,12 @@ system RAM, 8 CPU threads, 31.8 GB RAM, Samsung NVMe. Corpus of 48 sequences ×
 | **Q2** | **40.1%** consecutive overlap vs 12.5% random | strong temporal locality |
 | **Q3** | `stale_router` **0.835** at k=1; `probe` **0.726** at k=8 | prefetch works, and the two tiers want different predictors |
 | **Q4** | between-domain JS **24.8×** the within-domain floor | domains separate cleanly — cache warming has real signal |
-| **Q5** | Belady 83.9%, static 72.8%, LFU 72.4%, **LRU 65.2%** | 18.7% headroom, and LRU is the *worst* online policy |
+| **Q5** | Belady 77.9%, **LRU 54.5%**, static 42.2%, LFU 42.1% | 23.4% headroom, and LRU is the *best* online policy |
 | **Q6** | union(4) = **2.48×** top-k → 1.61× fewer bytes/token | moderate; speculation needs high draft acceptance |
 | **Q7** | `t_c = 0.0358·m + 0.730` ms, PCIe 1.117 ms, **m\* = 17.4 tokens** | experts under ~17 tokens are cheaper on the CPU |
 | **Q8** | 2.39 GB/s peak, 8.27 ms/expert, **4 layers** of lookahead needed | a disk tier is reachable, at 2× prefetch budget |
 
-### The three findings that changed the design
+### The four findings that changed the design
 
 **Predictor choice is tier-dependent.** `stale_router` — running layer *N+k*'s
 real router on layer *N*'s hidden state, no training, no parameters — wins at
@@ -58,13 +58,46 @@ RAM→GPU needs one layer, so use the free predictor. Disk→RAM needs four, whe
 a flat decay curve is worth more than peak accuracy. Judging both by the same
 predictor hides the second case entirely.
 
-**LRU is the wrong default, and the cyclic access pattern is why.** MoE decode
-sweeps every layer before returning to layer 0, touching `top_k × n_layers` =
-128 distinct slots per token. Below that working set, LRU evicts each entry
-immediately before its next use — its textbook worst case. Measured at 25%
-capacity, LRU (65.2%) is beaten by LFU (72.4%) *and* by a static hot-expert
-table (72.8%). An earlier run on 2,727 tokens showed the opposite; the
-pathology only became visible with enough data.
+**LRU is the right default here — and an earlier version of this README said
+the opposite, because the cache simulator was reading a biased sample.**
+
+The sim budgets itself with `--max-accesses`, which used to truncate the
+flattened access stream to its first N entries. That stream is ordered by
+`(seq_id, pos, layer)`, so a prefix is the first few *documents* — and this
+corpus is grouped by domain, so the default 300k budget showed the simulator
+**five `code` documents and nothing else.** Inside a single-domain monoculture
+expert usage is maximally concentrated, frequency policies look excellent, and
+LFU (72.4%) beat LRU (65.2%).
+
+Across all 48 documents the ranking reverses:
+
+```
+                belady     lru     lfu  static
+5 code docs      83.9%   65.2%   72.4%   72.8%    <- prefix, domain monoculture
+all 48 docs      77.9%   54.5%   42.1%   42.2%    <- LRU wins by 12 points
+```
+
+`subsample_sequences` now budgets by dropping whole sequences at random, so
+each document's internal access pattern stays intact while corpus diversity is
+preserved. The cyclic-sweep cliff described below is still real *below one
+token's working set* — but above it, what decides the ranking is how many
+distinct kinds of document the cache sees.
+
+**Prefill and decode behave almost identically.** Captured 768 real greedy
+decode steps to check whether serving differs from prefill. At matched shape
+(48 sequences × 16 tokens) the two are within about one point on every policy:
+
+```
+                   belady     lru     lfu  static
+prefill[0:16]       75.2%   52.3%   45.6%   46.6%
+decode              76.2%   53.1%   41.1%   42.2%
+prefill[248:264]    76.2%   51.4%   41.8%   43.0%
+```
+
+Q2 agrees: 40.1% consecutive-expert overlap on prefill, 40.9% on decode. So
+prefill traces are a sound proxy for serving behaviour on this model, which is
+useful because they are roughly 9× cheaper to collect — decode runs one forward
+pass per token and cost 2.25 s/token here against 0.03 s/token for prefill.
 
 **The storage tier wants batched reads, not a deeper queue of single ones.**
 
@@ -87,8 +120,12 @@ Single model, single machine. `m*`, the PCIe figures and the whole storage
 curve are properties of this hardware and have to be re-measured elsewhere —
 which is what `ff-bench` is for. The corpus is 48 sequences; large enough to
 make the probe well-determined (≈14,700 training samples against 2,048
-dimensions) but not a substitute for a real workload trace. All numbers are
-prefill-only; `--gen-tokens` captures decode and has not been run at this size.
+dimensions) but not a substitute for a real workload trace.
+
+Q1–Q6 are measured on prefill, with 768 real decode steps used to confirm the
+two phases agree rather than to carry the headline numbers. Any policy tuned
+here should be re-checked on a decode trace at serving scale before it ships,
+even though the two matched closely at this one.
 
 ## Stage 0 — instrumentation
 
@@ -333,14 +370,15 @@ That is LRU's textbook worst case. Below a capacity of one token's working set,
 LRU evicts every entry just before its next use — in the synthetic check its hit
 rate is **exactly zero** while LFU and static are at 25–40% on the same trace.
 
-So a single global LRU is the wrong default here. If real traces show the same
-cliff, the fixes are per-layer cache partitioning or a frequency-biased policy.
-Check where LRU crosses LFU before designing Stage 1.
+So a single global LRU is the wrong default *at that capacity*. The fixes are
+per-layer cache partitioning or a frequency-biased policy. Check where LRU
+crosses LFU before designing Stage 1.
 
-**They did.** On the real 24,576-token trace LRU reaches 65.2% at 25% capacity
-against LFU's 72.4% and a static hot-expert table's 72.8% — the synthetic
-check called this one correctly, and an earlier 2,727-token run did not show
-it. Stage 1 should not build on recency.
+**Only below one token's working set.** On the real 24,576-token trace at 25%
+capacity (256 slots, twice a token's 128-slot sweep) LRU reaches 54.5% against
+LFU's 42.1% — recency wins comfortably. The cliff is genuine, but it lives
+below the capacity anyone would actually provision. What matters at realistic
+capacities is corpus diversity, not the sweep.
 
 ## Layout
 
@@ -366,7 +404,7 @@ is a custom module and will need its own branch in `discover_moe()`.
 ## Roadmap
 
 - **Stage 0** — instrumentation and routing analysis *(current; runs on existing hardware)*
-- **Stage 1** — expert cache + async prefetch in pure PyTorch, pinned RAM, separate CUDA stream. Most of the wall-clock win lives here. Stage 0 says: use a frequency-biased or static policy rather than LRU (Q5), prefetch one layer ahead with `stale_router` (Q3), pin experts and skip the three-stream split since pinned already saturates this bus (Q7), and send experts with under ~17 routed tokens to the CPU to free a PCIe slot (Q7).
+- **Stage 1** — expert cache + async prefetch in pure PyTorch, pinned RAM, separate CUDA stream. Most of the wall-clock win lives here. Stage 0 says: start from LRU, which beats frequency policies by 12 points across a diverse corpus (Q5); prefetch one layer ahead with `stale_router` (Q3); pin experts and skip the three-stream split, since pinned already saturates this bus (Q7); and send experts with under ~17 routed tokens to the CPU to free a PCIe slot (Q7). Prefill traces are a sound proxy for decode, so iterate on those.
 - **Stage 2** — Triton kernels: fused gather-GEMM, dequant, fused router. *Needs sm_80+.*
 - **Stage 3** — scale to V4-Flash, where the routed pool may not fit in RAM either and experts stream disk→RAM→GPU. *Needs RAM and NVMe headroom.* Q8 is the go/no-go: if `t_disk` needs more lookahead than Q3 shows prediction surviving, the disk tier has to be driven by a longer-horizon signal rather than per-layer routing prediction.
 

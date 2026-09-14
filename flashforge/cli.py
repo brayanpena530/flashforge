@@ -292,6 +292,16 @@ def analyze_main(argv: list[str] | None = None) -> int:
     print(f"\n[Q2] {lag1:.1%} of a token's experts were also used by the previous token")
     print(f"     (random baseline: {store.top_k / store.num_experts:.1%})")
 
+    # Prefill and decode are different access patterns, and only one of them is
+    # what a serving cache sees. Reporting the blend hides that.
+    phases = analysis.phase_frames(frame)
+    if len(phases) > 1:
+        for name, part in phases.items():
+            sub = analysis.consecutive_overlap(part, store.num_experts, store.top_k)
+            value = sub[sub["lag"] == 1]["mean_overlap"].mean()
+            tokens = part.groupby(["seq_id", "pos"], observed=True).ngroups
+            print(f"     {name:>8}: {value:.1%} over {tokens:,} tokens")
+
     # Q3 -------------------------------------------------------------
     # ff-bench writes hardware.json next to the report; if it is there, the
     # lookahead depth a disk read needs gets drawn straight onto the chart, so
@@ -421,11 +431,17 @@ def analyze_main(argv: list[str] | None = None) -> int:
 
     # Q5 -------------------------------------------------------------
     log.info("Q5: cache simulation")
-    keys = cachesim.build_access_sequence(frame, store.num_experts)
-    if keys.size > args.max_accesses:
-        log.info("Truncating cache sim to the first %d of %d accesses",
-                 args.max_accesses, keys.size)
-        keys = keys[: args.max_accesses]
+    # Budget by dropping whole sequences. Truncating the flattened stream takes
+    # the first few documents instead of a sample of them, and the policy
+    # ranking flips with how many documents are in view.
+    sim_frame, kept, available = cachesim.subsample_sequences(frame, args.max_accesses)
+    if kept < available:
+        log.info("Cache sim on %d of %d sequences (budget %d accesses)",
+                 kept, available, args.max_accesses)
+        print(f"\n[Q5] sampling {kept} of {available} sequences to stay under "
+              f"--max-accesses {args.max_accesses:,}. Raise it to use the whole corpus; "
+              "policy ranking is sensitive to how many documents are in view.")
+    keys = cachesim.build_access_sequence(sim_frame, store.num_experts)
 
     total_slots = store.num_experts * len(store.moe_layers)
     capacities = sorted({
@@ -454,6 +470,29 @@ def analyze_main(argv: list[str] | None = None) -> int:
         print(f"\n     Belady - LRU headroom: {headroom:.1%} "
               + ("→ eviction policy is worth real work"
                  if headroom > 0.05 else "→ eviction is near-optimal; put the effort into prefetch"))
+
+    # The decode-only sweep is the one that describes serving. Prefill amortises
+    # a whole sequence's experts across one forward pass and flatters every
+    # policy; decode pays per token.
+    if len(phases) > 1 and "decode" in phases:
+        decode_part, _, _ = cachesim.subsample_sequences(phases["decode"], args.max_accesses)
+        decode_keys = cachesim.build_access_sequence(decode_part, store.num_experts)
+        if decode_keys.size:
+            decode_sweep = cachesim.sweep(
+                decode_keys, [quarter],
+                bytes_per_expert=args.bytes_per_expert,
+                accesses_per_token=store.top_k * len(store.moe_layers),
+            )
+            save("q5_cache_sweep_decode", decode_sweep)
+            print(f"\n[Q5] decode only ({decode_keys.size:,} accesses), same capacity:")
+            for _, row in decode_sweep.iterrows():
+                line = f"     {row['policy']:>7}  hit rate {row['hit_rate']:.1%}"
+                if pd.notna(row.get("fetch_bytes_per_token")):
+                    line += f"  |  {row['fetch_bytes_per_token'] / 1e6:.1f} MB fetched/token"
+                print(line)
+            d = decode_sweep.set_index("policy")["hit_rate"]
+            if {"belady", "lru"} <= set(d.index):
+                print(f"     Belady - LRU headroom on decode: {d['belady'] - d['lru']:.1%}")
 
     print(f"\nReport written to {out_dir}")
     return 0
