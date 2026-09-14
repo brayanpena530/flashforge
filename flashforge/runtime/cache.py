@@ -18,16 +18,21 @@ also makes the VRAM budget a number you choose rather than one you discover.
 
 WHY THERE IS NO EXPLICIT SYNCHRONIZE
 ------------------------------------
-Fills are issued on the current CUDA stream, and the expert GEMMs that consume
-them run on that same stream afterwards. CUDA guarantees ordering within a
-stream, so the copy is complete before the GEMM reads it without any
-`synchronize()` call. That is worth stating explicitly because it is precisely
-the guarantee Stage 1's prefetcher will *give up* when it moves fills to a side
-stream, at which point events become mandatory.
+Demand fills are issued on the current CUDA stream, and the expert GEMMs that
+consume them run on that same stream afterwards. CUDA guarantees ordering
+within a stream, so the copy is complete before the GEMM reads it without any
+`synchronize()` call.
+
+Stage 1c's `prefetch` gives that guarantee up, exactly as this docstring
+predicted it would: it issues fills on a side stream so they overlap the
+*previous* layer's GEMMs. Every read and write across the two streams is
+therefore ordered by an explicit event. There are two hazards, not one, and
+they need different mechanisms — see `prefetch`.
 """
 
 from __future__ import annotations
 
+import contextlib
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
@@ -46,6 +51,13 @@ class CacheStats:
     misses: int = 0
     evictions: int = 0
     bytes_fetched: int = 0
+    # Stage 1c. `prefetch_issued` is experts speculatively fetched;
+    # `prefetch_used` is how many of those a later `acquire` actually wanted.
+    # Their ratio is the predictor's precision measured *in the runtime*, which
+    # is the only place it counts — Q3's 0.835 was recall, offline, on a trace.
+    prefetch_issued: int = 0
+    prefetch_used: int = 0
+    prefetch_wasted: int = 0
     # Lookups broken out by layer, so a bad hit rate can be traced to where it
     # happens rather than averaged into a single uninformative number.
     per_layer: dict[int, list[int]] = field(default_factory=dict)
@@ -65,8 +77,13 @@ class CacheStats:
         counts[0] += hits
         counts[1] += misses
 
+    @property
+    def prefetch_precision(self) -> float:
+        return self.prefetch_used / self.prefetch_issued if self.prefetch_issued else 0.0
+
     def reset(self) -> None:
         self.hits = self.misses = self.evictions = self.bytes_fetched = 0
+        self.prefetch_issued = self.prefetch_used = self.prefetch_wasted = 0
         self.per_layer.clear()
 
     def describe(self) -> str:
@@ -119,6 +136,37 @@ class ExpertCache:
 
         self._slot_of: OrderedDict[ExpertKey, int] = OrderedDict()
         self._free: list[int] = list(range(self.capacity))
+
+        # Stage 1c instrumentation, off by default because recording two CUDA
+        # events per layer is itself a perturbation. See `drain_fill_ms`.
+        self.time_fills = False
+        self._fill_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        # Side-stream work is timed separately and must never be added to the
+        # demand total. Demand fill blocks the GEMMs; speculative fill is
+        # supposed not to. Summing them into one "fill ms" column would make a
+        # prefetch run look worse the better the overlap got.
+        self._spec_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+
+        # Stage 1c prefetch. The stream is created eagerly on CUDA so that
+        # enabling prefetch mid-run cannot allocate one inside a timed region.
+        self._stream = torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
+        # Experts whose fill is in flight on the side stream, and the event that
+        # says it has landed.
+        self._pending: dict[ExpertKey, torch.cuda.Event] = {}
+        # Slots the layer currently executing holds. The side stream must not
+        # choose these as eviction victims; see `prefetch` for why the WAR event
+        # alone does not cover them.
+        self._protected: set[int] = set()
+
+    @property
+    def _timing(self) -> bool:
+        """`time_fills`, but only where CUDA events exist to record.
+
+        The CPU-side tests build an ExpertCache on the CPU, where a fill is a
+        host memcpy and there is nothing asynchronous to measure. Silently doing
+        nothing there is right; raising would make the flag untestable off-GPU.
+        """
+        return self.time_fills and self.device.type == "cuda"
 
     # -- geometry ----------------------------------------------------------
 
@@ -188,6 +236,11 @@ class ExpertCache:
                 # at the MRU end and cannot be chosen as victims below.
                 self._slot_of.move_to_end(key)
                 hits.append(expert)
+                # A hit that a prefetch put there is still a hit, but the copy
+                # may not have landed. Ordering it against this stream is the
+                # whole reason the side stream needs events: cache.py's module
+                # docstring promised this exact guarantee would be given up.
+                self._await(key, used=True)
             else:
                 misses.append(expert)
 
@@ -196,7 +249,20 @@ class ExpertCache:
             self._evict_for(len(misses))
             self._fill(layer, misses)
 
-        return {expert: self._slot_of[(layer, expert)] for expert in experts}
+        slots = {expert: self._slot_of[(layer, expert)] for expert in experts}
+        # These are the slots the GEMMs about to run will read. A prefetch
+        # issued during those GEMMs must not evict them.
+        self._protected = set(slots.values())
+        return slots
+
+    def _await(self, key: ExpertKey, *, used: bool) -> None:
+        """Make the compute stream wait for an in-flight prefetch of `key`."""
+        event = self._pending.pop(key, None)
+        if event is None:
+            return
+        torch.cuda.current_stream(self.device).wait_event(event)
+        if used:
+            self.stats.prefetch_used += 1
 
     def _evict_for(self, needed: int) -> None:
         shortfall = needed - len(self._free)
@@ -205,13 +271,142 @@ class ExpertCache:
             # belonging to the in-flight request was moved to the other end in
             # acquire(), and acquire() refuses requests larger than capacity,
             # so a victim is never something we are about to read.
-            _, slot = self._slot_of.popitem(last=False)
+            key, slot = self._slot_of.popitem(last=False)
+            if key in self._pending:
+                # A speculative fetch nobody wanted. The slot is about to be
+                # rewritten on the compute stream, so that write has to be
+                # ordered after the side stream's write — otherwise the two race
+                # and the loser's bytes are what the model reads.
+                self._await(key, used=False)
+                self.stats.prefetch_wasted += 1
             self._free.append(slot)
             self.stats.evictions += 1
+
+    def prefetch(self, layer: int, experts: list[int]) -> int:
+        """Speculatively fill `experts` on the side stream. Returns how many.
+
+        Called from layer L for layer L+1, so the copies overlap L's GEMMs
+        instead of stalling L+1's. Nothing here is allowed to block: a
+        misprediction must cost bandwidth, never latency, or a predictor at
+        Q3's 0.835 recall would be a net loss.
+
+        TWO WRITE HAZARDS, TWO MECHANISMS
+        ---------------------------------
+        The side stream writes into slots the compute stream reads, so both
+        directions have to be ordered explicitly.
+
+        *Later layers' slots* are covered by the event recorded below: it is
+        recorded on the compute stream at issue time, so waiting on it means
+        every kernel enqueued before now — including every previous layer's
+        GEMMs — has finished before a single byte is overwritten.
+
+        *This* layer's slots are not, because its GEMMs have not been enqueued
+        yet when the prefetch is issued. They are covered by `_protected`, which
+        `acquire` just set, and which eviction below refuses to touch.
+
+        Missing either one produces a model that is correct on most tokens and
+        quietly wrong on the ones where the race is lost — the failure mode with
+        no error message, which is why it is spelled out rather than commented.
+        """
+        wanted = [e for e in experts if (layer, e) not in self._slot_of]
+        if not wanted:
+            return 0
+
+        # Only the unprotected LRU tail may be displaced, and only by as many
+        # experts as there is room for. A prefetch that had to evict the layer
+        # it is running underneath would be trading a certain cost for a
+        # speculative one.
+        evictable = [
+            key for key, slot in self._slot_of.items() if slot not in self._protected
+        ]
+        room = len(self._free) + len(evictable)
+        wanted = wanted[:room]
+        if not wanted:
+            return 0
+
+        # On CPU there is no side stream and a fill is a host memcpy, so the
+        # copies simply happen here. The bookkeeping below — eviction, slot
+        # accounting, the protected set — is identical either way, which is what
+        # lets the CPU tests cover it. Only the ordering is GPU-only.
+        if self._stream is not None:
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream(self.device))
+            context = torch.cuda.stream(self._stream)
+        else:
+            ready = None
+            context = contextlib.nullcontext()
+
+        row_bytes = self.store.shape.nbytes
+        pinned = self.store.is_pinned(layer)
+        with context:
+            if self._stream is not None:
+                self._stream.wait_event(ready)
+            if self._timing:
+                spec_start = torch.cuda.Event(enable_timing=True)
+                spec_start.record(self._stream)
+            for expert in wanted:
+                if not self._free:
+                    key = evictable.pop(0)
+                    if key in self._pending:
+                        # Displacing one speculation with another. Order the
+                        # writes; the side stream is one stream, so recording
+                        # and waiting here is enough.
+                        self._stream.wait_event(self._pending.pop(key))
+                        self.stats.prefetch_wasted += 1
+                    self._free.append(self._slot_of.pop(key))
+                    self.stats.evictions += 1
+
+                slot = self._free.pop()
+                self._slots[slot].copy_(self.store.row(layer, expert), non_blocking=pinned)
+                if self._stream is not None:
+                    landed = torch.cuda.Event()
+                    landed.record(self._stream)
+                    self._pending[(layer, expert)] = landed
+
+                self._slot_of[(layer, expert)] = slot
+                self.stats.bytes_fetched += row_bytes
+                self.stats.prefetch_issued += 1
+            if self._timing:
+                spec_end = torch.cuda.Event(enable_timing=True)
+                spec_end.record(self._stream)
+                self._spec_events.append((spec_start, spec_end))
+
+        return len(wanted)
+
+    def drain_fill_ms(self) -> tuple[float, float]:
+        """(demand ms, speculative ms) of GPU fill time since the last drain.
+
+        The first number bounds prefetching. Demand fills are issued on the
+        compute stream, so a fill's duration is time the GEMMs that follow it
+        are *not* running — it is on the critical path by construction, and a
+        perfect prefetcher would recover all of it and nothing more.
+
+        The second is side-stream work, which is *meant* to be hidden. It is
+        reported beside the first rather than added to it, because the two
+        answer different questions: how much is still blocking, and how much
+        bandwidth the speculation spent to get it there.
+
+        This synchronizes, so call it outside a timed region. Events are
+        recorded per call (per layer), not per expert, so a layer's misses are
+        timed as the one back-to-back burst they are issued as.
+        """
+        if not (self._fill_events or self._spec_events):
+            return (0.0, 0.0)
+        torch.cuda.synchronize()
+        totals = tuple(
+            sum(start.elapsed_time(end) for start, end in events)
+            for events in (self._fill_events, self._spec_events)
+        )
+        self._fill_events.clear()
+        self._spec_events.clear()
+        return totals
 
     def _fill(self, layer: int, experts: list[int]) -> None:
         row_bytes = self.store.shape.nbytes
         pinned = self.store.is_pinned(layer)
+        if self._timing:
+            start_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
         for expert in experts:
             slot = self._free.pop()
             # non_blocking only actually overlaps when the source is pinned;
@@ -221,6 +416,10 @@ class ExpertCache:
             self._slots[slot].copy_(self.store.row(layer, expert), non_blocking=pinned)
             self._slot_of[(layer, expert)] = slot
             self.stats.bytes_fetched += row_bytes
+        if self._timing:
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record()
+            self._fill_events.append((start_event, end_event))
 
     # -- introspection -----------------------------------------------------
 
@@ -229,7 +428,13 @@ class ExpertCache:
 
     def clear(self) -> None:
         """Drop every resident expert without freeing the pool."""
+        if self._pending:
+            # Slots are about to be declared free, so any in-flight write to
+            # them has to be finished, not merely ordered.
+            torch.cuda.synchronize(self.device)
+            self._pending.clear()
         self._slot_of.clear()
+        self._protected.clear()
         self._free = list(range(self.capacity))
 
     def describe(self) -> str:

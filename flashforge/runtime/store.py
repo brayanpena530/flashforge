@@ -125,9 +125,32 @@ class ExpertStore:
                 )
 
             want_pinned = pinned_bytes + layer_bytes <= pin_budget_bytes
-            rows = torch.empty(
-                (num_experts, shape.numel), dtype=shape.dtype, pin_memory=want_pinned
-            )
+            try:
+                rows = torch.empty(
+                    (num_experts, shape.numel), dtype=shape.dtype, pin_memory=want_pinned
+                )
+            except RuntimeError as exc:
+                # Pinned host memory has its own ceiling, well below free RAM,
+                # and it is reported as "CUDA error: out of memory" from a *host*
+                # allocation — which reads like a VRAM problem and is not one.
+                # Measured here: 11.8 GB pinnable on an idle 32 GB machine
+                # against a 12.0 GB store, so asking for all of it fails on the
+                # last layer after eleven minutes of work.
+                #
+                # A partly pinned store is a perfectly good store; the pinned
+                # layers still take the async path and `is_pinned` is already
+                # per-layer. So degrade rather than discard the load.
+                if not want_pinned:
+                    raise
+                log.warning(
+                    "Could not pin layer %d (%.2f GB pinned so far): %s\n"
+                    "Falling back to pageable for this and every later layer. "
+                    "Lower --pin-gb to keep the budget under the ceiling.",
+                    layer_idx, pinned_bytes / (1 << 30), str(exc).splitlines()[0],
+                )
+                pin_budget_bytes = pinned_bytes  # stop trying
+                want_pinned = False
+                rows = torch.empty((num_experts, shape.numel), dtype=shape.dtype)
             for expert_idx, expert in enumerate(experts):
                 rows[expert_idx] = _flatten_expert(expert, shape)
 

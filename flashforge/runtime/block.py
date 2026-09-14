@@ -65,6 +65,15 @@ class CachedMoEBlock(nn.Module):
         self.norm_topk_prob = norm_topk_prob
         self.act_fn = act_fn
         self.grouped = grouped
+        # Stage 1c. `next_gate` is the *next* MoE layer's real router module,
+        # wired up by install_expert_cache. Running it on this layer's hidden
+        # state is Q3's `stale_router` predictor, which recalled 0.835 of the
+        # true top-k one layer ahead — the best of the predictors swept, and
+        # nearly free: one (tokens x hidden) @ (hidden x num_experts) matmul
+        # against the 3 x top_k expert GEMMs it is trying to overlap.
+        self.prefetch = False
+        self.next_gate: nn.Linear | None = None
+        self.next_layer_idx: int | None = None
         # A prefill batch routes to every expert in the layer, and gathering all
         # 64 of OLMoE's costs 805 MB of transient VRAM — on a 6 GB card holding a
         # 3.9 GB slot pool, that is the difference between running and OOM. The
@@ -92,27 +101,49 @@ class CachedMoEBlock(nn.Module):
             device=hidden_states.device,
         )
 
-        # `unique` returns ascending order, which is the stock loop's order with
-        # the unrouted experts removed. Keeping the order matters: index_add_
-        # accumulates in fp16 here and floating-point addition is not
-        # associative, so a different visit order would give a different (still
-        # correct, but not bit-identical) result and make the parity test
-        # against the stock block impossible to write tightly.
+        # ONE device->host sync per layer, and it is worth saying why this is
+        # written the way it is rather than the obvious way.
         #
-        # `return_counts` costs nothing extra and the grouped path needs the
-        # group sizes. Both paths pay one device->host sync here either way.
-        unique_experts, counts = torch.unique(selected_experts, return_counts=True)
-        routed = unique_experts.tolist()
+        # The obvious way is `torch.unique(selected_experts, return_counts=True)`
+        # and then `.tolist()` on each — two transfers. Add prefetch's predicted
+        # set and it is three, sixteen times per token. Stage 1c measured what
+        # that costs: the first prefetcher took 68 ms/token of transfer stall
+        # off the critical path and returned 4% more tokens, because each sync
+        # it added handed the stall straight back.
+        #
+        # `bincount` gives the routed set *and* the group sizes as one
+        # fixed-size vector, so the prediction concatenates onto it and the
+        # whole layer costs a single 64- or 128-element copy. Walking it
+        # host-side yields ascending order, which is what `unique` gave and what
+        # fp16 `index_add_` needs to stay bit-exact against the stock block.
+        counts_all = torch.bincount(selected_experts.reshape(-1), minlength=self.num_experts)
+
+        predicted: list[int] | None = None
+        if self.prefetch and self.next_gate is not None and not self._is_prefill(hidden_states):
+            fused = torch.cat([counts_all, self._predict_next(hidden_states)]).tolist()
+            predicted = [e for e in range(self.num_experts) if fused[self.num_experts + e]]
+        else:
+            fused = counts_all.tolist()
+
+        routed = [e for e in range(self.num_experts) if fused[e]]
+        group_sizes = [fused[e] for e in routed]
 
         # One cache call per layer rather than per expert, so the fills for a
         # layer are issued back to back. Q8's lesson one tier down was that
         # request batching, not queue depth alone, is what saturates a device.
         slots = self.cache.acquire(self.layer_idx, routed)
 
+        # Issued after this layer's own experts are resident and before its
+        # GEMMs are enqueued, which is the only window where the copies have
+        # something to hide behind: they run on the side stream while the bmms
+        # below run on the compute stream.
+        if predicted:
+            self.cache.prefetch(self.next_layer_idx, predicted)
+
         if self.grouped:
             self._forward_grouped(
                 hidden_states, routing_weights, selected_experts,
-                routed, counts, slots, final_hidden_states,
+                routed, group_sizes, slots, final_hidden_states,
             )
         else:
             self._forward_loop(
@@ -151,7 +182,7 @@ class CachedMoEBlock(nn.Module):
         routing_weights: torch.Tensor,
         selected_experts: torch.Tensor,
         routed: list[int],
-        counts: torch.Tensor,
+        size_list: list[int],
         slots: dict[int, int],
         final_hidden_states: torch.Tensor,
     ) -> None:
@@ -168,9 +199,8 @@ class CachedMoEBlock(nn.Module):
         token_of = torch.div(order, top_k, rounding_mode="floor")
         weight_of = routing_weights.reshape(-1)[order]
 
-        # Group sizes are already on the host from the `unique` above; the
-        # offsets follow from them, so no second sync is needed.
-        size_list = counts.tolist()
+        # Group sizes arrive as a host list from `forward`'s single sync; the
+        # offsets follow from them, so nothing here touches the device.
         offset_list = [0]
         for size in size_list[:-1]:
             offset_list.append(offset_list[-1] + size)
@@ -213,6 +243,35 @@ class CachedMoEBlock(nn.Module):
             out = out * weights.unsqueeze(-1)
 
             final_hidden_states.index_add_(0, flat_tokens, out.view(-1, hidden_dim))
+
+    # -- Stage 1c: speculative prefetch -------------------------------------
+
+    def _is_prefill(self, hidden_states: torch.Tensor) -> bool:
+        """More tokens than experts, so the batch routes to essentially all of them.
+
+        Prefetching that is pure loss: there is nothing left to predict, and the
+        speculative fetch would be a second whole-layer transfer stacked on top
+        of the demand one it cannot avoid.
+        """
+        return hidden_states.shape[0] > self.num_experts
+
+    def _predict_next(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Q3's `stale_router`: the next layer's real gate, on this layer's input.
+
+        Returns a `num_experts` count vector, on the device and deliberately
+        *not* synced — `forward` concatenates it onto this layer's own counts so
+        both cross to the host in one copy.
+
+        The guess cannot affect the output. It only decides which weights are
+        already in VRAM when the next layer asks, and the next layer asks its
+        own router regardless — so a wrong prediction costs PCIe bandwidth and a
+        cache slot, never a wrong expert. That is what makes a predictor at
+        0.835 recall usable at all, and it is why this is allowed to be cheap
+        and approximate when the thing it feeds is not.
+        """
+        with torch.no_grad():
+            _, predicted = torch.topk(self.next_gate(hidden_states), self.top_k, dim=-1)
+            return torch.bincount(predicted.reshape(-1), minlength=self.num_experts)
 
     def _run_expert(self, slot: int, x: torch.Tensor) -> torch.Tensor:
         """SwiGLU against cache slot views — `F.linear` is `x @ W.T`, as nn.Linear."""

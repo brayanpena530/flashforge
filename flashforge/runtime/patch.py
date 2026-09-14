@@ -62,6 +62,7 @@ def install_expert_cache(
     device: torch.device | str = "cuda",
     pin_gb: float = 0.0,
     grouped: bool = True,
+    prefetch: bool = False,
 ) -> PatchReport:
     """Move experts to host RAM, front them with a GPU cache, return the wiring.
 
@@ -74,6 +75,18 @@ def install_expert_cache(
     real model in fp16 the two paths produced identical greedy output for 65
     tokens — the divergence is below the argmax. Pass `grouped=False` for the
     bit-exact loop path, which is what the parity tests hold to zero.
+
+    `prefetch` selects Stage 1c's side-stream speculative fill. It defaults
+    **off**, which is the opposite call from `grouped` and for a documented
+    reason: its mechanism reproduces (blocking fill 100.5 -> 32.7 ms/token,
+    decode hit rate 46.8% -> 81.8%, predictor precision 78.2%) but its effect on
+    throughput does not — measured against the grouped path three times it came
+    out at -15%, +4% and +29%, every one inside a within-path spread of 18-53%.
+    A default is a claim, and that claim is not supported yet.
+
+    Note it requires pinned host memory to do anything at all: on a pageable
+    store `copy_(non_blocking=True)` is synchronous, so the side stream cannot
+    overlap and the speculation is pure extra bandwidth. Pass `pin_gb`.
     """
     device = torch.device(device)
     spec = discover_moe(model)
@@ -98,6 +111,16 @@ def install_expert_cache(
         )
         _replace_module(model, f"layers.{layer_idx}.mlp", block)
         blocks.append(block)
+
+    # Stage 1c: each block gets a handle on the next one's router, so it can run
+    # Q3's `stale_router` predictor on its own hidden state. The last MoE layer
+    # keeps `next_gate = None` — there is no layer after it to prefetch for, and
+    # guessing into the next *token* is a different predictor with a different
+    # (much longer) horizon.
+    for block, following in zip(blocks, blocks[1:]):
+        block.next_gate = following.gate
+        block.next_layer_idx = following.layer_idx
+        block.prefetch = prefetch
 
     model.to(device)
     gc.collect()

@@ -9,7 +9,7 @@ Read the first section before publishing any number.
 
 ## 1. Measurement traps
 
-This is the dominant category. Six of the bugs below produced *plausible,
+This is the dominant category. Most of the bugs below produced *plausible,
 publishable results* — a tidy table, a monotonic trend, a clean speedup — and
 were only caught by someone asking where a number came from.
 
@@ -75,7 +75,40 @@ had been derived from the stale row and was wrong by 60%.
 **Rule:** Q7 and Q8 have to come from the *same* `ff-bench` invocation. When a
 table cell has a provenance, put the run in the caption.
 
-### 1.4 Truncating an ordered stream is not sampling
+### 1.4 A profile taken at one capacity does not describe another
+
+Stage 1 profiled decode, found `aten::copy_` at 4.95%, and concluded transfers
+were nearly free. That reordered the whole roadmap: grouped GEMM moved up,
+prefetch moved down to "worth at most ~5%", and the README said so.
+
+The profile was taken at **384 slots**. The runtime ships at **256**, where
+transfer volume is seven times higher (0.859 vs 0.120 GB/token). Measured
+there, fill is **71% of decode**, not 5%. The prefetch ceiling was not 5%; it
+was +244%.
+
+Worse, the 384-slot row should never have been used for anything — see 1.8.
+
+**Rule:** a breakdown is a property of an operating point, not of a system. If
+the number is going to be used to rank work, measure it at the configuration
+the work will ship in, and put the configuration next to the number.
+
+### 1.5 Instrument every path, or the column means two things
+
+The fill timer above wrapped `ExpertCache._fill`, which is the *demand* path.
+When prefetch moved most fills to a side stream, the column dropped from 126.3
+to 50.5 ms/token and read as a 60% improvement. It was not measuring an
+improvement; it was measuring less of the program.
+
+The fix is two columns — demand ms (blocking, on the critical path) and
+speculative ms (side stream, supposed to be hidden) — because adding them
+would make better overlap look like a regression, and reporting only the first
+makes moving work out of frame look like removing it.
+
+**Rule:** when an optimisation *relocates* work, a counter scoped to the old
+location will show the win whether or not the win happened. Scope counters to
+the work, not to the function.
+
+### 1.6 Truncating an ordered stream is not sampling
 
 Q5's simulator took `--max-accesses`, applied to a trace ordered by
 `(seq_id, pos, layer)`. Truncation therefore handed the simulator the first
@@ -88,7 +121,7 @@ Fixed with `subsample_sequences()`, which samples whole sequences.
 **Rule:** if a trace is sorted by anything, a prefix is a biased sample. Subsample
 at the granularity of the unit the sort key groups by.
 
-### 1.5 Isolate phases before averaging them
+### 1.7 Isolate phases before averaging them
 
 The first `ff-serve` printed a single hit rate over prefill + decode. Meaningless:
 prefill misses are compulsory (a prefill batch touches nearly every expert), so
@@ -97,7 +130,7 @@ the blended figure mostly measures the prefill/decode token ratio.
 `_run_phase()` now snapshots the counters between phases. Prefill hit 8.3% and
 decode 46.8% at the same capacity — averaging those describes nothing.
 
-### 1.6 A leak in the sweep loop reads exactly like a cache-policy finding
+### 1.8 A resource bug reads exactly like a cache-policy finding
 
 In the capacity sweep the previous iteration's `report` (12 GB host store + 3 GB
 VRAM pool) stayed alive while the next model loaded. The machine swapped.
@@ -113,7 +146,30 @@ Fixed with an explicit `del model, report` per iteration, plus
 per row. A result where hit rate and throughput move in opposite directions is a
 resource bug until proven otherwise.
 
-### 1.7 Environmental contamination
+**The VRAM version of this is worse, because it does not raise.** At 384 slots
+the cache is 5.39 GB resident on a 6 GB card. On Windows that does not OOM —
+WDDM silently backs the overflow with host memory, so every read of a "resident"
+expert crosses PCIe again. Decode: **0.83 tok/s at a 92.7% hit rate**, against
+5.53 tok/s at 46.9% with 256 slots. Hit rate doubled, throughput fell 6.7x. The
+same signature, one tier down, and it had been sitting in the published capacity
+sweep as the 384-slot row — the row the "transfers are nearly free" profile was
+taken from (1.4).
+
+Two things follow. Print VRAM headroom per row, not just host RAM. And call
+`torch.cuda.empty_cache()` before `mem_get_info()`: PyTorch's caching allocator
+counts as *used* at the driver level, so without it the check reads 0.00 GB free
+at every capacity including the ones with 3.6 GB genuinely spare. A warning that
+fires on every row is not a warning.
+
+**Also: rows inside one sweep are not comparable to each other.** Even with the
+explicit `del`, free host RAM fell 12.4 → 7.5 → 5.8 GB across a 128/256/320
+sweep, and 256 slots measured **2.77 tok/s** there against **5.53** in a run of
+its own. Same capacity, same code, same machine — different amount of the
+machine left. Row one is the only row measured on a clean box. `ff-serve` now
+warns when free RAM has drifted more than 1 GB from row one's, but the real fix
+is one capacity per invocation.
+
+### 1.9 Environmental contamination
 
 - **Page cache.** A disk benchmark whose scratch file is smaller than RAM
   measures the page cache. Size the file above RAM or drop caches.
@@ -220,7 +276,48 @@ prefetch is worth at most 5% and moved after it.
 **Rule:** docstrings and READMEs state what was measured. Predictions get labelled
 as predictions, in the future tense, with the experiment that would settle them.
 
-### 4.4 A tolerance in a unit test is not a tolerance in the model
+### 4.4 Removing a stall is not the same as removing the cost
+
+Stage 1c's prefetcher did exactly what it was designed to do. Blocking fill fell
+from 100.5 to 32.7 ms/token, decode hit rate went 46.8% -> 81.8%, and the
+predictor ran at 78% precision in the runtime. Every intermediate metric said it
+worked.
+
+Decode throughput moved +4%, inside a 20% spread.
+
+Sixty-eight milliseconds per token left the critical path and did not come back
+as tokens, because prefetch also moved **24% more bytes** over the link that was
+already the bottleneck — 22% of its guesses are wrong, and it pays full price
+for them. Overlapping a transfer helps when ordering is the problem. It does not
+help when bandwidth is the problem; it makes bandwidth worse.
+
+**Rule:** an intermediate metric moving the right way is evidence the mechanism
+is wired up, not evidence the change is worth having. Name the end-to-end number
+before you start, and if the mechanism improves while it does not, look for the
+resource the change is *spending* rather than the one it is saving.
+
+### 4.5 Count the synchronizations, not just the milliseconds
+
+Between them the router and the prefetcher were doing **three** device-to-host
+copies per layer — `unique(...).tolist()`, `counts.tolist()`, and the predicted
+set — sixteen times per token. Each is tiny and each one drains the pipeline.
+
+`torch.bincount(..., minlength=num_experts)` returns the routed set and the
+group sizes in one fixed-size vector, so the prediction concatenates onto it and
+the whole layer costs one copy. That took the loop path's blocking fill from
+130.4 to 98.4 ms/token — a bigger change than most of what was being measured
+around it, from code that was never the subject of a benchmark.
+
+Walking the count vector host-side also yields ascending expert order, which is
+what `unique` gave and what fp16 `index_add_` needs to stay bit-exact against
+the stock block. That property had to survive the rewrite, and the parity test
+asserting a difference of *exactly zero* is what proved it did.
+
+**Rule:** on a hot path, `.tolist()`, `.item()` and `.cpu()` are the expensive
+operations regardless of how little data they move. Count them per layer before
+optimising anything measured in milliseconds.
+
+### 4.6 A tolerance in a unit test is not a tolerance in the model
 
 Stage 1b's grouped path is not bit-exact — one `index_add_` over every expert
 has no defined accumulation order. The test suite held it to `2e-19` in fp32 on
@@ -245,5 +342,11 @@ at the real dtype, the real scale, and on the observable the user actually sees.
 2. Is it a median of >=5 passes, with the spread printed next to it?
 3. Do all the constants in this table come from one run?
 4. Are prefill and decode reported separately?
-5. Was free RAM/VRAM checked between sweep iterations?
+5. Was free RAM *and* VRAM checked per row, VRAM after an `empty_cache()`?
 6. If it came from a subagent or an old log — did you re-run it yourself?
+7. If it is a breakdown or a profile, was it taken at the operating point the
+   conclusion will be applied to?
+8. If the change *moved* work rather than removing it, does the counter still
+   cover both places it can now be?
+9. Is every row in this table from its own invocation, or did a sweep hand you
+   row three on a machine that row one had already used up?

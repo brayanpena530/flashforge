@@ -306,6 +306,69 @@ check("gather stacks the right experts in the right shapes",
       and torch.equal(down_w[1], reference.layers[0].mlp.experts[7].down_proj.weight),
       f"gate {tuple(gate_w.shape)}, down {tuple(down_w.shape)} — down keeps its transpose")
 
+print("\nPrefetch (Stage 1c)")
+
+# The GPU half of prefetch — the side stream and the events ordering it against
+# compute — cannot be exercised here. What can, and is where the bugs actually
+# live, is the bookkeeping: which slots a speculative fill is allowed to take,
+# what it does to LRU order, and whether a wrong guess can cost correctness
+# rather than only bandwidth. On CPU `prefetch` runs that same bookkeeping and
+# copies synchronously.
+
+# Wiring first. A block that prefetches for the wrong layer would still produce
+# correct output — the next layer's own `acquire` fixes it — and would show up
+# only as a hit rate that never improves. So assert the chain directly.
+chain = install_expert_cache(copy.deepcopy(model), capacity=L * E, device="cpu")
+check("each block prefetches for the next MoE layer",
+      [b.next_layer_idx for b in chain.blocks] == [b.layer_idx for b in chain.blocks[1:]] + [None],
+      f"next_layer_idx chain {[b.next_layer_idx for b in chain.blocks]}; the last "
+      "block has no successor to predict")
+check("prefetch is off unless asked for",
+      not any(b.prefetch for b in chain.blocks),
+      "install_expert_cache defaults to prefetch=False — unlike grouped, it has "
+      "a correctness story that only a GPU can check, so it does not self-enable")
+
+# A wrong guess must cost bandwidth, never the answer. Prefetching a layer's
+# experts and then asking for a *disjoint* set is the adversarial case: the
+# speculation has to be evictable, and the demand fill has to win.
+wrong_cache = ExpertCache(probe_store, capacity=4, device="cpu")
+wrong_cache.prefetch(0, [0, 1, 2, 3])
+wrong_slots = wrong_cache.acquire(0, [4, 5, 6, 7])
+correct = all(
+    torch.equal(wrong_cache.gate_proj(wrong_slots[e]),
+                reference.layers[0].mlp.experts[e].gate_proj.weight)
+    for e in (4, 5, 6, 7)
+)
+check("a completely wrong prefetch does not corrupt the answer", correct,
+      f"all 4 speculative fills were evicted by demand; "
+      f"{wrong_cache.stats.prefetch_issued} issued, "
+      f"{wrong_cache.stats.prefetch_used} used")
+
+# The protected set is the half of the hazard story that events do not cover:
+# slots the currently-executing layer holds have not been enqueued behind any
+# event yet, so eviction is the only thing standing between them and a
+# concurrent overwrite.
+guard_cache = ExpertCache(probe_store, capacity=4, device="cpu")
+held = guard_cache.acquire(0, [0, 1, 2, 3])
+guard_cache.prefetch(1, [0, 1, 2, 3])
+check("prefetch refuses to evict the running layer's slots",
+      guard_cache.stats.prefetch_issued == 0
+      and set(guard_cache.resident()) == {(0, e) for e in range(4)},
+      f"all 4 slots are protected, so nothing was speculatively fetched; "
+      f"resident set unchanged ({len(guard_cache.resident())} experts)")
+
+# And the payoff case: a correct guess turns what would have been a miss into a
+# hit. This is the only assertion that says prefetch does anything at all.
+warm_cache = ExpertCache(probe_store, capacity=8, device="cpu")
+warm_cache.acquire(0, [0, 1])
+warm_cache.prefetch(1, [5, 6])
+before_misses = warm_cache.stats.misses
+warm_cache.acquire(1, [5, 6])
+check("a correct prefetch converts a miss into a hit",
+      warm_cache.stats.misses == before_misses and warm_cache.stats.prefetch_used == 0,
+      f"layer 1 cost 0 further misses (used counter is GPU-only: it increments "
+      f"when an event had to be awaited, and CPU fills are already complete)")
+
 print("\nRouting is untouched")
 patched = copy.deepcopy(model)
 install_expert_cache(patched, capacity=L * E, device="cpu")

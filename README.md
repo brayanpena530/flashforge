@@ -281,6 +281,76 @@ from each other. So `ff-serve` decodes greedily on both paths and reports the
 first token id where they differ: **identical for all 65 tokens**. That is why
 `grouped=True` is the default and `grouped=False` is still there.
 
+## Stage 1c — the prefetch budget, and a profile taken in the wrong place
+
+Stage 1's profile put `aten::copy_` at 4.95% of decode, and the roadmap below
+used to say prefetch was "worth at most ~5%". Both were wrong, for the same
+reason: **that profile was taken at 384 slots and the runtime ships at 256.**
+
+```
+ff-serve --capacity 256 --path all --repeats 5 --pin-gb 7
+```
+
+| slots | fill ms/token | % of decode | ceiling if prefetch were perfect |
+|------:|--------------:|------------:|---------------------------------:|
+| 128   | 216.7         | 77.0%       | +335% |
+| 256   | 126.3         | 70.9%       | +244% |
+| 320   | 123.0         | 22.4%       | +29%  |
+
+Transfers were never nearly free. They are most of decode.
+
+**And the 384-slot row was never a valid measurement.** It puts 5.39 GB resident
+on a 6 GB card. On Windows that does not raise — WDDM backs the overflow with
+host memory, so every read of a "resident" expert crosses PCIe again. It
+measured **0.83 tok/s at a 92.7% hit rate**, against 5.53 tok/s at 46.9% with
+256 slots: hit rate doubled, throughput fell 6.7x. That is the signature of a
+resource bug, one tier down from the host-RAM version already in
+[troubleshoot.md](troubleshoot.md). `ff-serve` now prints VRAM headroom per row.
+
+### The prefetcher works. The speedup does not reproduce.
+
+`CachedMoEBlock` runs the next layer's router on this layer's hidden state
+(Q3's `stale_router`) and issues the predicted fills on a side CUDA stream.
+At 256 slots, 6.75 GB of the store pinned, one invocation:
+
+| path | decode t/s | blocking fill | decode hit | GB/token |
+|------|-----------:|--------------:|-----------:|---------:|
+| loop     | 4.98 | 130.4 ms (50%) | 46.8% | 0.858 |
+| grouped  | 5.85 | 100.5 ms (65%) | 46.7% | 0.859 |
+| prefetch | 6.08 | **32.7 ms (20%)** | **81.8%** | 1.069 |
+
+Every intermediate metric says it worked: hit rate 46.8 → 81.8%, blocking fill
+down by two thirds, predictor precision 78.2% measured in the runtime rather
+than quoted from Q3's offline recall.
+
+Decode throughput, measured against grouped three times, came in at **−15%, +4%
+and +29%** — each inside a within-path spread of 18–53%. Three runs that
+disagree on the *sign* are not three noisy estimates of a real effect. Prefetch
+is therefore **off by default** and `--path prefetch` is opt-in.
+
+The live hypothesis is that removing a stall does not help when the link, not
+the ordering, is the constraint: prefetch moves 24% more bytes because 22% of
+its guesses are wrong, and it pays full price for them. That predicts a fix —
+spend the speculation budget on the highest-weighted predictions only — which is
+where this resumes.
+
+### Two things that fell out of it
+
+**Pinning was never on.** Every measurement in this project before now ran with
+a fully pageable store, where `copy_(non_blocking=True)` is synchronous and a
+side stream cannot overlap at all. Pinning is a prerequisite for prefetch, not
+an optimisation beside it. The ceiling is lower than free RAM suggests: 11.8 GB
+pinnable on this 32 GB machine against a 12.0 GB store, reported as `CUDA error:
+out of memory` from a *host* allocation. `ExpertStore` now degrades to pageable
+for the remaining layers instead of discarding an eleven-minute load.
+
+**The hot path was doing three device→host syncs per layer** — `unique`,
+`counts`, and the prediction — 16 times per token. `torch.bincount` returns the
+routed set and the group sizes in one vector, so the prediction concatenates
+onto it and a layer costs one copy. That alone took the loop path's blocking
+fill from 130.4 to 98.4 ms/token, and it preserves the ascending expert order
+that keeps the loop path bit-exact at *exactly zero* difference.
+
 ## Stage 0 — instrumentation
 
 Answers eight questions, each of which gates a later design decision. Q1–Q6
@@ -581,7 +651,8 @@ is a custom module and will need its own branch in `discover_moe()`.
 - **Stage 0** — instrumentation and routing analysis *(complete; see "Measured results")*
 - **Stage 1** — expert cache in pure PyTorch, experts in host RAM, LRU eviction. *(done: 4.41 tok/s, 12.1x over a measured offload baseline. The Stage 1b run re-measured the same loop path at 4.69 against a 0.40 baseline, 11.8x — two runs, each internally consistent; do not cross them.)*
 - **Stage 1b** — grouped expert GEMM, promoted from Stage 2 because 95% of decode was per-expert dispatch rather than transfer. *(done: 5.98 tok/s, +27% on decode, 15.0x over the baseline measured in the same run. Prefill unchanged within noise.)*
-- **Stage 1c** — async prefetch on a side stream, one layer ahead with `stale_router` (Q3), plus the CPU path for experts under ~11 routed tokens (Q7). Worth at most ~5% until 1b lands, so it is sequenced after it rather than before.
+- **Stage 1c** — async prefetch on a side stream, one layer ahead with `stale_router` (Q3). *(built and measured; see "Stage 1c" above. The "worth at most ~5%" this line used to carry came from a profile of an invalid configuration — the real budget at 256 slots is 50–71% of decode. The prefetcher removes two thirds of the blocking fill and lifts the decode hit rate to 81.8%, but the throughput win does not reproduce: −15%, +4%, +29% across three runs, all inside the spread. Off by default.)*
+- **Stage 1c, resumed** — cut the speculation's bandwidth waste before re-measuring: prefetch only the highest-weighted predictions rather than all `top_k`, since 22% of guesses are wrong and paid for in full on a link that is the bottleneck. Then the CPU path for experts under ~11 routed tokens (Q7), which is the same lever from the other side — an expert computed in place is a transfer not made.
 - **Stage 2** — Triton kernels: fused gather-GEMM, dequant, fused router. *Needs sm_80+.*
 - **Stage 3** — scale to V4-Flash, where the routed pool may not fit in RAM either and experts stream disk→RAM→GPU. *Needs RAM and NVMe headroom.* Q8 is the go/no-go: if `t_disk` needs more lookahead than Q3 shows prediction surviving, the disk tier has to be driven by a longer-horizon signal rather than per-layer routing prediction.
 

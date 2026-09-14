@@ -761,7 +761,7 @@ def _cuda_sync() -> None:
         torch.cuda.synchronize()
 
 
-def _run_phase(model, input_ids, gen_tokens: int, stats=None) -> dict:
+def _run_phase(model, input_ids, gen_tokens: int, stats=None, cache=None) -> dict:
     """Time prefill and decode, keeping their cache statistics apart.
 
     Blending the two produces a hit rate that means nothing. Prefill touches
@@ -780,8 +780,14 @@ def _run_phase(model, input_ids, gen_tokens: int, stats=None) -> dict:
             return (0, 0, 0)
         return (stats.hits, stats.misses, stats.bytes_fetched)
 
+    def drain():
+        # Synchronizes, so it only ever runs immediately after a timed region
+        # has already been synced and closed out.
+        return cache.drain_fill_ms() if cache is not None else (0.0, 0.0)
+
     with torch.no_grad():
         before = snapshot()
+        drain()
         _cuda_sync()
         start = time.perf_counter()
         out = model(input_ids, use_cache=True)
@@ -793,9 +799,12 @@ def _run_phase(model, input_ids, gen_tokens: int, stats=None) -> dict:
             "prefill_s": prefill_s,
             "prefill_tokens": int(input_ids.shape[1]),
             "prefill_counts": tuple(a - b for a, b in zip(after_prefill, before)),
+            "prefill_fill_ms": drain()[0],
             "decode_s": 0.0,
             "decode_tokens": 0,
             "decode_counts": (0, 0, 0),
+            "decode_fill_ms": 0.0,
+            "decode_spec_ms": 0.0,
             "tokens": [],
         }
         if gen_tokens <= 0:
@@ -823,6 +832,7 @@ def _run_phase(model, input_ids, gen_tokens: int, stats=None) -> dict:
         result["decode_s"] = time.perf_counter() - start
         result["decode_tokens"] = gen_tokens
         result["decode_counts"] = tuple(a - b for a, b in zip(snapshot(), after_prefill))
+        result["decode_fill_ms"], result["decode_spec_ms"] = drain()
         result["tokens"] = [int(t.flatten()[0]) for t in tokens]
 
     return result
@@ -936,11 +946,19 @@ def serve_main(argv: list[str] | None = None) -> int:
              "so this is a hard claim on physical memory — see runtime/store.py",
     )
     parser.add_argument(
-        "--path", default="both", choices=["loop", "grouped", "both"],
+        "--path", default="both", choices=["loop", "grouped", "prefetch", "both", "all"],
         help="expert execution path. 'loop' is the bit-exact reference, one GEMM "
-             "per expert; 'grouped' is Stage 1b's batched bmm. 'both' times them "
-             "back to back on the same loaded model and the same warm cache, "
-             "which is the only way to attribute a difference to the path",
+             "per expert; 'grouped' is Stage 1b's batched bmm; 'prefetch' is "
+             "grouped plus Stage 1c's side-stream speculative fill. 'both' is "
+             "loop+grouped, 'all' adds prefetch. Several paths are timed back to "
+             "back on the same loaded model and the same warm cache, which is the "
+             "only way to attribute a difference to the path",
+    )
+    parser.add_argument(
+        "--no-fill-timing", dest="fill_timing", action="store_false",
+        help="skip the extra instrumented pass that measures how much of a token "
+             "is PCIe fill. That pass is what bounds prefetching: it is the only "
+             "thing a perfect prefetcher could recover",
     )
     parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16"])
     parser.add_argument(
@@ -968,7 +986,14 @@ def serve_main(argv: list[str] | None = None) -> int:
 
     model_id = args.model or DEFAULT_MODEL
     capacities = [int(c) for c in args.capacity.split(",") if c.strip()]
-    paths = ["loop", "grouped"] if args.path == "both" else [args.path]
+    # name -> (grouped, prefetch). Ordered so the first entry is always the
+    # comparison base, and so `loop` stays first when it is present: it is the
+    # bit-exact oracle and every other path is a claim measured against it.
+    path_flags = {"loop": (False, False), "grouped": (True, False), "prefetch": (True, True)}
+    paths = {
+        "both": ["loop", "grouped"],
+        "all": ["loop", "grouped", "prefetch"],
+    }.get(args.path, [args.path])
 
     import gc
 
@@ -1020,6 +1045,7 @@ def serve_main(argv: list[str] | None = None) -> int:
 
     rows = []
     report = None
+    first_free_gb = None
     for i, capacity in enumerate(capacities):
         # Each capacity needs a fresh model: install_expert_cache moves the
         # experts out, so the previous iteration left a hollow shell behind.
@@ -1041,10 +1067,50 @@ def serve_main(argv: list[str] | None = None) -> int:
         print(f"\n=== capacity {capacity}")
         print(report.describe())
 
+        # The VRAM twin of the host-RAM check below, and it was added because
+        # the 384-slot row of the Stage 1 sweep was a resource bug that read as
+        # a cache result: 5.39 GB resident on a 6 GB card, hit rate 92.7%,
+        # decode 0.83 tok/s against 5.53 at 256 slots. Hit rate up, throughput
+        # down 6.7x. On Windows an over-committed allocation does not fail — WDDM
+        # spills it to host memory and every slot read silently crosses PCIe
+        # again. The profile that concluded "transfers are nearly free" was
+        # taken in that regime.
+        #
+        # empty_cache() first, and it is not optional. mem_get_info() reports
+        # what the *driver* has free, and PyTorch's caching allocator counts as
+        # used — so without this the check reads 0.00 GB free at every capacity,
+        # including 128 slots with 3.6 GB genuinely spare, and warns on rows
+        # that are fine. An instrument that fires on everything says nothing.
+        torch.cuda.empty_cache()
+        vram_free, vram_total = torch.cuda.mem_get_info()
+        print(f"  VRAM free after install: {vram_free / (1 << 30):.2f} GB "
+              f"of {vram_total / (1 << 30):.2f} GB")
+        # 0.25 GB, not 0.5: 256 slots runs healthily at ~0.5 GB free and tripping
+        # there would flag the configuration the runtime actually ships. The
+        # collapse at 384 slots happened at 0.00 GB.
+        if vram_free < 0.25 * (1 << 30):
+            print("  WARNING: under 0.5 GB of VRAM headroom. Activations and the "
+                  "gather buffer still have to fit; past this point the driver "
+                  "pages the slot pool to host memory and these timings measure "
+                  "that, not the cache. Treat this row as invalid, not as a result.")
+
         free = hardware.available_ram_bytes()
         if free is not None:
             free_gb = free / (1 << 30)
             print(f"  host RAM free: {free_gb:.1f} GB")
+            # Not a threshold — a drift. Even with the explicit `del` above,
+            # free host RAM fell 12.4 -> 7.5 -> 5.8 GB across a 128/256/320
+            # sweep, and 256 slots measured 2.77 tok/s there against 5.53 in a
+            # run of its own. The capacity was the same; the machine was not.
+            # Row one is the only row in a sweep that is measured on a clean
+            # box, so say which rows are downstream of that.
+            if i > 0 and first_free_gb is not None and free_gb < first_free_gb - 1.0:
+                print(f"  WARNING: {first_free_gb - free_gb:.1f} GB less free RAM than "
+                      f"the first capacity in this sweep had. Rows are no longer "
+                      f"comparable to each other — compare capacities across separate "
+                      f"invocations, and trust row one.")
+            if i == 0:
+                first_free_gb = free_gb
             # Swapping shows up as a throughput collapse with an unchanged or
             # better hit rate, which reads exactly like a cache-policy finding.
             # It is not one, so say so here rather than letting the table imply it.
@@ -1057,8 +1123,11 @@ def serve_main(argv: list[str] | None = None) -> int:
         # already-installed blocks is what makes the comparison controlled: same
         # weights, same slot pool, same residency, one variable.
         for path in paths:
+            grouped, prefetching = path_flags[path]
             for block in report.blocks:
-                block.grouped = path == "grouped"
+                block.grouped = grouped
+                # The last block has no next_gate, so this is a no-op there.
+                block.prefetch = prefetching
 
             for _ in range(args.warmup):
                 _run_phase(model, input_ids, min(4, args.gen_tokens))
@@ -1077,6 +1146,28 @@ def serve_main(argv: list[str] | None = None) -> int:
             # timings they need no aggregation.
             p_hits, p_misses, p_bytes = timing["prefill_counts"]
             d_hits, d_misses, d_bytes = timing["decode_counts"]
+            # Read before the probe pass below resets the counters. This is the
+            # predictor's precision as the runtime actually experienced it,
+            # which is the number that matters — Q3's 0.835 was recall, offline,
+            # on a trace, and a speculative fetch is paid for by precision.
+            issued, used = stats.prefetch_issued, stats.prefetch_used
+
+            # Stage 1c's bound, measured on its own pass. Recording two CUDA
+            # events per layer is a perturbation, so it must not touch the
+            # throughput column above — the whole point of the number is to be
+            # compared against that column, and an instrument that changes what
+            # it measures would make the comparison circular.
+            #
+            # Fills are issued on the compute stream, so their duration is time
+            # the expert GEMMs are stalled. A prefetcher that predicted
+            # perfectly and had infinite spare bandwidth would recover exactly
+            # this and no more. It is a ceiling, not a forecast.
+            probe = None
+            if args.fill_timing:
+                report.cache.time_fills = True
+                stats.reset()
+                probe = _run_phase(model, input_ids, args.gen_tokens, stats, report.cache)
+                report.cache.time_fills = False
 
             rows.append({
                 "capacity": capacity,
@@ -1097,6 +1188,30 @@ def serve_main(argv: list[str] | None = None) -> int:
                 "decode_gb_per_token": d_bytes / 1e9 / max(1, timing["decode_tokens"]),
                 "vram_gb": report.resident_bytes / (1 << 30),
                 "tokens": timing["tokens"],
+                "prefetch_issued": issued,
+                "prefetch_used": used,
+                # Shares are computed against the probe pass's *own* wall clock,
+                # not the median above. Mixing a numerator from one pass with a
+                # denominator from another is how this project has produced
+                # three wrong tables; see troubleshoot.md 1.3.
+                "decode_fill_share": (
+                    probe["decode_fill_ms"] / (probe["decode_s"] * 1e3)
+                    if probe and probe["decode_s"] else None
+                ),
+                "decode_fill_ms_per_token": (
+                    probe["decode_fill_ms"] / max(1, probe["decode_tokens"])
+                    if probe else None
+                ),
+                "prefill_fill_share": (
+                    probe["prefill_fill_ms"] / (probe["prefill_s"] * 1e3)
+                    if probe and probe["prefill_s"] else None
+                ),
+                # Side-stream ms, kept apart from the demand number above. On
+                # the non-prefetch paths this is zero by construction.
+                "decode_spec_ms_per_token": (
+                    probe["decode_spec_ms"] / max(1, probe["decode_tokens"])
+                    if probe else None
+                ),
             })
             print(f"  [{path:>7}] prefill {_median(prefill_samples):8.1f} tok/s  "
                   f"({min(prefill_samples):.1f}-{max(prefill_samples):.1f})  "
@@ -1105,6 +1220,19 @@ def serve_main(argv: list[str] | None = None) -> int:
                   f"({min(decode_samples):.2f}-{max(decode_samples):.2f} over "
                   f"{len(decode_samples)} passes)  hit {_rate(d_hits, d_misses):5.1%}  "
                   f"{d_bytes / 1e9:5.2f} GB")
+            if issued:
+                print(f"  [{path:>7}] predict {used:>6,} of {issued:,} speculative fetches "
+                      f"were wanted = {used / issued:.1%} precision")
+            if probe:
+                row = rows[-1]
+                print(f"  [{path:>7}] fill    {row['decode_fill_ms_per_token']:8.1f} ms/token "
+                      f"blocking = {row['decode_fill_share']:.1%} of decode "
+                      f"(prefill {row['prefill_fill_share']:.1%}) "
+                      "<- the prefetch ceiling")
+                if row["decode_spec_ms_per_token"]:
+                    print(f"  [{path:>7}] spec    "
+                          f"{row['decode_spec_ms_per_token']:8.1f} ms/token on the side "
+                          "stream, which only helps if it overlapped")
 
     print("\n" + "=" * 100)
     print(f"{'slots':>7} {'path':>8} {'VRAM GB':>8} {'prefill t/s':>12} {'spread':>13} "
@@ -1120,42 +1248,61 @@ def serve_main(argv: list[str] | None = None) -> int:
     # Same rule as the capacity sweep: a path difference narrower than the
     # machine's own run-to-run spread is not a result.
     if len(paths) > 1:
-        print(f"\n{'slots':>7} {'phase':>8} {'loop t/s':>10} {'grouped t/s':>12} "
-              f"{'change':>9}  verdict")
+        # Everything is scored against the first path requested, which is `loop`
+        # whenever it was asked for. Comparing prefetch against grouped instead
+        # would hide whichever of the two changes cancelled the other.
+        base_path = paths[0]
+        print(f"\n{'slots':>7} {'path':>9} {'phase':>8} {base_path + ' t/s':>12} "
+              f"{'this t/s':>10} {'change':>9}  verdict")
         for capacity in capacities:
-            pair = {r["path"]: r for r in rows if r["capacity"] == capacity}
-            loop, grouped = pair.get("loop"), pair.get("grouped")
-            if not (loop and grouped):
+            by_path = {r["path"]: r for r in rows if r["capacity"] == capacity}
+            base = by_path.get(base_path)
+            if base is None:
                 continue
-            for phase, key, lo, hi in [
-                ("prefill", "prefill_tok_s", "prefill_lo", "prefill_hi"),
-                ("decode", "decode_tok_s", "decode_lo", "decode_hi"),
-            ]:
-                if not loop[key]:
+            for path in paths[1:]:
+                other = by_path.get(path)
+                if other is None:
                     continue
-                change = grouped[key] / loop[key] - 1.0
-                noise = max((r[hi] - r[lo]) / r[key] for r in (loop, grouped) if r[key])
-                verdict = ("real" if abs(change) > noise
-                           else f"inside the {noise:.0%} within-path spread — no finding")
-                print(f"{capacity:>7} {phase:>8} {loop[key]:>10.2f} "
-                      f"{grouped[key]:>12.2f} {change:>+8.0%}  {verdict}")
+                for phase, key, lo, hi in [
+                    ("prefill", "prefill_tok_s", "prefill_lo", "prefill_hi"),
+                    ("decode", "decode_tok_s", "decode_lo", "decode_hi"),
+                ]:
+                    if not base[key]:
+                        continue
+                    change = other[key] / base[key] - 1.0
+                    noise = max((r[hi] - r[lo]) / r[key] for r in (base, other) if r[key])
+                    verdict = ("real" if abs(change) > noise
+                               else f"inside the {noise:.0%} within-path spread — no finding")
+                    print(f"{capacity:>7} {path:>9} {phase:>8} {base[key]:>12.2f} "
+                          f"{other[key]:>10.2f} {change:>+8.0%}  {verdict}")
 
-            # A tolerance in fp32 on a toy block says nothing about fp16 on a
-            # 7B model, where a rounding difference can flip an argmax and the
-            # two paths then walk away from each other. This is the only check
-            # that speaks to whether the grouped path is the same *model*.
-            loop_ids, grouped_ids = loop["tokens"], grouped["tokens"]
-            if loop_ids and grouped_ids:
-                shared = min(len(loop_ids), len(grouped_ids))
-                diverged = next(
-                    (i for i in range(shared) if loop_ids[i] != grouped_ids[i]), None
-                )
-                if diverged is None:
-                    print(f"        greedy output identical for all {shared} tokens")
-                else:
-                    print(f"        greedy output diverges at token {diverged} of "
-                          f"{shared} — grouped is not bit-exact, and at fp16 that "
-                          "is visible in the text, not just the activations")
+                # A tolerance in fp32 on a toy block says nothing about fp16 on
+                # a 7B model, where a rounding difference can flip an argmax and
+                # the two paths then walk away from each other. This is the only
+                # check that speaks to whether a path is the same *model*.
+                #
+                # For prefetch it is doing a second job. Prefetch is supposed to
+                # be bit-exact — it changes when weights arrive, never which
+                # ones — so any divergence at all is a cross-stream race, not a
+                # rounding difference, and the number to look at is which token.
+                base_ids, other_ids = base["tokens"], other["tokens"]
+                if base_ids and other_ids:
+                    shared = min(len(base_ids), len(other_ids))
+                    diverged = next(
+                        (i for i in range(shared) if base_ids[i] != other_ids[i]), None
+                    )
+                    if diverged is None:
+                        print(f"          {path}: greedy output identical for all "
+                              f"{shared} tokens")
+                    elif path == "prefetch":
+                        print(f"          {path}: DIVERGES at token {diverged} of {shared}. "
+                              "Prefetch does not change which experts run, so this is a "
+                              "read/write race between the side stream and the compute "
+                              "stream, not rounding. Do not ship it.")
+                    else:
+                        print(f"          {path}: greedy output diverges at token "
+                              f"{diverged} of {shared} — not bit-exact, and at fp16 that "
+                              "is visible in the text, not just the activations")
 
     # A capacity sweep is only informative if the differences it shows are
     # larger than the machine's own run-to-run variation. On this box they were
@@ -1173,6 +1320,28 @@ def serve_main(argv: list[str] | None = None) -> int:
                   f"wider than the spread within one ({widest:.0%}).")
             print("        Capacity is not resolvably changing decode speed on this "
                   "machine — which is the finding, not a failed measurement.")
+
+    # Stage 1c's go/no-go. A prefetcher can only ever remove fill time from the
+    # critical path, so if that share is smaller than the run-to-run spread the
+    # harness cannot demonstrate the improvement even if the improvement is real.
+    # Saying so here is cheaper than building the prefetcher and then finding out.
+    timed = [r for r in rows if r.get("decode_fill_share") is not None]
+    if timed:
+        print(f"\n{'slots':>7} {'path':>8} {'fill ms/tok':>12} {'fill % decode':>14} "
+              f"{'spread':>8}  prefetch ceiling")
+        for row in timed:
+            spread = ((row["decode_hi"] - row["decode_lo"]) / row["decode_tok_s"]
+                      if row["decode_tok_s"] else 0.0)
+            share = row["decode_fill_share"]
+            # Removing a fraction s of a token speeds it by s/(1-s), not s.
+            ceiling = share / (1 - share) if share < 1 else float("inf")
+            verdict = (f"+{ceiling:.0%} at best — above the {spread:.0%} spread, worth building"
+                       if ceiling > spread else
+                       f"+{ceiling:.0%} at best — under the {spread:.0%} spread, "
+                       "not measurable on this box")
+            print(f"{row['capacity']:>7} {row['path']:>8} "
+                  f"{row['decode_fill_ms_per_token']:>12.1f} {share:>13.1%} "
+                  f"{spread:>7.0%}  {verdict}")
 
     best = max(rows, key=lambda r: r["decode_tok_s"])
     print(f"\n[serve] best decode {best['decode_tok_s']:.2f} tok/s at {best['capacity']} slots "
