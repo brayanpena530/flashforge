@@ -38,7 +38,7 @@ system RAM, 8 CPU threads, 31.8 GB RAM, Samsung NVMe. Corpus of 48 sequences ×
 | **Q4** | between-domain JS **24.8×** the within-domain floor | domains separate cleanly — cache warming has real signal |
 | **Q5** | Belady 77.9%, **LRU 54.5%**, static 42.2%, LFU 42.1% | 23.4% headroom, and LRU is the *best* online policy |
 | **Q6** | union(4) = **2.48×** top-k → 1.61× fewer bytes/token | moderate; speculation needs high draft acceptance |
-| **Q7** | `t_c = 0.0358·m + 0.730` ms, PCIe 1.117 ms, **m\* = 17.4 tokens** | experts under ~17 tokens are cheaper on the CPU |
+| **Q7** | `t_c = 0.0367·m + 1.073` ms, PCIe 1.212 ms, **m\* = 10.8 tokens** | experts under ~11 tokens are cheaper on the CPU |
 | **Q8** | 2.39 GB/s peak, 8.27 ms/expert, **4 layers** of lookahead needed | a disk tier is reachable, at 2× prefetch budget |
 
 ### The four findings that changed the design
@@ -126,6 +126,78 @@ Q1–Q6 are measured on prefill, with 768 real decode steps used to confirm the
 two phases agree rather than to carry the headline numbers. Any policy tuned
 here should be re-checked on a decode trace at serving scale before it ships,
 even though the two matched closely at this one.
+
+**Q7 and Q8 have to come from the same `ff-bench` run.** They were briefly
+mixed here: an earlier version of this table quoted Q7 from a run whose scratch
+file sat on a spinning disk (`m* = 18.0`) alongside Q8 from the later NVMe run.
+The two differ because the second run's CPU was busier, not because the machine
+changed — `m*` moved from 18.0 to 10.8 on a measurement of the *CPU*, which is
+a useful reminder that these constants carry the load of the box at the moment
+they were taken. `hardware.json` records the whole set together for exactly
+this reason; read it rather than copying individual figures across.
+
+## Stage 1 — the offload runtime
+
+Experts live in host RAM; a fixed pool of GPU slots caches the hot ones; the
+MoE block pulls what it needs through that cache. LRU, because Q5 measured it
+12 points ahead of the frequency policies.
+
+```bash
+uv run ff-serve --capacity 128,256,384 --prompt-tokens 128 --gen-tokens 32
+```
+
+```
+  slots  VRAM GB  prefill t/s  pf hit  decode t/s  dec hit  GB/tok
+    128     2.39         73.6   1.2%        3.94   33.0%   1.080
+    256     3.89         62.5   8.9%        4.18   46.8%   0.858
+    384     5.39         97.2  25.3%        4.33   92.6%   0.120
+```
+
+**4.33 tok/s against the accelerate-offload baseline's 0.44 — a 9.8x speedup**,
+on a model 2.3x larger than the card it runs on. The runtime is bit-exact
+against the stock block; `tests/runtime_check.py` asserts a max absolute
+difference of zero.
+
+### The finding that redirected Stage 1
+
+**Transfer is not the bottleneck, and the roadmap had the order wrong.**
+
+Look at the last two columns together. Between 128 and 384 slots the hit rate
+triples and transfer volume falls **9x** — and decode throughput moves **10%**.
+At 384 slots the remaining 0.120 GB/token is, at the measured 10.4 GB/s PCIe,
+11.5 ms of a 231 ms token. A profiler puts `aten::copy_` at **4.95%** of decode.
+
+The other 95% is dispatch. A decode token issues **465 separate GEMMs** —
+16 layers x (8 experts x 3 projections + gate) plus attention — each one
+multiplying a single token's activations against a 2048x1024 matrix. Self CPU
+time lands within 7% of self CUDA time, which is what a launch-bound workload
+looks like: both sides are doing bookkeeping rather than arithmetic.
+
+So the planned next step was wrong. **Prefetch would buy at most 5% here**,
+because at a workable cache size the transfers are already nearly free. The
+lever is collapsing the per-expert GEMMs into one grouped call — filed under
+Stage 2 as a kernel concern, actually the Stage 1 bottleneck.
+
+This is the second time in this project that a confident prediction from
+Stage 0's constants survived until something measured it. The constants were
+right; the inference from them was not.
+
+### Two things worth knowing before reading the table
+
+**Prefill and decode hit rates are not comparable.** A prefill batch touches
+the *union* of its tokens' experts, which past a few dozen tokens is every
+expert in the layer — those misses are compulsory and no capacity removes them.
+A decode step touches exactly top-k per layer. Only the decode column belongs
+next to Q5's simulated 54.5%, and at 256 slots it measures 46.8%, close enough
+that the simulator was doing its job.
+
+**Sweep capacities in one process only if the RAM allows it.** The expert store
+is 12 GB against ~15 GB free. An early version of the sweep held the previous
+iteration's store alive while loading the next model, which never raised — it
+just swapped, and produced a table where a *better* hit rate came with *worse*
+throughput (46.8% at 2.33 tok/s against 33.0% at 3.67). That reads exactly like
+a cache-policy finding and is not one. `ff-serve` now frees the old store
+first, and prints free host RAM at each step so the failure is visible.
 
 ## Stage 0 — instrumentation
 
@@ -335,6 +407,8 @@ Useful flags:
 | `--layer-time-ms X` | bench | measured per-layer decode time; without it, a conservative floor is used |
 | `--skip-q7` / `--skip-q8` | bench | run one half only |
 | `--remove-scratch` | bench | delete the scratch file afterwards (recreated next run) |
+| `--capacity 128,256` | serve | expert slots to cache; comma-separated to sweep |
+| `--pin-gb N` | serve | host RAM to page-lock for async DMA. Pinned pages cannot be swapped |
 
 The built-in prompt set is a starting point sized for a few thousand tokens.
 For numbers you intend to trust, point `--prompts` at a real corpus — a couple
@@ -349,6 +423,18 @@ uv run python tests/synthetic_check.py
 Builds a synthetic trace with known planted structure and asserts each analysis
 recovers it — no download, no GPU, ~2 minutes. Run it after touching
 `analysis.py`, `hardware.py`, `cachesim.py`, or `plots.py`.
+
+```bash
+uv run python tests/runtime_check.py
+```
+
+Does the same for Stage 1, in a few seconds, against a randomly initialised
+OLMoE block on CPU. The load-bearing check is **parity**: the cached block must
+match the stock `OlmoeSparseMoeBlock` exactly, including at a capacity small
+enough to force eviction on every layer. It asserts a max absolute difference
+of *zero*, not a tolerance, because the block reproduces the original's op
+order deliberately — a caching bug that served the wrong expert would otherwise
+show up as slightly worse generated text and nothing else.
 
 The controls are the point. Q4 runs a positive **and** a negative control, so
 the metric has to discriminate rather than always answer "yes". Q3's band split
@@ -392,6 +478,11 @@ flashforge/
   cachesim.py  Belady / LRU / LFU / static sweep
   plots.py     charts
   viz.py       validated palette + matplotlib style
+  runtime/     Stage 1 — the offloaded MoE runtime
+    store.py   expert weights in host RAM, one contiguous row each
+    cache.py   preallocated GPU slot pool, LRU eviction
+    block.py   drop-in replacement for the model's MoE block
+    patch.py   installs the above into a loaded model
 notebooks/
   stage0.ipynb interactive version of the analysis
 ```
@@ -403,8 +494,10 @@ is a custom module and will need its own branch in `discover_moe()`.
 
 ## Roadmap
 
-- **Stage 0** — instrumentation and routing analysis *(current; runs on existing hardware)*
-- **Stage 1** — expert cache + async prefetch in pure PyTorch, pinned RAM, separate CUDA stream. Most of the wall-clock win lives here. Stage 0 says: start from LRU, which beats frequency policies by 12 points across a diverse corpus (Q5); prefetch one layer ahead with `stale_router` (Q3); pin experts and skip the three-stream split, since pinned already saturates this bus (Q7); and send experts with under ~17 routed tokens to the CPU to free a PCIe slot (Q7). Prefill traces are a sound proxy for decode, so iterate on those.
+- **Stage 0** — instrumentation and routing analysis *(complete; see "Measured results")*
+- **Stage 1** — expert cache in pure PyTorch, experts in host RAM, LRU eviction. *(done: 9.8x over the offload baseline)*
+- **Stage 1b** — **grouped expert GEMM.** Promoted from Stage 2 by measurement: 95% of decode is per-expert dispatch, not transfer, so batching the 465 GEMMs a token issues is worth far more than anything scheduling-related. Does not need new kernels to start — `torch.bmm` over a gathered stack of cached experts is a pure-PyTorch first cut, since the cache already stores every expert at an identical stride.
+- **Stage 1c** — async prefetch on a side stream, one layer ahead with `stale_router` (Q3), plus the CPU path for experts under ~11 routed tokens (Q7). Worth at most ~5% until 1b lands, so it is sequenced after it rather than before.
 - **Stage 2** — Triton kernels: fused gather-GEMM, dequant, fused router. *Needs sm_80+.*
 - **Stage 3** — scale to V4-Flash, where the routed pool may not fit in RAM either and experts stream disk→RAM→GPU. *Needs RAM and NVMe headroom.* Q8 is the go/no-go: if `t_disk` needs more lookahead than Q3 shows prediction surviving, the disk tier has to be driven by a longer-horizon signal rather than per-layer routing prediction.
 

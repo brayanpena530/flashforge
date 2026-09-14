@@ -750,5 +750,220 @@ def bench_main(argv: list[str] | None = None) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# ff-serve
+# --------------------------------------------------------------------------
+
+def _cuda_sync() -> None:
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _run_phase(model, input_ids, gen_tokens: int, stats=None) -> dict:
+    """Time prefill and decode, keeping their cache statistics apart.
+
+    Blending the two produces a hit rate that means nothing. Prefill touches
+    the union of experts over every token in the batch — past a few dozen
+    tokens that is every expert in the layer, so the misses are compulsory and
+    no cache size changes them. Decode touches exactly top_k per layer, which
+    is the regime Q5's capacity sweep actually modelled. Only the decode number
+    is comparable to Stage 0's 54.5%.
+    """
+    import time
+
+    import torch
+
+    def snapshot():
+        if stats is None:
+            return (0, 0, 0)
+        return (stats.hits, stats.misses, stats.bytes_fetched)
+
+    with torch.no_grad():
+        before = snapshot()
+        _cuda_sync()
+        start = time.perf_counter()
+        out = model(input_ids, use_cache=True)
+        _cuda_sync()
+        prefill_s = time.perf_counter() - start
+        after_prefill = snapshot()
+
+        result = {
+            "prefill_s": prefill_s,
+            "prefill_tokens": int(input_ids.shape[1]),
+            "prefill_counts": tuple(a - b for a, b in zip(after_prefill, before)),
+            "decode_s": 0.0,
+            "decode_tokens": 0,
+            "decode_counts": (0, 0, 0),
+        }
+        if gen_tokens <= 0:
+            return result
+
+        past = out.past_key_values
+        next_id = out.logits[:, -1:].argmax(-1)
+
+        _cuda_sync()
+        start = time.perf_counter()
+        for _ in range(gen_tokens):
+            out = model(next_id, past_key_values=past, use_cache=True)
+            past = out.past_key_values
+            next_id = out.logits[:, -1:].argmax(-1)
+        _cuda_sync()
+        result["decode_s"] = time.perf_counter() - start
+        result["decode_tokens"] = gen_tokens
+        result["decode_counts"] = tuple(a - b for a, b in zip(snapshot(), after_prefill))
+
+    return result
+
+
+def _rate(hits: int, misses: int) -> float:
+    total = hits + misses
+    return hits / total if total else 0.0
+
+
+def serve_main(argv: list[str] | None = None) -> int:
+    """Measure the Stage 1 offload runtime on a real model.
+
+    Reports prefill and decode separately because they stress the cache in
+    completely different ways, and averaging them hides both. A decode step
+    touches exactly top_k experts per layer, so the working set is tiny and the
+    cache has a real chance. A prefill batch touches the *union* over all its
+    tokens, which past a few dozen tokens is essentially every expert in the
+    layer — no cache smaller than the model can help, and the hit rate is
+    reporting the layer sweep, not locality.
+    """
+    import torch
+
+    from . import hardware
+    from .runtime import install_expert_cache
+
+    parser = argparse.ArgumentParser(
+        prog="ff-serve", description="Benchmark the offloaded MoE runtime."
+    )
+    parser.add_argument("--model", default=None, help="model id (default: the Stage 0 dev model)")
+    parser.add_argument(
+        "--capacity", default="256",
+        help="expert slots to cache, comma-separated to sweep (e.g. 128,256,512)",
+    )
+    parser.add_argument("--prompt-tokens", type=int, default=128)
+    parser.add_argument("--gen-tokens", type=int, default=32)
+    parser.add_argument("--warmup", type=int, default=1, help="untimed passes before measuring")
+    parser.add_argument(
+        "--pin-gb", type=float, default=0.0,
+        help="host RAM to page-lock for async DMA. Pinned pages cannot be swapped, "
+             "so this is a hard claim on physical memory — see runtime/store.py",
+    )
+    parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16"])
+    parser.add_argument("--cache-dir", default=None)
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args(argv)
+
+    _force_utf8_stdout()
+    _setup_logging(args.verbose)
+
+    if not torch.cuda.is_available():
+        print("ff-serve needs a CUDA device; the whole point is the PCIe crossing.")
+        return 1
+
+    from .models import DEFAULT_MODEL, load_model
+
+    model_id = args.model or DEFAULT_MODEL
+    capacities = [int(c) for c in args.capacity.split(",") if c.strip()]
+
+    # device_map=None loads everything to CPU. That is deliberate: with
+    # device_map="auto" accelerate would scatter experts across devices and
+    # meta tensors and then fight the runtime for control of placement.
+    log.info("Loading %s to CPU (%s)...", model_id, args.dtype)
+    model, tokenizer = load_model(
+        model_id, dtype=args.dtype, device_map=None, cache_dir=args.cache_dir
+    )
+
+    prompt = "The history of computing is" * 64
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids[:, : args.prompt_tokens]
+    input_ids = input_ids.to("cuda")
+
+    import gc
+
+    rows = []
+    report = None
+    for i, capacity in enumerate(capacities):
+        # Each capacity needs a fresh model: install_expert_cache moves the
+        # experts out, so the previous iteration left a hollow shell behind.
+        #
+        # Dropping `report` first is not tidiness. It owns the previous store
+        # (12 GB of host RAM) and the previous slot pool (3 GB of VRAM), and
+        # loading the next 13.8 GB checkpoint while both are still live would
+        # exhaust host memory on any machine that can only just hold one copy.
+        if i > 0:
+            del model, report
+            report = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            model, _ = load_model(
+                model_id, dtype=args.dtype, device_map=None, cache_dir=args.cache_dir
+            )
+
+        report = install_expert_cache(model, capacity=capacity, device="cuda", pin_gb=args.pin_gb)
+        print(f"\n=== capacity {capacity}")
+        print(report.describe())
+
+        free = hardware.available_ram_bytes()
+        if free is not None:
+            free_gb = free / (1 << 30)
+            print(f"  host RAM free: {free_gb:.1f} GB")
+            # Swapping shows up as a throughput collapse with an unchanged or
+            # better hit rate, which reads exactly like a cache-policy finding.
+            # It is not one, so say so here rather than letting the table imply it.
+            if free_gb < 2.0:
+                print("  WARNING: under 2 GB free — these timings are measuring swap, "
+                      "not the cache. Compare capacities across separate runs instead.")
+
+        stats = report.cache.stats
+        for _ in range(args.warmup):
+            _run_phase(model, input_ids, min(4, args.gen_tokens))
+
+        stats.reset()
+        timing = _run_phase(model, input_ids, args.gen_tokens, stats)
+
+        p_hits, p_misses, p_bytes = timing["prefill_counts"]
+        d_hits, d_misses, d_bytes = timing["decode_counts"]
+        prefill_tps = timing["prefill_tokens"] / timing["prefill_s"] if timing["prefill_s"] else 0.0
+        decode_tps = timing["decode_tokens"] / timing["decode_s"] if timing["decode_s"] else 0.0
+
+        rows.append({
+            "capacity": capacity,
+            "prefill_tok_s": prefill_tps,
+            "decode_tok_s": decode_tps,
+            "prefill_hit_rate": _rate(p_hits, p_misses),
+            "decode_hit_rate": _rate(d_hits, d_misses),
+            "decode_gb_per_token": d_bytes / 1e9 / max(1, timing["decode_tokens"]),
+            "vram_gb": report.resident_bytes / (1 << 30),
+        })
+        print(f"  prefill {prefill_tps:8.1f} tok/s  hit {_rate(p_hits, p_misses):5.1%}  "
+              f"{p_bytes / 1e9:5.2f} GB")
+        print(f"  decode  {decode_tps:8.2f} tok/s  hit {_rate(d_hits, d_misses):5.1%}  "
+              f"{d_bytes / 1e9:5.2f} GB  ({stats.evictions:,} evictions)")
+
+    print("\n" + "=" * 78)
+    print(f"{'slots':>7} {'VRAM GB':>8} {'prefill t/s':>12} {'pf hit':>7} "
+          f"{'decode t/s':>11} {'dec hit':>8} {'GB/tok':>7}")
+    for row in rows:
+        print(f"{row['capacity']:>7} {row['vram_gb']:>8.2f} {row['prefill_tok_s']:>12.1f} "
+              f"{row['prefill_hit_rate']:>6.1%} {row['decode_tok_s']:>11.2f} "
+              f"{row['decode_hit_rate']:>7.1%} {row['decode_gb_per_token']:>7.3f}")
+
+    best = max(rows, key=lambda r: r["decode_tok_s"])
+    print(f"\n[serve] best decode {best['decode_tok_s']:.2f} tok/s at {best['capacity']} slots "
+          f"({best['vram_gb']:.2f} GB resident, {best['decode_hit_rate']:.1%} hit rate)")
+    print("        Stage 0 measured the accelerate-offload baseline at 0.44 tok/s "
+          "(2.25 s/token) on this model and card.")
+    print("        Prefill's hit rate is low by construction, not by failure: a batch "
+          "touches the union of its tokens' experts,")
+    print("        which at these lengths is every expert in the layer. Only the "
+          "decode column is comparable to Q5's 54.5%.")
+    return 0
+
+
 if __name__ == "__main__":
     sys.exit(collect_main())
