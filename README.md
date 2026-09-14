@@ -136,6 +136,10 @@ a useful reminder that these constants carry the load of the box at the moment
 they were taken. `hardware.json` records the whole set together for exactly
 this reason; read it rather than copying individual figures across.
 
+That mistake, and every other one this project has made in the course of
+producing a number, is written up in [`troubleshoot.md`](troubleshoot.md).
+Read it before publishing a measurement.
+
 ## Stage 1 — the offload runtime
 
 Experts live in host RAM; a fixed pool of GPU slots caches the hot ones; the
