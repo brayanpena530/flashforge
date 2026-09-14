@@ -30,6 +30,13 @@ import torch
 from .models import MoESpec
 
 # Long-format trace schema. One row per (sequence, position, layer, rank).
+#
+# is_decode marks which phase produced the row: 0 for prefill, 1 for a real
+# greedy decode step. Prefill sees every position in one forward pass; decode
+# sees one token at a time against a growing KV cache. Same model, but the
+# access pattern a cache actually faces at serving time is the second one.
+# Deriving the split from `pos >= prefill_len` only works while every sequence
+# truncates to the same length, so it is recorded rather than inferred.
 TRACE_DTYPES = {
     "seq_id": "int32",
     "pos": "int32",
@@ -37,6 +44,7 @@ TRACE_DTYPES = {
     "rank": "int8",
     "expert": "int16",
     "weight": "float32",
+    "is_decode": "int8",
 }
 
 
@@ -104,10 +112,14 @@ class RouterTracer:
     def begin_sequence(self, seq_id: int) -> None:
         self._buffer = SequenceBuffer(seq_id=seq_id)
 
-    def set_window(self, start: int, length: int) -> None:
-        """Declare the absolute token positions the next forward will cover."""
+    def set_window(self, start: int, length: int, *, is_decode: bool = False) -> None:
+        """Declare the absolute token positions the next forward will cover.
+
+        `is_decode` tags the rows so the two phases can be analysed apart.
+        """
         self._pos_start = start
         self._pos_len = length
+        self._is_decode = 1 if is_decode else 0
 
     def end_sequence(self) -> None:
         """Flush the current sequence's dense arrays to disk."""
@@ -170,6 +182,9 @@ class RouterTracer:
                     ),
                     "expert": experts.to("cpu").numpy().astype(np.int16).ravel(),
                     "weight": weights.to("cpu").numpy().astype(np.float32).ravel(),
+                    "is_decode": np.full(
+                        n_tokens * self.spec.top_k, getattr(self, "_is_decode", 0), np.int8
+                    ),
                 }
             )
 
@@ -227,7 +242,7 @@ def trace_prompt(
     next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
     for step in range(gen_tokens):
-        tracer.set_window(prefill_len + step, 1)
+        tracer.set_window(prefill_len + step, 1, is_decode=True)
         outputs = model(next_token, past_key_values=past, use_cache=True)
         past = outputs.past_key_values
         next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)

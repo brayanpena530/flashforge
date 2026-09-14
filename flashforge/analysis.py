@@ -153,6 +153,31 @@ def skew_summary(freq: pd.DataFrame, num_experts: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def phase_frames(frame: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Split a trace into its prefill and decode halves.
+
+    Returns only the phases actually present, so callers can branch on the
+    keys. Traces collected before `is_decode` existed, or collected without
+    --gen-tokens, come back as {"prefill": frame}.
+
+    The distinction matters most for Q2 and Q5. Prefill processes every
+    position in a single forward pass; decode walks one token at a time. The
+    cache a serving system actually faces is the decode one, and it is the
+    harder case — each token sweeps the whole stack before any expert is
+    revisited.
+    """
+    if "is_decode" not in frame.columns:
+        return {"prefill": frame}
+    decode = frame[frame["is_decode"] == 1]
+    prefill = frame[frame["is_decode"] == 0]
+    out: dict[str, pd.DataFrame] = {}
+    if not prefill.empty:
+        out["prefill"] = prefill
+    if not decode.empty:
+        out["decode"] = decode
+    return out
+
+
 def routing_weight_profile(frame: pd.DataFrame, top_k: int) -> pd.DataFrame:
     """How much the top-ranked expert's routing weight dominates, per layer.
 
