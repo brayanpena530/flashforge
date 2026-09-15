@@ -785,6 +785,10 @@ def _run_phase(model, input_ids, gen_tokens: int, stats=None, cache=None) -> dic
         # has already been synced and closed out.
         return cache.drain_fill_ms() if cache is not None else (0.0, 0.0)
 
+    def log_len():
+        log = getattr(cache, "access_log", None) if cache is not None else None
+        return len(log) if log is not None else 0
+
     with torch.no_grad():
         before = snapshot()
         drain()
@@ -805,6 +809,11 @@ def _run_phase(model, input_ids, gen_tokens: int, stats=None, cache=None) -> dic
             "decode_counts": (0, 0, 0),
             "decode_fill_ms": 0.0,
             "decode_spec_ms": 0.0,
+            # Where decode starts inside cache.access_log, so a dumped trace can
+            # be sliced to the phase it describes. Prefill touches nearly every
+            # expert in every layer, so leaving it in would rank eviction
+            # policies on compulsory misses no policy can avoid.
+            "decode_log_start": log_len(),
             "tokens": [],
         }
         if gen_tokens <= 0:
@@ -1016,6 +1025,19 @@ def serve_main(argv: list[str] | None = None) -> int:
              "is PCIe fill. That pass is what bounds prefetching: it is the only "
              "thing a perfect prefetcher could recover",
     )
+    parser.add_argument(
+        "--dump-trace", default=None, metavar="PATH",
+        help="write the cache's own (layer, expert) access log to a .npz on one "
+             "extra untimed pass, for offline eviction-policy work (ff-evict). "
+             "Only the first measured path dumps: the log is a property of the "
+             "router, and every execution path produces the same one",
+    )
+    parser.add_argument(
+        "--trace-prompts", type=int, default=0, metavar="N",
+        help="dump the trace over N prompts from the Stage 0 corpus, interleaved "
+             "across its six domains, instead of the single repeated benchmark "
+             "phrase. Only affects --dump-trace; the timed passes are untouched",
+    )
     parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16"])
     parser.add_argument(
         "--baseline", action="store_true",
@@ -1132,6 +1154,7 @@ def serve_main(argv: list[str] | None = None) -> int:
     rows = []
     report = None
     first_free_gb = None
+    dumped_trace = False
     for i, capacity in enumerate(capacities):
         # Each capacity needs a fresh model: install_expert_cache moves the
         # experts out, so the previous iteration left a hollow shell behind.
@@ -1295,6 +1318,69 @@ def serve_main(argv: list[str] | None = None) -> int:
                 stats.reset()
                 probe = _run_phase(model, input_ids, args.gen_tokens, stats, report.cache)
                 report.cache.time_fills = False
+
+            if args.dump_trace and not dumped_trace:
+                dumped_trace = True
+                # The benchmark prompt is one phrase repeated 64 times, which is
+                # the right call for a *timing* harness — it makes the sequence
+                # length exact and the work reproducible — and the wrong trace to
+                # tune a cache policy on. Q5 measured the policy ranking
+                # reversing between a 5-document prefix and a 48-document corpus;
+                # a single repeated phrase is narrower than either. So the dump
+                # pass can replay the real corpus instead. It is untimed, and the
+                # router's choices do not depend on cache state, so widening it
+                # cannot perturb anything that was measured above.
+                prompt_ids = [input_ids]
+                if args.trace_prompts:
+                    from .prompts import load_prompts
+
+                    corpus = load_prompts()
+                    by_domain: dict[str, list[str]] = {}
+                    for item in corpus:
+                        by_domain.setdefault(item["domain"], []).append(item["text"])
+                    # Round-robin the domains so a budget smaller than the corpus
+                    # is still a sample of it rather than the first topic in it.
+                    interleaved = [
+                        text
+                        for group in zip(*by_domain.values())
+                        for text in group
+                    ][: args.trace_prompts]
+                    prompt_ids = [
+                        tokenizer(text, return_tensors="pt")
+                        .input_ids[:, : args.prompt_tokens].to("cuda")
+                        for text in interleaved
+                    ] or prompt_ids
+
+                prefill_keys: list[int] = []
+                decode_keys: list[int] = []
+                dump = None
+                for ids in prompt_ids:
+                    report.cache.access_log = []
+                    dump = _run_phase(model, ids, args.gen_tokens, stats, report.cache)
+                    split = dump["decode_log_start"]
+                    if not prefill_keys:
+                        prefill_keys = report.cache.access_log[:split]
+                    decode_keys.extend(report.cache.access_log[split:])
+                report.cache.access_log = None
+
+                keys = np.asarray(prefill_keys + decode_keys, dtype=np.int32)
+                start = len(prefill_keys)
+                dump = dict(dump, decode_tokens=dump["decode_tokens"] * len(prompt_ids))
+                out_path = Path(args.dump_trace)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(
+                    out_path,
+                    keys=keys,
+                    decode_start=start,
+                    num_experts=report.cache.store.num_experts,
+                    num_layers=len(report.cache.store.layers),
+                    decode_tokens=dump["decode_tokens"],
+                    capacity=capacity,
+                    prompts=len(prompt_ids),
+                )
+                print(f"  [{path:>7}] trace   {len(keys) - start:,} decode lookups "
+                      f"({(len(keys) - start) / max(1, dump['decode_tokens']):.0f}/token) "
+                      f"over {len(prompt_ids)} prompt(s) -> {out_path}")
 
             rows.append({
                 "capacity": capacity,
@@ -1541,6 +1627,189 @@ def serve_main(argv: list[str] | None = None) -> int:
           "touches the union of its tokens' experts,")
     print("        which at these lengths is every expert in the layer. Only the "
           "decode column is comparable to Q5's 54.5%.")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# ff-evict
+# --------------------------------------------------------------------------
+
+# Stage 1d's operating point, and the arithmetic that turns a simulated hit
+# rate into a throughput prediction. Measured at 256 slots, 88% of the store
+# pinned, grouped path, nine passes:
+#
+#     decode 6.92 tok/s  =  144.5 ms/token
+#     of which fill       =   91.1 ms/token  at 0.846 GB/token
+#                         =>  10.16 GB/s, 98% of this card's pinned PCIe rate
+#     everything else     =   53.4 ms/token
+#
+# The link is saturated (Stage 1c), so fill time is bytes / bandwidth with no
+# overlap term, and a policy that changes only the miss count moves only the
+# first line. This is a *prediction*, not a result: it assumes the new policy's
+# own bookkeeping is free, which for anything with a heap it is not.
+_MEASURED_TOK_S = 6.92
+_MEASURED_GB_PER_TOKEN = 0.846
+_MEASURED_FILL_MS = 91.1
+
+
+def _predict_tok_s(gb_per_token: float, *, fill_gbps: float, fixed_ms: float) -> float:
+    token_ms = fixed_ms + gb_per_token / fill_gbps * 1e3
+    return 1e3 / token_ms if token_ms > 0 else 0.0
+
+
+def evict_main(argv: list[str] | None = None) -> int:
+    """Rank eviction policies offline against a dumped runtime access log.
+
+    This exists so Stage 1e spends GPU time once instead of once per candidate.
+    Every policy here is a pure function of the key stream, so the ranking can
+    be produced on a laptop in seconds, and only the winner has to be built.
+    """
+    _force_utf8_stdout()
+
+    from . import cachesim
+
+    parser = argparse.ArgumentParser(
+        prog="ff-evict",
+        description="Rank cache eviction policies on a trace from ff-serve --dump-trace.",
+    )
+    parser.add_argument("trace", help="path to the .npz written by ff-serve --dump-trace")
+    parser.add_argument(
+        "--capacity", default=None,
+        help="slot counts to sweep, comma-separated (default: the trace's own)",
+    )
+    parser.add_argument(
+        "--phase", default="decode", choices=["decode", "prefill", "all"],
+        help="which part of the log to replay. Decode is the one that matters: "
+             "prefill's misses are compulsory, so every policy scores the same "
+             "there and including it dilutes the ranking toward zero",
+    )
+    parser.add_argument(
+        "--policies", default=",".join(cachesim.POLICIES + cachesim.CANDIDATES),
+        help="comma-separated policy names",
+    )
+    parser.add_argument(
+        "--slru-protected", default="0.6",
+        help="protected-segment fractions to sweep for slru, comma-separated",
+    )
+    parser.add_argument(
+        "--hybrid-pinned", default="0.5",
+        help="frequency-pinned fractions to sweep for hybrid, comma-separated",
+    )
+    parser.add_argument(
+        "--mib-per-expert", type=float, default=12.58,
+        help="bytes moved per miss (default: OLMoE fp16, measured in Q7)",
+    )
+    parser.add_argument(
+        "--fill-gbps", type=float, default=None,
+        help="fill bandwidth for the throughput prediction (default: derived "
+             "from the Stage 1d measurement)",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args(argv)
+    _setup_logging(args.verbose)
+
+    blob = np.load(args.trace)
+    keys = blob["keys"]
+    num_experts = int(blob["num_experts"])
+    decode_start = int(blob["decode_start"])
+    decode_tokens = int(blob["decode_tokens"])
+
+    if args.phase == "decode":
+        keys, tokens = keys[decode_start:], decode_tokens
+    elif args.phase == "prefill":
+        keys, tokens = keys[:decode_start], 1
+    else:
+        keys, tokens = keys, decode_tokens + 1
+    if keys.size == 0:
+        print(f"[evict] the {args.phase} slice of {args.trace} is empty")
+        return 1
+
+    per_token = keys.size / max(1, tokens)
+    capacities = (
+        [int(c) for c in args.capacity.split(",")]
+        if args.capacity else [int(blob["capacity"])]
+    )
+
+    # Expand the parameterised policies into one labelled run per value, so a
+    # fraction that happens to be bad cannot hide inside an averaged row.
+    requested = [p.strip() for p in args.policies.split(",") if p.strip()]
+    policies: list[str] = []
+    params: dict[str, dict[str, float]] = {}
+    sweeps = {
+        "slru": ("protected", args.slru_protected),
+        "hybrid": ("pinned", args.hybrid_pinned),
+    }
+    for name in requested:
+        if name in sweeps:
+            knob, values = sweeps[name]
+            for value in values.split(","):
+                label = f"{name}:{knob[0]}{value.strip()}"
+                policies.append(label)
+                params[label] = {knob: float(value)}
+        else:
+            policies.append(name)
+
+    bytes_per_expert = args.mib_per_expert * 1e6
+    fill_gbps = args.fill_gbps or (_MEASURED_GB_PER_TOKEN / (_MEASURED_FILL_MS / 1e3))
+    fixed_ms = 1e3 / _MEASURED_TOK_S - _MEASURED_FILL_MS
+
+    print(f"[evict] {keys.size:,} {args.phase} lookups, {per_token:.0f} per token, "
+          f"{np.unique(keys).size:,} distinct of {num_experts * int(blob['num_layers']):,} "
+          f"experts")
+    print(f"[evict] predicting throughput at {fill_gbps:.2f} GB/s fill and "
+          f"{fixed_ms:.1f} ms/token of non-transfer work\n")
+
+    frame = cachesim.sweep(
+        keys, capacities, policies=tuple(policies),
+        bytes_per_expert=bytes_per_expert, accesses_per_token=per_token,
+        stride=num_experts, params=params,
+    )
+    frame["gb_per_token"] = frame["fetch_bytes_per_token"] / 1e9
+    frame["pred_tok_s"] = [
+        _predict_tok_s(gb, fill_gbps=fill_gbps, fixed_ms=fixed_ms)
+        for gb in frame["gb_per_token"]
+    ]
+
+    for capacity in capacities:
+        at = frame[frame["capacity"] == capacity].sort_values("hit_rate", ascending=False)
+        lru = at[at["policy"] == "lru"]
+        base_hit = float(lru["hit_rate"].iloc[0]) if len(lru) else None
+        base_tps = float(lru["pred_tok_s"].iloc[0]) if len(lru) else None
+
+        print(f"{capacity} slots")
+        print(f"  {'policy':>14} {'hit rate':>9} {'vs lru':>8} {'GB/token':>9} "
+              f"{'pred t/s':>9} {'vs lru':>8}")
+        for _, row in at.iterrows():
+            delta = (f"{(row['hit_rate'] - base_hit) * 100:+5.1f} pt"
+                     if base_hit is not None else "")
+            gain = (f"{(row['pred_tok_s'] / base_tps - 1) * 100:+6.1f}%"
+                    if base_tps else "")
+            print(f"  {row['policy']:>14} {row['hit_rate']:>8.1%} {delta:>8} "
+                  f"{row['gb_per_token']:>9.3f} {row['pred_tok_s']:>9.2f} {gain:>8}")
+        print()
+
+    # The two rows that bound the exercise. Belady is the ceiling on any policy
+    # that fetches on demand; `static` and `hybrid` may sit above it because
+    # they preload and skip compulsory misses, which is a different game.
+    online = frame[
+        (frame["capacity"] == capacities[0])
+        & (~frame["policy"].str.startswith(("belady", "static", "hybrid")))
+    ]
+    if len(online):
+        best = online.loc[online["hit_rate"].idxmax()]
+        at = frame[frame["capacity"] == capacities[0]].set_index("policy")
+        if "belady" in at.index and "lru" in at.index:
+            gap = at.loc["belady", "hit_rate"] - at.loc["lru", "hit_rate"]
+            closed = (best["hit_rate"] - at.loc["lru", "hit_rate"]) / gap if gap else 0.0
+            print(f"[evict] best online policy is {best['policy']} at "
+                  f"{best['hit_rate']:.1%}, which closes {closed:.0%} of the "
+                  f"{gap * 100:.1f}-point gap to Belady")
+        print("[evict] this is a simulation. It charges nothing for the policy's own "
+              "bookkeeping,")
+        print("        and the runtime is bandwidth-bound, so a policy that costs "
+              "CPU time on the")
+        print("        critical path can win here and lose in ff-serve. Build the "
+              "winner, then measure it.")
     return 0
 
 

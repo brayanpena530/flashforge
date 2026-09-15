@@ -182,6 +182,40 @@ than the card.
 Stage 1d re-ran that comparison with the store pinned, again in one invocation:
 baseline 0.355 tok/s (0.34-0.36 over nine passes) against 6.92 grouped, which
 is **19.5x**. Quote one of these two lines, never a mix of them.
+
+STAGE 1E — THE EVICTION GAP IS A CAPACITY MEASUREMENT
+-----------------------------------------------------
+With transfers running at hardware speed, the only lever left is moving fewer
+bytes, and the obvious first swing is Q5's 23.4 points of Belady headroom over
+LRU. `ExpertCache` grew an `access_log` so the runtime can dump its own decode
+stream, and four candidate policies were ranked against it offline — segmented
+LRU, LRU-2, per-layer partitioning, and a frequency-pinned hybrid.
+
+Every one of them loses. Over 147,456 decode lookups spanning 18 documents from
+six domains, the best is segmented LRU at 58.2% against LRU's 56.3%: +1.9
+points, +2.6% predicted throughput, which is inside the harness's own +/-8%
+spread and therefore not a number this project can measure. So nothing was
+shipped. LRU stays.
+
+The finding is what the gap *means*. Belady scores 77.7% at 256 slots; LRU
+reaches 77.1% at 464. Perfect prophecy is worth 1.8x the cache — and capacity
+can be bought, which is the whole difference:
+
+    config                            slots    hit   GB/token   pred t/s
+    fp16, LRU          (today)          256  56.3%      0.703       7.74
+    fp16, Belady       (unreachable)    256  77.7%      0.358      10.87
+    int8, LRU          (same 3.0 GB)    512  81.4%      0.149      14.39
+
+Halving bytes per expert doubles the slots for the same VRAM *and* halves what
+each surviving miss costs, so quantised experts under plain LRU beat perfect
+eviction at fp16 by 32%. Stage 1e-2 is quantisation, and eviction policy is
+closed.
+
+One process note, because it nearly went the other way. Ranked on the benchmark
+prompt — the string "The history of computing is" repeated 64 times — LRU-2
+scored **+16.9** points. On the 18-document trace it scores **-20.8**. The
+repeated phrase is correct for a timing harness and wrong for fitting a policy,
+and `ff-serve --trace-prompts` exists so the two never get confused again.
 """
 
 from __future__ import annotations

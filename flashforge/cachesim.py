@@ -44,6 +44,71 @@ comfortably above LRU (65.2%); the full 48 reverses it to LRU 54.5%, LFU 42.1%.
 
 Which is why `subsample_sequences` exists: budget by dropping whole sequences,
 never by truncating the flattened key stream.
+
+STAGE 1E — SPENDING THE BELADY GAP
+----------------------------------
+Stage 1d left the fill path at 98% of the card's pinned PCIe rate, so no
+reordering or acceleration of transfers can pay any more; only moving fewer
+bytes can. At 256 slots the runtime misses 52.5% of 128 lookups per token, and
+every avoided miss is 12.58 MB that never crosses the link. Belady's 23.4-point
+margin over LRU is therefore a throughput budget, not a curiosity.
+
+The four candidates here are chosen against a specific diagnosis. 256 slots is
+exactly two tokens of sweep, so global LRU grants *every* expert the router
+touched once a full two tokens of residency, whether or not it is ever touched
+again. `lru2` and `slru` both attack that by requiring a second reference
+before granting full residency; `layered` attacks the cyclic sweep that makes
+late layers evict early ones; `hybrid` splits the pool between a frequency-
+pinned half and a recency half, on the theory that `static` and `lru` fail on
+different accesses rather than one simply being worse.
+
+All four lose. Ranked on 147,456 decode lookups dumped from the runtime over 18
+prompts spanning the corpus's six domains, at the 256 slots it ships at:
+
+    policy        hit rate   vs lru   predicted decode t/s
+    belady           77.7%   +21.4      10.87   (unreachable)
+    slru p=0.5       58.2%    +1.9       7.94
+    layered          56.8%    +0.4       7.79
+    lru              56.3%       -       7.74
+    lfu              42.3%   -14.1       6.51
+    lru2             35.6%   -20.8       6.06
+
+The best online policy anyone here can build is worth **+1.9 points**, which is
++2.6% predicted throughput — under the harness's own ±8% pass-to-pass spread,
+so it is not merely small, it is unmeasurable. Belady's 21.4 points are real
+and no online policy gets a tenth of them.
+
+AND THE FIRST VERSION OF THAT TABLE SAID THE OPPOSITE
+-----------------------------------------------------
+Ranked on the *benchmark* prompt — which is the string "The history of
+computing is" repeated 64 times — `lru2` scored +16.9 points and `static`
++33.5. Widening the trace to 18 real documents sent `lru2` to -20.8. Same
+model, same capacity, same simulator; one prompt versus eighteen.
+
+This is the reversal the section above warns about, reproduced exactly, and it
+is worth being precise about the trap. The repeated phrase is the right choice
+for a *timing* harness: it fixes the sequence length and makes the work
+reproducible. It is the wrong trace to fit a policy to, because a policy fitted
+to it is fitted to a workload of one topic. Dump with `--trace-prompts` for
+policy work; the flag exists because trusting the narrow table would have
+shipped a 22% regression.
+
+WHAT THE GAP IS ACTUALLY WORTH, WHICH IS THE USEFUL PART
+---------------------------------------------------------
+Belady at 256 slots scores 77.7%. LRU reaches 77.1% at 464 slots. So perfect
+prophecy is worth **1.8x the cache** — and it is cheaper to buy the capacity
+than to predict the future, because capacity is purchasable and prophecy is
+not. Halving the bytes per expert buys 2x the slots for the same VRAM *and*
+halves what each remaining miss costs:
+
+    config                              slots   hit    GB/token   pred t/s
+    fp16, LRU            (today)          256  56.3%      0.703       7.74
+    fp16, Belady         (unreachable)    256  77.7%      0.358      10.87
+    int8, LRU            (same 3.0 GB)    512  81.4%      0.149      14.39
+
+Quantised experts under plain LRU beat perfect eviction at fp16 by 32%. That is
+the Stage 1e result: the eviction gap is a measurement of how much capacity is
+missing, not an invitation to write a smarter policy.
 """
 
 from __future__ import annotations
@@ -55,6 +120,11 @@ import numpy as np
 import pandas as pd
 
 POLICIES = ("belady", "lru", "lfu", "static")
+
+# Stage 1e candidates. Kept separate from POLICIES so the Stage 0 report keeps
+# printing the four columns it has always printed, and so a policy that loses
+# here does not silently become part of the Q5 answer.
+CANDIDATES = ("lru2", "slru", "layered", "hybrid")
 
 
 def build_access_sequence(frame: pd.DataFrame, num_experts: int) -> np.ndarray:
@@ -197,12 +267,177 @@ def _sim_static(keys: np.ndarray, capacity: int) -> int:
     return int(np.isin(keys, list(pinned)).sum()) if pinned else 0
 
 
+def _sim_lru2(keys: np.ndarray, capacity: int) -> int:
+    """LRU-K with K=2: evict by the *second* most recent reference.
+
+    The policy LRU loses to here is not "keep things longer", it is "tell a
+    one-hit wonder from a regular". At 256 slots the cache holds exactly two
+    tokens of sweep, so LRU keeps every expert the router touched once for two
+    tokens whether or not it will ever be touched again — and Belady's 23.4
+    points of headroom is largely those. LRU-2 ranks a key by how long ago it
+    was seen *twice*, so a single reference buys much less residency.
+
+    Keys referenced only once have infinite backward-2-distance and are evicted
+    first, tie-broken by recency, which is LRU restricted to the unproven set.
+    """
+    last: dict[int, int] = {}
+    second: dict[int, int] = {}
+    cache: set[int] = set()
+    heap: list[tuple[int, int, int]] = []
+    hits = 0
+
+    def priority(key: int) -> tuple[int, int]:
+        # Evicting the minimum: unproven keys (rank 0) go before proven ones.
+        return (1, second[key]) if key in second else (0, last[key])
+
+    for time, key in enumerate(keys):
+        key = int(key)
+        if key in cache:
+            hits += 1
+        else:
+            if len(cache) >= capacity:
+                while heap:
+                    rank, when, victim = heapq.heappop(heap)
+                    if victim in cache and (rank, when) == priority(victim):
+                        cache.discard(victim)
+                        # Forget the history too. A key that comes back after
+                        # eviction is a fresh arrival: crediting it with
+                        # references from before it was thrown out would let a
+                        # long-dead key re-enter straight into the proven set.
+                        last.pop(victim, None)
+                        second.pop(victim, None)
+                        break
+            cache.add(key)
+
+        if key in last:
+            second[key] = last[key]
+        last[key] = time
+        rank, when = priority(key)
+        heapq.heappush(heap, (rank, when, key))
+    return hits
+
+
+def _sim_slru(keys: np.ndarray, capacity: int, *, protected: float = 0.6) -> int:
+    """Segmented LRU: a probationary segment in front of a protected one.
+
+    Same intuition as LRU-2 and a cheaper implementation of it — two
+    `OrderedDict`s and no heap, so it is the one that can actually go in the
+    runtime's hot path. A miss lands in probation; a second reference promotes
+    it to protected. Victims come from probation's LRU end, so the cost of a
+    one-hit wonder is bounded by the probation segment rather than the cache.
+    """
+    # Not clamped away from the ends. protected=0 has to be exactly LRU and
+    # protected=1 exactly LRU-with-an-extra-hop, because those degeneracies are
+    # what the tests pin the implementation against; clamping to [1, capacity-1]
+    # makes both of them almost-but-not-quite right, which is the hardest kind
+    # of wrong to notice in a table of hit rates.
+    protected_cap = max(0, min(capacity, int(round(capacity * protected))))
+    prot: OrderedDict[int, None] = OrderedDict()
+    prob: OrderedDict[int, None] = OrderedDict()
+    hits = 0
+
+    for key in keys:
+        key = int(key)
+        if key in prot:
+            prot.move_to_end(key)
+            hits += 1
+            continue
+        if key in prob:
+            hits += 1
+            del prob[key]
+            prot[key] = None
+            if len(prot) > protected_cap:
+                # Demote, do not drop: a protected key that aged out has still
+                # been referenced twice, so it outranks a fresh arrival.
+                demoted, _ = prot.popitem(last=False)
+                prob[demoted] = None
+            continue
+        if len(prot) + len(prob) >= capacity:
+            (prob or prot).popitem(last=False)
+        prob[key] = None
+    return hits
+
+
+def _sim_layered(keys: np.ndarray, capacity: int, *, stride: int) -> int:
+    """One independent LRU per layer, with the capacity split evenly.
+
+    MoE decode sweeps layer 0..N-1 every token, so under a single global LRU
+    the later layers' misses evict the earlier layers' entries on every token.
+    Partitioning makes a layer's residency depend only on that layer's routing.
+    It also gives up the thing global LRU does well — lending slots to whichever
+    layer routes most diffusely — so which wins is a measurement.
+    """
+    layers = sorted({int(k) // stride for k in np.unique(keys)})
+    budgets = {layer: capacity // len(layers) for layer in layers}
+    for layer in layers[: capacity % len(layers)]:
+        budgets[layer] += 1
+
+    caches: dict[int, OrderedDict[int, None]] = {layer: OrderedDict() for layer in layers}
+    hits = 0
+    for key in keys:
+        key = int(key)
+        cache = caches[key // stride]
+        if key in cache:
+            cache.move_to_end(key)
+            hits += 1
+        else:
+            if len(cache) >= budgets[key // stride]:
+                cache.popitem(last=False)
+            cache[key] = None
+    return hits
+
+
+def _sim_hybrid(keys: np.ndarray, capacity: int, *, pinned: float = 0.5) -> int:
+    """Pin the globally hottest keys, run LRU over what is left.
+
+    `static` alone scored 42.2% and LRU 54.5%, and the temptation is to read
+    that as "frequency loses". It does not follow: the two policies fail on
+    different accesses. Frequency captures the experts every document uses and
+    misses the local burst; recency captures the burst and re-fetches the
+    perennials after every sweep. Splitting the pool lets each cover its half.
+
+    Like `static`, the pinned set is chosen from whole-trace frequencies, so
+    this is an *offline-profiled* policy. That is achievable — profile once at
+    build time — but it is not an online result, and it must not be compared
+    against LRU as if it were.
+    """
+    pin_count = max(0, min(capacity, int(round(capacity * pinned))))
+    unique, counts = np.unique(keys, return_counts=True)
+    hot = set(unique[np.argsort(-counts)[:pin_count]].tolist())
+
+    lru_cap = capacity - pin_count
+    cache: OrderedDict[int, None] = OrderedDict()
+    hits = 0
+    for key in keys:
+        key = int(key)
+        if key in hot:
+            hits += 1
+            continue
+        if lru_cap <= 0:
+            continue
+        if key in cache:
+            cache.move_to_end(key)
+            hits += 1
+        else:
+            if len(cache) >= lru_cap:
+                cache.popitem(last=False)
+            cache[key] = None
+    return hits
+
+
 _SIMULATORS = {
     "belady": _sim_belady,
     "lru": _sim_lru,
     "lfu": _sim_lfu,
     "static": _sim_static,
+    "lru2": _sim_lru2,
+    "slru": _sim_slru,
+    "layered": _sim_layered,
+    "hybrid": _sim_hybrid,
 }
+
+# Policies that need to decode a layer index out of the flat key.
+_NEEDS_STRIDE = frozenset({"layered"})
 
 
 def sweep(
@@ -212,19 +447,32 @@ def sweep(
     policies: tuple[str, ...] = POLICIES,
     bytes_per_expert: float | None = None,
     accesses_per_token: int | None = None,
+    stride: int | None = None,
+    params: dict[str, dict[str, float]] | None = None,
 ) -> pd.DataFrame:
     """Hit rate for each (policy, capacity).
 
     bytes_per_expert and accesses_per_token turn the hit rate into the number
     that actually matters — bytes fetched per generated token, which divided by
     your storage bandwidth is seconds per token.
+
+    `stride` is num_experts, needed to recover a layer index from a flat key;
+    `params` carries per-policy knobs, e.g. {"slru": {"protected": 0.75}}. The
+    label in the output is the policy name plus those knobs, so a parameter
+    sweep does not collapse into one row.
     """
     rows = []
     total = int(keys.shape[0])
     for policy in policies:
-        simulate = _SIMULATORS[policy]
+        base, _, _ = policy.partition(":")
+        simulate = _SIMULATORS[base]
+        kwargs: dict[str, float | int] = dict((params or {}).get(policy, {}))
+        if base in _NEEDS_STRIDE:
+            if stride is None:
+                raise ValueError(f"policy {policy!r} needs stride=num_experts")
+            kwargs["stride"] = stride
         for capacity in capacities:
-            hits = simulate(keys, capacity)
+            hits = simulate(keys, capacity, **kwargs)
             row = {
                 "policy": policy,
                 "capacity": capacity,

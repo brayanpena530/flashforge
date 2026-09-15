@@ -328,6 +328,34 @@ check("repin is reversible",
       "back to fully pageable, contents still identical — so a pin sweep can "
       "revisit a level without reloading the model")
 
+print("\nAccess logging (Stage 1e)")
+
+# The log is what every eviction-policy conclusion was drawn from, so an error
+# here would not raise — it would quietly rank policies against a stream the
+# runtime never produced. Two things have to hold: it records every lookup in
+# acquire order, and it is a faithful key encoding rather than a re-derivation.
+log_cache = ExpertCache(probe_store, capacity=L * E, device="cpu")
+log_cache.access_log = []
+requests = [(0, [3, 7]), (1, [5]), (0, [7, 3, 11])]
+for layer, experts in requests:
+    log_cache.acquire(layer, experts)
+expected = [layer * probe_store.num_experts + e for layer, experts in requests for e in experts]
+check("the access log records every lookup in order",
+      log_cache.access_log == expected,
+      f"{len(log_cache.access_log)} keys, hits and misses alike — a log that "
+      "dropped hits would make any cache look worse the better it got")
+check("logged keys decode back to (layer, expert)",
+      [(k // probe_store.num_experts, k % probe_store.num_experts)
+       for k in log_cache.access_log]
+      == [(layer, e) for layer, experts in requests for e in experts],
+      "flat key is layer * num_experts + expert, which is the stride ff-evict assumes")
+
+log_cache.access_log = None
+log_cache.acquire(2, [1])
+check("logging off by default costs nothing",
+      log_cache.access_log is None,
+      "access_log stays None unless a caller sets it to a list")
+
 print("\nPrefetch (Stage 1c)")
 
 # The GPU half of prefetch — the side stream and the events ordering it against

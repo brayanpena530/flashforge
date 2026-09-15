@@ -447,6 +447,70 @@ the pinned store and activations, so "pin everything" is not the goal — 88% is
 where this card settles. `ExpertStore` degrades to pageable rather than
 discarding the load when it hits that wall.
 
+## Stage 1e — the eviction gap turns out to be a capacity measurement
+
+Stage 1d left transfers running at 98% of hardware, so the only lever left is
+moving fewer bytes. The obvious first swing was Q5's 23.4 points of Belady
+headroom over LRU: every avoided miss is 12.58 MB that never crosses PCIe, and
+transfer is still 60% of a decode token.
+
+`ExpertCache` grew an `access_log`, so `ff-serve --dump-trace` writes the
+runtime's own decode stream to disk, and four candidate policies were ranked
+against it offline — no GPU time per candidate, so only a winner would have to
+be built. Over **147,456 decode lookups across 18 documents and six domains**,
+at the 256 slots the runtime ships at:
+
+| policy | hit rate | vs LRU | predicted decode t/s |
+|---|---|---|---|
+| belady *(unreachable)* | 77.7% | +21.4 pt | 10.87 |
+| **slru** p=0.5 | 58.2% | +1.9 pt | 7.94 |
+| layered | 56.8% | +0.4 pt | 7.79 |
+| **lru** *(shipping)* | 56.3% | — | 7.74 |
+| lfu | 42.3% | −14.1 pt | 6.51 |
+| lru2 | 35.6% | −20.8 pt | 6.06 |
+
+The best online policy is worth **+1.9 points, or +2.6% predicted throughput** —
+inside the harness's own ±8% pass-to-pass spread, so it is not merely a small
+win, it is one this project cannot measure. **Nothing was shipped. LRU stays.**
+
+### What the gap is actually worth
+
+Belady scores 77.7% at 256 slots. LRU reaches 77.1% at **464**. Perfect prophecy
+is worth 1.8x the cache — and capacity can be bought, which is the entire
+difference between the two. Halving bytes per expert doubles the slots for the
+same VRAM *and* halves what each surviving miss costs:
+
+| config | slots | hit rate | GB/token | predicted decode t/s |
+|---|---|---|---|---|
+| fp16, LRU *(today)* | 256 | 56.3% | 0.703 | 7.74 |
+| fp16, Belady *(unreachable)* | 256 | 77.7% | 0.358 | 10.87 |
+| **int8, LRU** *(same 3.0 GB)* | 512 | 81.4% | 0.149 | **14.39** |
+
+Quantised experts under plain LRU beat perfect eviction at fp16 by 32%. So the
+eviction gap was never an invitation to write a smarter policy; it was a
+measurement of how much cache is missing. Stage 1e-2 is quantisation.
+
+### The first version of that table said the opposite
+
+Ranked against the benchmark prompt — which is the string `"The history of
+computing is"` repeated 64 times — `lru2` scored **+16.9** points and `static`
+**+33.5**. Widening the trace to 18 real documents sent `lru2` to **−20.8**.
+Same model, same capacity, same simulator; one prompt versus eighteen.
+
+This is the reversal `cachesim.py` has warned about since Stage 0, reproduced
+exactly. The repeated phrase is the *right* choice for a timing harness — it
+fixes the sequence length and makes the work reproducible — and the wrong trace
+to fit a policy to, because a policy fitted to it is fitted to one topic.
+`ff-serve --trace-prompts N` replays the real corpus on the untimed dump pass
+only, so widening the trace cannot perturb any number that was measured.
+Trusting the narrow table would have shipped a 22% regression.
+
+```bash
+ff-serve --capacity 256 --path grouped --gen-tokens 64 \
+         --dump-trace traces/decode_corpus.npz --trace-prompts 18
+ff-evict traces/decode_corpus.npz --slru-protected 0.25,0.5,0.75
+```
+
 ## Stage 0 — instrumentation
 
 Answers eight questions, each of which gates a later design decision. Q1–Q6
@@ -749,7 +813,11 @@ is a custom module and will need its own branch in `discover_moe()`.
 - **Stage 1b** — grouped expert GEMM, promoted from Stage 2 because 95% of decode was per-expert dispatch rather than transfer. *(done: 5.98 tok/s, +27% on decode, 15.0x over the baseline measured in the same run. Prefill unchanged within noise.)*
 - **Stage 1c** — async prefetch on a side stream, one layer ahead with `stale_router` (Q3). *(built, measured, and **closed negative**. The "worth at most ~5%" this line used to carry came from a profile of an invalid configuration; the real fill budget at 256 slots is 50–71% of decode. The prefetcher works — blocking fill 116 → 36 ms/token, decode hit rate 47.5% → 82.4% — and is still 14% slower, p=0.010, because the link is saturated and it adds 23% more bytes. Off by default. The finding is that **transfer reordering cannot help here at all**; see "Stage 1c" above.)*
 - **Stage 1d — pinning** *(done, and the largest single gain in the project: **+38% decode, p=0.003**, from a flag that already existed and defaulted to off. 19.5x the measured baseline. The fill path now runs at 98% of this card's pinned PCIe rate, so transfer optimisation is **finished** — see "Stage 1d" above.)*
-- **Stage 1e — move fewer bytes.** Transfer is still 60% of a decode token, so eliminating it would be +150%, but every way of moving the same bytes *faster* is now exhausted. In order of expected payoff: (1) **eviction policy**, where Q5 measured 23.4 points of Belady headroom over LRU at this capacity; (2) **Q7's CPU path** — break-even is 10.8 routed tokens and decode has exactly 1, so every decode expert is on the wrong side of it; (3) **quantised experts**, which halves bytes per miss and doubles what the cache holds for the same VRAM.
+- **Stage 1e — move fewer bytes.** Transfer is still 60% of a decode token, so eliminating it would be +150%, and every way of moving the same bytes *faster* is now exhausted.
+  - **1e-1 — eviction policy** *(**closed negative**. Four candidates ranked offline on 147k decode lookups across 18 documents; the best beats LRU by 1.9 points, or +2.6% predicted — inside the harness's own noise. Nothing shipped. The useful finding is the conversion rate: Belady's 21.4-point gap is worth exactly 1.8x the cache, and capacity is purchasable where prophecy is not. See "Stage 1e" above.)*
+  - **1e-2 — quantised experts** *(next, and now the highest-expected-value item in the project. int8 halves bytes per miss **and** doubles slots for the same VRAM: 512 slots, 81.4% hit, 0.149 GB/token, **predicted 14.4 tok/s** — which beats perfect eviction at fp16 by 32%. Cost: it changes numerics, so it needs Stage 1b's greedy-divergence treatment on the real model at real dtype, and dequant probably wants a Triton kernel.)*
+  - **1e-3 — Q7's CPU path** *(break-even is 10.8 routed tokens and decode has exactly 1, so every decode expert is on the wrong side of it. Computing a missed expert in place also overlaps GPU work instead of blocking it. Larger potential than 1e-2 and larger integration risk.)*
+  - **1e-4 — prefill streaming** *(prefill moves 7.59 GB per prompt at a 9% hit rate — 59% of the whole model — because it touches every expert in every layer anyway. The LRU cache is pure overhead there; a fixed layer-order stream would do the same work without the eviction thrash.)*
 - **Stage 2** — Triton kernels: fused gather-GEMM, dequant, fused router. *Needs sm_80+.*
 - **Stage 3** — scale to V4-Flash, where the routed pool may not fit in RAM either and experts stream disk→RAM→GPU. *Needs RAM and NVMe headroom.* Q8 is the go/no-go: if `t_disk` needs more lookahead than Q3 shows prediction surviving, the disk tier has to be driven by a longer-horizon signal rather than per-layer routing prediction.
 

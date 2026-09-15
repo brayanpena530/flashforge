@@ -421,6 +421,44 @@ check("full capacity ~ perfect", pivot.loc[total_slots, "belady"] > 0.99,
 check("bytes/token column present", "fetch_bytes_per_token" in sweep.columns,
       f"{sweep['fetch_bytes_per_token'].min()/1e6:.1f}-{sweep['fetch_bytes_per_token'].max()/1e6:.1f} MB/token")
 
+# Stage 1e candidates. They lost on the real trace, but they are the apparatus
+# that established the loss, so they have to stay correct: a broken simulator
+# would have made the negative result meaningless rather than obviously wrong.
+print("\nStage 1e eviction candidates")
+cand_caps = [int(total_slots * f) for f in (0.10, 0.25, 0.50)]
+cand_params = {"slru": {"protected": 0.5}, "hybrid": {"pinned": 0.5}}
+cand = cachesim.sweep(keys[:120_000], cand_caps, policies=cachesim.CANDIDATES,
+                      stride=E, params=cand_params)
+cand_pivot = cand.pivot(index="capacity", columns="policy", values="hit_rate")
+# .loc first: the baseline sweep covers six capacities and this one covers
+# three, and joining them straight produces NaN rows that compare False against
+# everything — a passing policy would read as a violated bound.
+both = pivot.loc[cand_caps].join(cand_pivot)
+check("every candidate ran", set(cachesim.CANDIDATES) <= set(cand_pivot.columns),
+      ", ".join(f"{p} {cand_pivot[p].max():.1%}" for p in cachesim.CANDIDATES))
+check("belady still bounds the demand-paging candidates",
+      bool((both["belady"] >= both[["lru2", "slru", "layered"]].max(axis=1) - 1e-9).all()),
+      f"min margin {(both['belady'] - both[['lru2','slru','layered']].max(axis=1)).min():.4f}")
+check("candidate hit rates monotonic in capacity",
+      bool(all(np.all(np.diff(cand_pivot[p].to_numpy()) >= -1e-9) for p in cand_pivot.columns)),
+      "all non-decreasing")
+# A protected segment of 0 is LRU with an extra dict in the way, and a
+# partition of one layer is LRU with an extra lookup. Both are worth asserting:
+# they are the boundary where a wrong implementation stops being wrong quietly.
+lru_at = int(total_slots * 0.25)
+check("slru with an empty protected segment degenerates to lru",
+      cachesim._sim_slru(keys[:120_000], lru_at, protected=0.0)
+      == cachesim._sim_lru(keys[:120_000], lru_at),
+      "protected=0 reproduces lru exactly")
+check("layered over a single layer degenerates to lru",
+      cachesim._sim_layered(keys[keys // E == 0][:40_000], 64, stride=E)
+      == cachesim._sim_lru(keys[keys // E == 0][:40_000], 64),
+      "one partition reproduces lru exactly")
+check("hybrid pinning everything reproduces static",
+      cachesim._sim_hybrid(keys[:120_000], lru_at, pinned=1.0)
+      == cachesim._sim_static(keys[:120_000], lru_at),
+      "pinned=1.0 is the static policy")
+
 # Budgeting the cache sim by truncating the flattened key stream takes the
 # first few documents rather than a sample of them, and the policy ranking
 # depends on how many documents are in view. On the real OLMoE trace a 300k

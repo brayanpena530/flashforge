@@ -158,6 +158,15 @@ class ExpertCache:
         # alone does not cover them.
         self._protected: set[int] = set()
 
+        # Stage 1e. Set to a list to record every lookup as a flat
+        # `layer * num_experts + expert` key, in acquire order. This is the
+        # stream an eviction policy actually faces, which is not the same object
+        # as Q5's offline trace: Q5 replayed a *corpus*, and the policy ranking
+        # there was measured to depend on how many documents were in view. A
+        # policy tuned on the runtime's own log is tuned on the workload the
+        # runtime is graded on.
+        self.access_log: list[int] | None = None
+
     @property
     def _timing(self) -> bool:
         """`time_fills`, but only where CUDA events exist to record.
@@ -226,6 +235,10 @@ class ExpertCache:
                 "batch of more than a few tokens will touch nearly every expert in "
                 "the layer. Size the cache for num_experts, or prefill in chunks."
             )
+
+        if self.access_log is not None:
+            stride = self.store.num_experts
+            self.access_log.extend(layer * stride + expert for expert in experts)
 
         hits: list[int] = []
         misses: list[int] = []

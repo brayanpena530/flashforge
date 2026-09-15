@@ -200,6 +200,33 @@ Fixed with `subsample_sequences()`, which samples whole sequences.
 **Rule:** if a trace is sorted by anything, a prefix is a biased sample. Subsample
 at the granularity of the unit the sort key groups by.
 
+#### 1.8 addendum — the benchmark's input is not the workload's input
+
+1.8 was about a *trace* that was too narrow. Stage 1e hit the same reversal
+from the other direction: the trace was fine, the **prompt** was too narrow.
+
+`ff-serve` benchmarks on `"The history of computing is" * 64`, which is exactly
+right for a timing harness — it fixes the sequence length, so a token is the
+same amount of work every pass. Ranking eviction policies against the decode
+stream that prompt produces gave `lru2` **+16.9 points** over LRU. Re-ranking on
+18 documents across six domains gave `lru2` **−20.8**. Same model, same
+capacity, same simulator, opposite conclusion; building the "winner" would have
+shipped a 22% regression.
+
+The trap is that the prompt had already been validated — for throughput, where
+it is correct, and where nobody would think to question it. A repeated phrase
+makes routing stationary, and *every* policy that exploits stationarity looks
+excellent on it.
+
+Fixed by separating the two jobs rather than changing the benchmark:
+`--trace-prompts N` replays the real corpus on the untimed dump pass only, so
+the timed passes stay byte-identical and remain comparable to Stage 1a–1d.
+
+**Rule:** a fixture that is correct for one measurement is not thereby correct
+for the next one. Before fitting anything to a trace, ask what the *input* was,
+not just what the trace contains — and if the answer is one document, one
+prompt, or one repeated string, widen it before you read the table.
+
 ### 1.9 Isolate phases before averaging them
 
 The first `ff-serve` printed a single hit rate over prefill + decode. Meaningless:
@@ -434,6 +461,31 @@ measure itself.
 
 **Rule:** when an optimisation trades exactness, the acceptance test has to run
 at the real dtype, the real scale, and on the observable the user actually sees.
+
+### 4.7 Convert a theoretical gap into something purchasable before chasing it
+
+Q5's headline for two stages was "Belady beats LRU by 23.4 points", carried
+forward as if it were a to-do item. It is a real number and it was the wrong
+unit. Expressed as something you can actually buy, it reads: *Belady at 256
+slots scores what LRU scores at 464*. Perfect prophecy is worth 1.8x the cache.
+
+That single conversion settles the stage without writing a policy. Capacity can
+be bought — int8 doubles the slots for the same VRAM and halves what each miss
+costs, landing at a predicted 14.4 tok/s against perfect-eviction-at-fp16's
+10.9. Prophecy cannot be bought, and the best online policy tested reached 1.9
+of the 21.4 points.
+
+The same mistake shape as Stage 1c, where "transfers are 60% of a token" was
+read as "so overlap them" rather than "so the link is the constraint". A gap is
+a budget, not a plan; the plan depends on the exchange rate.
+
+**Rule:** before building against a headroom figure, restate it in the units of
+a change you could actually make — slots, bytes, milliseconds, dollars. If the
+restatement names something you can purchase outright, purchase it instead.
+
+**Corollary:** when the best available policy's gain lands inside the harness's
+own spread, that is not a small win to bank, it is a result you cannot measure.
+Ship nothing and say so. Stage 1e's +2.6% against a ±8% spread is the example.
 
 ---
 
