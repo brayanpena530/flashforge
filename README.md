@@ -38,7 +38,7 @@ system RAM, 8 CPU threads, 31.8 GB RAM, Samsung NVMe. Corpus of 48 sequences ×
 | **Q4** | between-domain JS **24.8×** the within-domain floor | domains separate cleanly — cache warming has real signal |
 | **Q5** | Belady 77.9%, **LRU 54.5%**, static 42.2%, LFU 42.1% | 23.4% headroom, and LRU is the *best* online policy |
 | **Q6** | union(4) = **2.48×** top-k → 1.61× fewer bytes/token | moderate; speculation needs high draft acceptance |
-| **Q7** | `t_c = 0.0358·m + 0.730` ms, PCIe 1.117 ms, **m\* = 17.4 tokens** | experts under ~17 tokens are cheaper on the CPU |
+| **Q7** | `t_c = 0.0367·m + 1.073` ms, PCIe 1.212 ms, **m\* = 10.8 tokens** | experts under ~11 tokens are cheaper on the CPU |
 | **Q8** | 2.39 GB/s peak, 8.27 ms/expert, **4 layers** of lookahead needed | a disk tier is reachable, at 2× prefetch budget |
 
 ### The four findings that changed the design
@@ -126,6 +126,390 @@ Q1–Q6 are measured on prefill, with 768 real decode steps used to confirm the
 two phases agree rather than to carry the headline numbers. Any policy tuned
 here should be re-checked on a decode trace at serving scale before it ships,
 even though the two matched closely at this one.
+
+**Q7 and Q8 have to come from the same `ff-bench` run.** They were briefly
+mixed here: an earlier version of this table quoted Q7 from a run whose scratch
+file sat on a spinning disk (`m* = 18.0`) alongside Q8 from the later NVMe run.
+The two differ because the second run's CPU was busier, not because the machine
+changed — `m*` moved from 18.0 to 10.8 on a measurement of the *CPU*, which is
+a useful reminder that these constants carry the load of the box at the moment
+they were taken. `hardware.json` records the whole set together for exactly
+this reason; read it rather than copying individual figures across.
+
+That mistake, and every other one this project has made in the course of
+producing a number, is written up in [`troubleshoot.md`](troubleshoot.md).
+Read it before publishing a measurement.
+
+## Stage 1 — the offload runtime
+
+Experts live in host RAM; a fixed pool of GPU slots caches the hot ones; the
+MoE block pulls what it needs through that cache. LRU, because Q5 measured it
+12 points ahead of the frequency policies.
+
+```bash
+uv run ff-serve --baseline --capacity 128,256,384 --gen-tokens 32 --repeats 5
+```
+
+```
+  slots  VRAM GB  prefill t/s  pf hit  decode t/s        spread  dec hit  GB/tok
+    128     2.39         78.6   1.2%        3.84     2.87-3.89   33.0%   1.080
+    256     3.89         82.4   8.3%        4.41     3.94-4.47   46.8%   0.858
+    384     5.39         86.2  26.5%        3.53     3.21-3.63   92.6%   0.120
+
+baseline                 45.3               0.36     0.34-0.38
+```
+
+**4.41 tok/s against a measured accelerate-offload baseline of 0.36 — 12.1x**,
+on a model 2.3x larger than the card it runs on. Decode figures are the median
+of five timed passes; the baseline runs the same prompt through the same
+harness. The runtime is bit-exact against the stock block —
+`tests/runtime_check.py` asserts a max absolute difference of zero.
+
+### The finding that redirected Stage 1
+
+**Transfer is not the bottleneck, and the roadmap had the order wrong.**
+
+Read the `spread` column before the `decode t/s` column. Across capacities the
+median moves 20%; *within* a single capacity, repeated passes move 26%. The
+sweep cannot resolve a difference between these three configurations at all —
+and that is the result, not a failed measurement. Transfer volume falls **9x**
+from 128 slots to 384 and decode speed does not reliably respond.
+
+The arithmetic agrees. At 384 slots the remaining 0.120 GB/token is, at the
+measured 10.4 GB/s PCIe, ~11 ms of a ~230 ms token. A profiler puts
+`aten::copy_` at **4.95%** of decode.
+
+The other 95% is dispatch. A decode token issues **465 separate GEMMs** —
+16 layers x (8 experts x 3 projections + gate) plus attention — each one
+multiplying a *single* token's activations against a 2048x1024 matrix. Self CPU
+time lands within 7% of self CUDA time, which is what a launch-bound workload
+looks like: both sides doing bookkeeping rather than arithmetic.
+
+So the planned next step was wrong. **Prefetch would buy at most 5% here**,
+because at a workable cache size the transfers are already nearly free. The
+lever is collapsing the per-expert GEMMs into one grouped call — filed under
+Stage 2 as a kernel concern, actually the Stage 1 bottleneck. Stage 1b below
+does that, and gets 27%.
+
+Note also that 384 slots is not the best configuration despite the best hit
+rate. 5.39 GB resident on a 6 GB card leaves little room for activations, and
+the median comes out *below* 256 slots. Whether that is real or more of the
+same variance, this sweep cannot say — but "give the cache everything spare"
+is not supported.
+
+This is the second time a confident prediction from Stage 0's constants stood
+until something measured it. The constants were right; the inference was not.
+
+### Two things worth knowing before reading the table
+
+**Prefill and decode hit rates are not comparable.** A prefill batch touches
+the *union* of its tokens' experts, which past a few dozen tokens is every
+expert in the layer — those misses are compulsory and no capacity removes them.
+A decode step touches exactly top-k per layer. Only the decode column belongs
+next to Q5's simulated 54.5%, and at 256 slots it measures 46.8%, close enough
+that the simulator was doing its job.
+
+**Time more than one pass, and measure the baseline yourself.** The first
+version of this section reported single passes and quoted 9.8x against a figure
+lifted from Stage 0's decode *tracing* run — which had forward hooks writing
+router logits and hidden states for 16 layers to disk on every token, at a
+different prompt length. That is not a baseline, it is a different experiment.
+`--baseline` now runs `device_map="auto"` through the same harness on the same
+prompt, in a subprocess because accelerate's offload does not reliably release
+its CPU-side weights (measured as a segfault when the next model load ran into
+what it had kept). Single-pass timing also produced a tidy monotonic table,
+3.94 -> 4.18 -> 4.33, that five passes show was noise.
+
+**Sweep capacities in one process only if the RAM allows it.** The expert store
+is 12 GB against ~15 GB free. An early version of the sweep held the previous
+iteration's store alive while loading the next model, which never raised — it
+just swapped, and produced a table where a *better* hit rate came with *worse*
+throughput (46.8% at 2.33 tok/s against 33.0% at 3.67). That reads exactly like
+a cache-policy finding and is not one. `ff-serve` now frees the old store
+first, and prints free host RAM at each step so the failure is visible.
+
+## Stage 1b — the grouped GEMM path
+
+Stage 1's profile said dispatch, not transfer. So `CachedMoEBlock` grew a
+second path: sort the (token, expert) pairs by expert, pad each expert's group
+to a common width, gather the routed experts' weights into one batched tensor,
+and run three `bmm` calls for the whole layer instead of 3E separate GEMMs.
+
+```bash
+uv run ff-serve --baseline --capacity 256 --path both --repeats 5 --gen-tokens 32
+```
+
+```
+  slots     path  VRAM GB  prefill t/s        spread  decode t/s        spread  dec hit
+    256     loop     3.89         92.3 63.3-94.9            4.69 4.17-4.69       46.8%
+    256  grouped     3.89         99.7 80.0-104.3           5.98 4.61-6.06       46.7%
+
+  slots    phase   loop t/s  grouped t/s    change  verdict
+    256  prefill      92.30        99.72      +8%  inside the 34% within-path spread — no finding
+    256   decode       4.69         5.98     +27%  real
+
+baseline                 48.7                0.40  0.39-0.40
+```
+
+**5.98 tok/s against a baseline of 0.40 measured in the same invocation —
+15.0x.** Decode gains 27% over the loop path, and reproduced at +39%, +35%,
++29% and +27% across four runs.
+
+Both paths are timed on the *same* loaded model, the same slot pool and the
+same warm cache — the flag flips on the already-installed blocks — so the only
+variable is the path. That matters more than it sounds: the identical hit rates
+and identical GB/token in the table are the evidence that nothing else moved.
+
+**Prefill is not a result.** The first Stage 1b run appeared to show a 36%
+prefill *regression*, with a plausible story attached — a prefill batch routes
+to all 64 experts, so the gather copies 805 MB per layer to save launches the
+loop path was not wasting. The next run reversed the sign. Prefill is one short
+timed region per pass and its spread is 63.3–94.9 tok/s on the loop path alone,
+which swallows the difference whole. `ff-serve` now prints a prefill spread
+column for exactly this reason, and says "no finding" rather than "+8%".
+
+### The grouped path is not bit-exact, and that was measured too
+
+One `index_add_` over every expert at once has no defined accumulation order,
+so the grouped path cannot be held to the zero-difference standard the loop
+path meets. `tests/runtime_check.py` holds it to a tolerance instead (`2e-19`
+in fp32 on the toy block) and keeps the loop path as the oracle.
+
+A tolerance on a toy block in fp32 says nothing about fp16 on a 7B model, where
+one rounding difference can flip an argmax and the two paths then walk away
+from each other. So `ff-serve` decodes greedily on both paths and reports the
+first token id where they differ: **identical for all 65 tokens**. That is why
+`grouped=True` is the default and `grouped=False` is still there.
+
+## Stage 1c — the prefetch budget, and a profile taken in the wrong place
+
+Stage 1's profile put `aten::copy_` at 4.95% of decode, and the roadmap below
+used to say prefetch was "worth at most ~5%". Both were wrong, for the same
+reason: **that profile was taken at 384 slots and the runtime ships at 256.**
+
+```
+ff-serve --capacity 256 --path all --repeats 5 --pin-gb 7
+```
+
+| slots | fill ms/token | % of decode | ceiling if prefetch were perfect |
+|------:|--------------:|------------:|---------------------------------:|
+| 128   | 216.7         | 77.0%       | +335% |
+| 256   | 126.3         | 70.9%       | +244% |
+| 320   | 123.0         | 22.4%       | +29%  |
+
+Transfers were never nearly free. They are most of decode.
+
+**And the 384-slot row was never a valid measurement.** It puts 5.39 GB resident
+on a 6 GB card. On Windows that does not raise — WDDM backs the overflow with
+host memory, so every read of a "resident" expert crosses PCIe again. It
+measured **0.83 tok/s at a 92.7% hit rate**, against 5.53 tok/s at 46.9% with
+256 slots: hit rate doubled, throughput fell 6.7x. That is the signature of a
+resource bug, one tier down from the host-RAM version already in
+[troubleshoot.md](troubleshoot.md). `ff-serve` now prints VRAM headroom per row.
+
+### The prefetcher works. The speedup does not reproduce.
+
+`CachedMoEBlock` runs the next layer's router on this layer's hidden state
+(Q3's `stale_router`) and issues the predicted fills on a side CUDA stream.
+At 256 slots, 6.75 GB of the store pinned, one invocation:
+
+| path | decode t/s | blocking fill | decode hit | GB/token |
+|------|-----------:|--------------:|-----------:|---------:|
+| loop     | 4.98 | 130.4 ms (50%) | 46.8% | 0.858 |
+| grouped  | 5.85 | 100.5 ms (65%) | 46.7% | 0.859 |
+| prefetch | 6.08 | **32.7 ms (20%)** | **81.8%** | 1.069 |
+
+Every intermediate metric says it worked: hit rate 46.8 → 81.8%, blocking fill
+down by two thirds, predictor precision 78.2% measured in the runtime rather
+than quoted from Q3's offline recall.
+
+Decode throughput is **worse**. Nine passes per path, one invocation, with a
+two-sided permutation test on the difference of medians:
+
+| path | decode t/s | GB/token | change | verdict |
+|------|-----------:|---------:|-------:|---------|
+| grouped | **6.86** | 0.846 | — | — |
+| `pf-all` (all top_k) | 5.92 | 1.045 | −14% | **real, p=0.010** |
+| `pf-k4` (top 4 only) | 6.36 | 0.872 | −7% | not distinguishable, p=0.09 |
+
+An earlier five-pass run showed the opposite — `pf-k4` peaking at 6.50 against
+5.97 — and the *baseline* was the noisy one. Prefetch never beat it at any
+speculation budget. It is **off by default**: not unproven, measured worse.
+
+### Why — and this is the part worth keeping
+
+Multiply each path's throughput by its bytes per token:
+
+```
+                tok/s   ×   GB/token   =   GB/s sustained
+grouped          6.86       0.846          5.80
+pf-all           5.92       1.045          6.19
+pf-k4            6.36       0.872          5.55
+
+throughput varies  ±8%   |   bytes vary ±11%   |   the product is flat
+```
+
+That is a saturated link. On one, `decode tok/s = bandwidth ÷ bytes-per-token`,
+and prefetch only ever raises the denominator. It did everything it promised —
+80 ms/token of blocking transfer removed from the critical path, hit rate 47.5%
+→ 82.4% — and lost anyway, because the side stream contends for the same PCIe
+link that was already the constraint.
+
+**No reordering of transfers can help at this operating point. Only moving
+fewer bytes can.** `ff-serve` now prints a sustained-GB/s column and says so
+when that column is flatter than the throughput it derives from.
+
+### Two things that fell out of it
+
+**Pinning was never on.** Every measurement in this project before now ran with
+a fully pageable store, where `copy_(non_blocking=True)` is synchronous and a
+side stream cannot overlap at all. Pinning is a prerequisite for prefetch, not
+an optimisation beside it. The ceiling is lower than free RAM suggests: 11.8 GB
+pinnable on this 32 GB machine against a 12.0 GB store, reported as `CUDA error:
+out of memory` from a *host* allocation. `ExpertStore` now degrades to pageable
+for the remaining layers instead of discarding an eleven-minute load.
+
+**The hot path was doing three device→host syncs per layer** — `unique`,
+`counts`, and the prediction — 16 times per token. `torch.bincount` returns the
+routed set and the group sizes in one vector, so the prediction concatenates
+onto it and a layer costs one copy. That alone took the loop path's blocking
+fill from 130.4 to 98.4 ms/token, and it preserves the ascending expert order
+that keeps the loop path bit-exact at *exactly zero* difference.
+
+## Stage 1d — pinning, the lever that was switched off the whole time
+
+Stage 1c established that the link is the constraint. The obvious follow-up was
+the one nobody had checked: **every measurement this project ever published ran
+with a fully pageable expert store.** On pageable memory a host-to-device copy
+cannot be a true async DMA, and Q7 had measured the difference back in Stage 0.
+
+`--pin-gb` existed. It defaulted to 0. The store dutifully printed
+`0.00 GB pinned` in a line nobody read as a performance number.
+
+```
+ff-serve --capacity 256 --path grouped --pin-sweep 10.5,9,6,0 --baseline --repeats 9 --gen-tokens 96
+```
+
+| pinned | decode t/s | GB/token | fill ms/tok | fill GB/s | % of Q7's 10.4 GB/s |
+|-------:|-----------:|---------:|------------:|----------:|--------------------:|
+| 0%     | 5.01       | 0.846    | 148.7       | 6.08      | 58% |
+| 50%    | 6.27       | 0.845    | 110.4       | 8.64      | 83% |
+| 75%    | 6.51       | 0.844    | 88.4        | 9.64      | 93% |
+| 88%    | **6.92**   | 0.846    | 91.1        | **10.16** | **98%** |
+
+**+38% decode, p=0.003, from a flag.** Bytes per token are constant to three
+decimals and the hit rate never moves off 47.5% — the cache does identical
+work, and only the speed those bytes cross at changed. That is exactly what a
+bandwidth-bound system predicts, and it is a larger lever than Stage 1b's
+grouped GEMM (+27%) or Stage 1c's prefetch (0%).
+
+Against accelerate's `device_map="auto"` measured in the **same invocation**:
+0.355 tok/s → 6.92 tok/s, **19.5x**, on a model 2.3x larger than the card.
+
+### Pinning is now finished, and the tool says so
+
+At 88% coverage the fill path runs at 98% of this machine's measured pinned
+PCIe rate. The two remaining unpinned layers are worth about 2%. `ff-serve
+--pcie-gbps` compares the two and prints the conclusion rather than leaving it
+as arithmetic:
+
+> the fill path is at 98% of this machine's measured pinned PCIe rate
+> (10.4 GB/s). Transfers are running at hardware speed — there is nothing left
+> to win by moving the same bytes faster.
+
+This also explains Stage 1c cleanly in hindsight. Prefetch tried to make
+transfers *overlap*; pinning made them *fast*. Once the link runs at hardware
+speed only the second kind of change exists, and the first was never going to
+pay for the bytes it spent.
+
+### Why the order was run backwards
+
+Pin levels were swept ascending first (0 → 88%) and the curve was monotone —
+which is also what thermal drift, or a machine quietly settling, would produce.
+Coverage only ever increases, so drift aliases perfectly onto the variable.
+
+So it was re-run descending. `pin0` read 4.99 in first position and 5.01 in
+last; `pin10.5` read 7.22 last and 6.92 first. The effect follows coverage, not
+the clock.
+
+This is only answerable at all because `ExpertStore.repin()` reallocates layers
+as pinned or pageable in place, so coverage is a variable you can flip between
+timed regions on one loaded model. Comparing pinned and pageable *invocations*
+would have compared two machines — the mistake that has produced a wrong answer
+every time it has been made here.
+
+### The ceiling is lower than free RAM suggests
+
+Idle, this 32 GB box page-locks 11.8 GiB. With the model loaded the 16th layer
+failed at 11.25 GiB, and reaching 94% coverage left so little headroom that the
+**forward pass** then OOM'd. There is a three-way budget between the slot pool,
+the pinned store and activations, so "pin everything" is not the goal — 88% is
+where this card settles. `ExpertStore` degrades to pageable rather than
+discarding the load when it hits that wall.
+
+## Stage 1e — the eviction gap turns out to be a capacity measurement
+
+Stage 1d left transfers running at 98% of hardware, so the only lever left is
+moving fewer bytes. The obvious first swing was Q5's 23.4 points of Belady
+headroom over LRU: every avoided miss is 12.58 MB that never crosses PCIe, and
+transfer is still 60% of a decode token.
+
+`ExpertCache` grew an `access_log`, so `ff-serve --dump-trace` writes the
+runtime's own decode stream to disk, and four candidate policies were ranked
+against it offline — no GPU time per candidate, so only a winner would have to
+be built. Over **147,456 decode lookups across 18 documents and six domains**,
+at the 256 slots the runtime ships at:
+
+| policy | hit rate | vs LRU | predicted decode t/s |
+|---|---|---|---|
+| belady *(unreachable)* | 77.7% | +21.4 pt | 10.87 |
+| **slru** p=0.5 | 58.2% | +1.9 pt | 7.94 |
+| layered | 56.8% | +0.4 pt | 7.79 |
+| **lru** *(shipping)* | 56.3% | — | 7.74 |
+| lfu | 42.3% | −14.1 pt | 6.51 |
+| lru2 | 35.6% | −20.8 pt | 6.06 |
+
+The best online policy is worth **+1.9 points, or +2.6% predicted throughput** —
+inside the harness's own ±8% pass-to-pass spread, so it is not merely a small
+win, it is one this project cannot measure. **Nothing was shipped. LRU stays.**
+
+### What the gap is actually worth
+
+Belady scores 77.7% at 256 slots. LRU reaches 77.1% at **464**. Perfect prophecy
+is worth 1.8x the cache — and capacity can be bought, which is the entire
+difference between the two. Halving bytes per expert doubles the slots for the
+same VRAM *and* halves what each surviving miss costs:
+
+| config | slots | hit rate | GB/token | predicted decode t/s |
+|---|---|---|---|---|
+| fp16, LRU *(today)* | 256 | 56.3% | 0.703 | 7.74 |
+| fp16, Belady *(unreachable)* | 256 | 77.7% | 0.358 | 10.87 |
+| **int8, LRU** *(same 3.0 GB)* | 512 | 81.4% | 0.149 | **14.39** |
+
+Quantised experts under plain LRU beat perfect eviction at fp16 by 32%. So the
+eviction gap was never an invitation to write a smarter policy; it was a
+measurement of how much cache is missing. Stage 1e-2 is quantisation.
+
+### The first version of that table said the opposite
+
+Ranked against the benchmark prompt — which is the string `"The history of
+computing is"` repeated 64 times — `lru2` scored **+16.9** points and `static`
+**+33.5**. Widening the trace to 18 real documents sent `lru2` to **−20.8**.
+Same model, same capacity, same simulator; one prompt versus eighteen.
+
+This is the reversal `cachesim.py` has warned about since Stage 0, reproduced
+exactly. The repeated phrase is the *right* choice for a timing harness — it
+fixes the sequence length and makes the work reproducible — and the wrong trace
+to fit a policy to, because a policy fitted to it is fitted to one topic.
+`ff-serve --trace-prompts N` replays the real corpus on the untimed dump pass
+only, so widening the trace cannot perturb any number that was measured.
+Trusting the narrow table would have shipped a 22% regression.
+
+```bash
+ff-serve --capacity 256 --path grouped --gen-tokens 64 \
+         --dump-trace traces/decode_corpus.npz --trace-prompts 18
+ff-evict traces/decode_corpus.npz --slru-protected 0.25,0.5,0.75
+```
 
 ## Stage 0 — instrumentation
 
@@ -335,6 +719,10 @@ Useful flags:
 | `--layer-time-ms X` | bench | measured per-layer decode time; without it, a conservative floor is used |
 | `--skip-q7` / `--skip-q8` | bench | run one half only |
 | `--remove-scratch` | bench | delete the scratch file afterwards (recreated next run) |
+| `--capacity 128,256` | serve | expert slots to cache; comma-separated to sweep |
+| `--baseline` | serve | also time accelerate's `device_map="auto"` offload, same prompt and harness |
+| `--repeats N` | serve | timed passes per capacity, reported as median (min–max). Default 3 |
+| `--pin-gb N` | serve | host RAM to page-lock for async DMA. Pinned pages cannot be swapped |
 
 The built-in prompt set is a starting point sized for a few thousand tokens.
 For numbers you intend to trust, point `--prompts` at a real corpus — a couple
@@ -349,6 +737,18 @@ uv run python tests/synthetic_check.py
 Builds a synthetic trace with known planted structure and asserts each analysis
 recovers it — no download, no GPU, ~2 minutes. Run it after touching
 `analysis.py`, `hardware.py`, `cachesim.py`, or `plots.py`.
+
+```bash
+uv run python tests/runtime_check.py
+```
+
+Does the same for Stage 1, in a few seconds, against a randomly initialised
+OLMoE block on CPU. The load-bearing check is **parity**: the cached block must
+match the stock `OlmoeSparseMoeBlock` exactly, including at a capacity small
+enough to force eviction on every layer. It asserts a max absolute difference
+of *zero*, not a tolerance, because the block reproduces the original's op
+order deliberately — a caching bug that served the wrong expert would otherwise
+show up as slightly worse generated text and nothing else.
 
 The controls are the point. Q4 runs a positive **and** a negative control, so
 the metric has to discriminate rather than always answer "yes". Q3's band split
@@ -392,6 +792,11 @@ flashforge/
   cachesim.py  Belady / LRU / LFU / static sweep
   plots.py     charts
   viz.py       validated palette + matplotlib style
+  runtime/     Stage 1 — the offloaded MoE runtime
+    store.py   expert weights in host RAM, one contiguous row each
+    cache.py   preallocated GPU slot pool, LRU eviction
+    block.py   drop-in replacement for the model's MoE block
+    patch.py   installs the above into a loaded model
 notebooks/
   stage0.ipynb interactive version of the analysis
 ```
@@ -403,8 +808,16 @@ is a custom module and will need its own branch in `discover_moe()`.
 
 ## Roadmap
 
-- **Stage 0** — instrumentation and routing analysis *(current; runs on existing hardware)*
-- **Stage 1** — expert cache + async prefetch in pure PyTorch, pinned RAM, separate CUDA stream. Most of the wall-clock win lives here. Stage 0 says: start from LRU, which beats frequency policies by 12 points across a diverse corpus (Q5); prefetch one layer ahead with `stale_router` (Q3); pin experts and skip the three-stream split, since pinned already saturates this bus (Q7); and send experts with under ~17 routed tokens to the CPU to free a PCIe slot (Q7). Prefill traces are a sound proxy for decode, so iterate on those.
+- **Stage 0** — instrumentation and routing analysis *(complete; see "Measured results")*
+- **Stage 1** — expert cache in pure PyTorch, experts in host RAM, LRU eviction. *(done: 4.41 tok/s, 12.1x over a measured offload baseline. The Stage 1b run re-measured the same loop path at 4.69 against a 0.40 baseline, 11.8x — two runs, each internally consistent; do not cross them.)*
+- **Stage 1b** — grouped expert GEMM, promoted from Stage 2 because 95% of decode was per-expert dispatch rather than transfer. *(done: 5.98 tok/s, +27% on decode, 15.0x over the baseline measured in the same run. Prefill unchanged within noise.)*
+- **Stage 1c** — async prefetch on a side stream, one layer ahead with `stale_router` (Q3). *(built, measured, and **closed negative**. The "worth at most ~5%" this line used to carry came from a profile of an invalid configuration; the real fill budget at 256 slots is 50–71% of decode. The prefetcher works — blocking fill 116 → 36 ms/token, decode hit rate 47.5% → 82.4% — and is still 14% slower, p=0.010, because the link is saturated and it adds 23% more bytes. Off by default. The finding is that **transfer reordering cannot help here at all**; see "Stage 1c" above.)*
+- **Stage 1d — pinning** *(done, and the largest single gain in the project: **+38% decode, p=0.003**, from a flag that already existed and defaulted to off. 19.5x the measured baseline. The fill path now runs at 98% of this card's pinned PCIe rate, so transfer optimisation is **finished** — see "Stage 1d" above.)*
+- **Stage 1e — move fewer bytes.** Transfer is still 60% of a decode token, so eliminating it would be +150%, and every way of moving the same bytes *faster* is now exhausted.
+  - **1e-1 — eviction policy** *(**closed negative**. Four candidates ranked offline on 147k decode lookups across 18 documents; the best beats LRU by 1.9 points, or +2.6% predicted — inside the harness's own noise. Nothing shipped. The useful finding is the conversion rate: Belady's 21.4-point gap is worth exactly 1.8x the cache, and capacity is purchasable where prophecy is not. See "Stage 1e" above.)*
+  - **1e-2 — quantised experts** *(next, and now the highest-expected-value item in the project. int8 halves bytes per miss **and** doubles slots for the same VRAM: 512 slots, 81.4% hit, 0.149 GB/token, **predicted 14.4 tok/s** — which beats perfect eviction at fp16 by 32%. Cost: it changes numerics, so it needs Stage 1b's greedy-divergence treatment on the real model at real dtype, and dequant probably wants a Triton kernel.)*
+  - **1e-3 — Q7's CPU path** *(break-even is 10.8 routed tokens and decode has exactly 1, so every decode expert is on the wrong side of it. Computing a missed expert in place also overlaps GPU work instead of blocking it. Larger potential than 1e-2 and larger integration risk.)*
+  - **1e-4 — prefill streaming** *(prefill moves 7.59 GB per prompt at a 9% hit rate — 59% of the whole model — because it touches every expert in every layer anyway. The LRU cache is pure overhead there; a fixed layer-order stream would do the same work without the eviction thrash.)*
 - **Stage 2** — Triton kernels: fused gather-GEMM, dequant, fused router. *Needs sm_80+.*
 - **Stage 3** — scale to V4-Flash, where the routed pool may not fit in RAM either and experts stream disk→RAM→GPU. *Needs RAM and NVMe headroom.* Q8 is the go/no-go: if `t_disk` needs more lookahead than Q3 shows prediction surviving, the disk tier has to be driven by a longer-horizon signal rather than per-layer routing prediction.
 
