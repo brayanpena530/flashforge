@@ -328,6 +328,83 @@ check("repin is reversible",
       "back to fully pageable, contents still identical — so a pin sweep can "
       "revisit a level without reloading the model")
 
+print("\nFake int8 quantisation (Stage 1e-2)")
+
+# The quantiser is measured by greedy divergence on the real model, which this
+# file cannot run. What it can check is that the thing is a *quantiser*: that it
+# preserves the layout, uses per-channel scales rather than one global one, and
+# lands on the grid it claims to. A per-tensor scale would still "work" and
+# would quietly be a much worse approximation.
+quant_store = ExpertStore.from_model(
+    copy.deepcopy(model), list(range(L)), detach_from_model=False
+)
+original = quant_store.row(0, 1).clone()
+stats_q = quant_store.fake_quantize_int8()
+after = quant_store.row(0, 1)
+check("quantisation preserves shape and dtype",
+      after.shape == original.shape and after.dtype == original.dtype,
+      f"{tuple(after.shape)} {after.dtype} — rows stay fp16, so bytes, slots and "
+      "bandwidth are all unchanged and only the values move")
+check("quantisation actually changed the weights",
+      not torch.equal(after, original),
+      f"relative RMS error {stats_q['rel_rms_error']:.3%}")
+check("quantisation error is small enough to be worth testing on the model",
+      0 < stats_q["rel_rms_error"] < 0.05,
+      f"{stats_q['rel_rms_error']:.3%} RMS, worst channel "
+      f"{stats_q['worst_channel_rel_error']:.3%}")
+
+# The real assertion: every output channel sits on its own 255-level grid. Take
+# one projection's rows and check each has at most 255 distinct values, which a
+# per-tensor scale would fail for all but the largest-magnitude row.
+m = quant_store.shape.matrix_numel
+gate = after[:m].unflatten(0, (quant_store.shape.intermediate_size,
+                               quant_store.shape.hidden_size)).to(torch.float32)
+levels = [int(torch.unique(row).numel()) for row in gate[:16]]
+check("each output channel gets its own scale",
+      max(levels) <= 255,
+      f"{max(levels)} distinct values in the widest of 16 sampled channels, "
+      "against int8's 255 levels — a per-tensor scale would blow this on every "
+      "channel but the largest")
+check("scales are not so coarse the channel collapses",
+      min(levels) > 8,
+      f"{min(levels)} distinct values in the narrowest sampled channel")
+del quant_store
+
+# Exempting a projection is what took the model from 98.32% agreement (failing)
+# to 99.13% (passing), so "did it actually skip that projection" is load-bearing
+# rather than cosmetic. Check the exempted bytes are untouched and the others
+# are not.
+partial = ExpertStore.from_model(
+    copy.deepcopy(model), list(range(L)), detach_from_model=False
+)
+pristine = partial.row(0, 2).clone()
+partial.fake_quantize_int8(projections=("gate_proj", "up_proj"))
+touched = partial.row(0, 2)
+check("an exempted projection is left bit-identical",
+      torch.equal(touched[2 * m : 3 * m], pristine[2 * m : 3 * m]),
+      "down_proj survives untouched, so it keeps fp16's dynamic range where the "
+      "product of two activations needs it")
+check("the requested projections are still quantised",
+      not torch.equal(touched[: 2 * m], pristine[: 2 * m]),
+      "gate_proj and up_proj did change — an exemption that silently skipped "
+      "everything would read as a free accuracy win")
+
+# Group size has to change the grid, or --quant-group is a flag that does
+# nothing and the measured 0.858% -> 0.660% would have been noise.
+grouped_store = ExpertStore.from_model(
+    copy.deepcopy(model), list(range(L)), detach_from_model=False
+)
+# 16, not the production 128: this stack is hidden_size=64 / intermediate=32, so
+# any group at or above 64 spans a whole row and is per-channel by construction.
+# A test asserting otherwise fails against correct code.
+fine = grouped_store.fake_quantize_int8(group_size=16)
+check("a finer group size lowers the weight error",
+      fine["rel_rms_error"] < stats_q["rel_rms_error"],
+      f"group-16 {fine['rel_rms_error']:.4%} against per-channel "
+      f"{stats_q['rel_rms_error']:.4%} — necessary, and on the real model not "
+      "sufficient: it improved KL and left top-1 agreement unchanged")
+del partial, grouped_store
+
 print("\nAccess logging (Stage 1e)")
 
 # The log is what every eviction-policy conclusion was drawn from, so an error

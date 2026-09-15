@@ -216,6 +216,50 @@ prompt — the string "The history of computing is" repeated 64 times — LRU-2
 scored **+16.9** points. On the 18-document trace it scores **-20.8**. The
 repeated phrase is correct for a timing harness and wrong for fitting a policy,
 and `ff-serve --trace-prompts` exists so the two never get confused again.
+
+STAGE 1E-2 — QUANTISATION, QUALIFIED BEFORE IT WAS BUILT
+--------------------------------------------------------
+int8 is a bytes argument with a numerics risk, so `ExpertStore` grew
+`fake_quantize_int8`, which round-trips the store through int8 **without
+changing its size**. Same rows, same slots, same bandwidth, different values —
+which answers the numerics question in one run, before any of the plumbing
+exists. `ff-serve --fake-quant-int8` runs it as a final `q8sim` path, and
+throughput came back unchanged at p=1.00, confirming the isolation worked.
+
+Three results, in the order they arrived, because the order is the lesson.
+
+**The benchmark prompt said it was free.** Greedy output identical for all 97
+tokens. It was wrong about the model: across 12 corpus documents, only 4 were
+identical and one diverged at token 3.
+
+**Greedy divergence was the wrong instrument.** It compounds — one flipped
+argmax at position 3 makes every later token differ — so it reports "how early
+did anything change" while sounding like "how much changed". Replaced with
+teacher-forced top-1 agreement: same document into both models, compare the
+argmax at every position independently. One forward pass per document instead
+of 96.
+
+**The bar had to be set before looking, and then controlled.** Pre-committed to
+99% agreement and 0.01 nats. Per-channel int8 scored 98.32% / 0.0024 — a miss.
+Group-128 improved the weight error (0.858% -> 0.660%) and the KL (0.0024 ->
+0.0016) and left agreement at 97.97%, one binomial standard error away, i.e.
+unchanged. At that point the bar itself was the suspect, so it got a control:
+what do two *accepted* fp16 paths score? Loop against grouped — non-bit-exact
+since Stage 1b and shipping by default — scores **99.42% / 0.00041**. The bar
+was fair, and int8's error is ~4x the reassociation noise already accepted.
+
+The fix was granularity, not a lower bar. `down_proj` consumes the product of
+two activations and so sees the widest dynamic range of the three projections;
+exempting it clears the bar:
+
+    variant                        slots  MB/exp    hit   pred t/s   agreement
+    fp16 (today)                     238   12.58  54.4%       7.55   99.42% (control)
+    int8 gate+up, fp16 down          357    8.39  67.6%      11.00   99.13% PASSES
+    int8 all three                   476    6.29  78.3%      13.84   98.32% FAILS
+
+So Stage 1e-2 ships **two of three projections quantised, +42% predicted**, and
+explicitly declines the +79% variant. The extra 37 points of throughput cost
+more output quality than this project's own accepted floor.
 """
 
 from __future__ import annotations

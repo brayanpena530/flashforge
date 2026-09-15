@@ -511,6 +511,55 @@ ff-serve --capacity 256 --path grouped --gen-tokens 64 \
 ff-evict traces/decode_corpus.npz --slru-protected 0.25,0.5,0.75
 ```
 
+## Stage 1e-2 — quantisation, qualified before it was built
+
+int8 is a *bytes* argument carrying a *numerics* risk, and the two can be
+separated. `ExpertStore.fake_quantize_int8()` round-trips the store through int8
+**without changing its size** — same rows, same slots, same bandwidth, different
+values — so the numerics question gets answered in one run before any of the
+plumbing exists. `ff-serve --fake-quant-int8` runs it as a final `q8sim` path;
+throughput came back unchanged at p=1.00, which is how you know the isolation
+worked.
+
+Three results, in the order they arrived, because the order is the lesson.
+
+**The benchmark prompt said it was free.** Greedy output identical for all 97
+tokens. It was wrong about the model: across 12 corpus documents only 4 were
+identical, and one diverged at token 3.
+
+**Greedy divergence was the wrong instrument.** It compounds — one flipped
+argmax at position 3 makes every later token differ — so it reports *how early
+anything changed* while sounding like *how much changed*. Replaced with
+teacher-forced top-1 agreement: the same document into both models, argmax
+compared at every position independently, one forward pass per document instead
+of 96.
+
+**The bar was pre-committed, then controlled.** ≥99% agreement and <0.01 nats,
+fixed before measuring. Per-channel int8 scored 98.32% / 0.0024 — a miss.
+Group-128 improved weight error (0.858%→0.660%) and KL (0.0024→0.0016) and left
+agreement at 97.97%, one binomial standard error away. At that point the bar
+itself was the suspect, so it got a control: **loop vs grouped** — non-bit-exact
+since Stage 1b and shipping by default — scores **99.42% / 0.00041**. The bar
+was fair; int8's error is ~4x the reassociation noise already accepted.
+
+The fix was granularity, not a lower bar. `down_proj` consumes the product of
+two activations, so it sees the widest dynamic range of the three projections:
+
+| variant | slots | MB/expert | hit rate | predicted t/s | agreement | |
+|---|---|---|---|---|---|---|
+| fp16 *(today)* | 238 | 12.58 | 54.4% | 7.55 | 99.42% | control floor |
+| **int8 gate+up, fp16 down** | 357 | 8.39 | 67.6% | **11.00** *(+42%)* | 99.13% | **passes** |
+| int8 all three | 476 | 6.29 | 78.3% | 13.84 *(+79%)* | 98.32% | fails |
+
+So Stage 1e-2 ships **two of three projections quantised** and explicitly
+declines the faster variant: the extra 37 points of throughput cost more output
+quality than this project's own accepted floor.
+
+```bash
+ff-serve --capacity 256 --path grouped --fake-quant-int8 \
+         --quant-projections gate_proj,up_proj --divergence-prompts 16
+```
+
 ## Stage 0 — instrumentation
 
 Answers eight questions, each of which gates a later design decision. Q1–Q6
@@ -815,7 +864,7 @@ is a custom module and will need its own branch in `discover_moe()`.
 - **Stage 1d — pinning** *(done, and the largest single gain in the project: **+38% decode, p=0.003**, from a flag that already existed and defaulted to off. 19.5x the measured baseline. The fill path now runs at 98% of this card's pinned PCIe rate, so transfer optimisation is **finished** — see "Stage 1d" above.)*
 - **Stage 1e — move fewer bytes.** Transfer is still 60% of a decode token, so eliminating it would be +150%, and every way of moving the same bytes *faster* is now exhausted.
   - **1e-1 — eviction policy** *(**closed negative**. Four candidates ranked offline on 147k decode lookups across 18 documents; the best beats LRU by 1.9 points, or +2.6% predicted — inside the harness's own noise. Nothing shipped. The useful finding is the conversion rate: Belady's 21.4-point gap is worth exactly 1.8x the cache, and capacity is purchasable where prophecy is not. See "Stage 1e" above.)*
-  - **1e-2 — quantised experts** *(next, and now the highest-expected-value item in the project. int8 halves bytes per miss **and** doubles slots for the same VRAM: 512 slots, 81.4% hit, 0.149 GB/token, **predicted 14.4 tok/s** — which beats perfect eviction at fp16 by 32%. Cost: it changes numerics, so it needs Stage 1b's greedy-divergence treatment on the real model at real dtype, and dequant probably wants a Triton kernel.)*
+  - **1e-2 — quantised experts** *(**numerics qualified, plumbing next**. Fake-quantisation settled the risk before any of the cache work: int8 on all three projections predicts +79% but scores 98.32% teacher-forced agreement against a control floor of 99.42%, so it is declined. int8 on gate+up with fp16 down_proj predicts **+42%** at 99.13% and passes. Remaining work is the real thing — int8 slots, a resident scale table, dequant inside `cache.gather()` — see "Stage 1e-2" above.)*
   - **1e-3 — Q7's CPU path** *(break-even is 10.8 routed tokens and decode has exactly 1, so every decode expert is on the wrong side of it. Computing a missed expert in place also overlaps GPU work instead of blocking it. Larger potential than 1e-2 and larger integration risk.)*
   - **1e-4 — prefill streaming** *(prefill moves 7.59 GB per prompt at a 9% hit rate — 59% of the whole model — because it touches every expert in every layer anyway. The LRU cache is pure overhead there; a fixed layer-order stream would do the same work without the eviction thrash.)*
 - **Stage 2** — Triton kernels: fused gather-GEMM, dequant, fused router. *Needs sm_80+.*

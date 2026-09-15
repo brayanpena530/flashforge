@@ -483,6 +483,38 @@ a budget, not a plan; the plan depends on the exchange rate.
 a change you could actually make — slots, bytes, milliseconds, dollars. If the
 restatement names something you can purchase outright, purchase it instead.
 
+### 4.8 A threshold you have not characterised is not a threshold
+
+Stage 1e-2 pre-committed to ">=99% top-1 agreement" before measuring int8, which
+is the right instinct and was still half a method. The number was picked from
+intuition. Nobody knew the statistic's variance, or what an *accepted* change
+already scored on it.
+
+Both gaps showed up immediately. Per-channel int8 scored 98.32%; group-128
+scored 97.97% on a strictly finer grid with better weight error and better KL.
+That looks like a contradiction until you compute the binomial standard error —
+at n=1,727 and p≈0.98 it is 0.34%, so the two runs are one SE apart and the
+"regression" is nothing. Half the candidate comparisons in that sweep were
+inside the noise of a statistic chosen without checking its noise.
+
+The second gap is the dangerous one, because failing a bar invites relaxing it.
+The fix is a **control measured on the same instrument**: what does a change
+this project has *already accepted* score? Loop against grouped — non-bit-exact
+since Stage 1b, shipping by default — came back at 99.42% and 0.00041 nats
+against int8's 98.32% and 0.0024. That vindicated the bar rather than the
+candidate, and it turned "is 99% reasonable?" from an argument into a reading.
+
+**Rule:** when you pre-commit to a threshold, pre-commit to two more things with
+it — the sampling error of the statistic at the n you will actually have, and a
+control drawn from something already shipping. Without the first you cannot tell
+a result from noise; without the second you cannot defend the bar when the
+result you wanted fails it.
+
+**Corollary:** prefer the low-variance statistic for detecting change and the
+interpretable one for deciding. KL moved cleanly and monotonically with weight
+error across every variant; top-1 agreement is what anyone actually cares about
+and is noisy. Report both, and do not read a rank ordering off the noisy one.
+
 **Corollary:** when the best available policy's gain lands inside the harness's
 own spread, that is not a small win to bank, it is a result you cannot measure.
 Ship nothing and say so. Stage 1e's +2.6% against a ±8% spread is the example.

@@ -225,6 +225,102 @@ class ExpertStore:
         gc.collect()
         return len(self._pinned)
 
+    def fake_quantize_int8(
+        self, group_size: int = 0, projections: tuple[str, ...] = PROJECTIONS
+    ) -> dict[str, float]:
+        """Round-trip every expert through int8, in place.
+
+        This changes the numbers without changing the bytes: rows stay fp16, so
+        transfers, cache capacity and throughput are all untouched. That is the
+        entire point. Stage 1e-2's case for int8 is a *bytes* argument —
+        512 slots instead of 256 and 6.29 MB per miss instead of 12.58 — and its
+        only real risk is a *numerics* one. Separating them means the numerics
+        question can be answered in one run, before any of the plumbing exists,
+        and a failure here kills the stage for 20 minutes rather than two days.
+
+        Symmetric, with `group_size` controlling how much weight shares a scale.
+
+        `group_size=0` is one scale per output channel — for OLMoE that is
+        2*intermediate + hidden = 4,096 fp16 values against 6.29 MB, so 0.13%
+        overhead, and it is strictly better than the per-tensor variant at
+        effectively no cost. It was the first thing tried and it **missed**:
+        98.32% teacher-forced top-1 agreement against a pre-committed 99% bar,
+        at a mean KL of 0.0024 nats. The distribution barely moves; the argmax
+        flips a little too often.
+
+        `group_size=128` splits each row into blocks of 128 inputs that share a
+        scale, which is the standard fix and costs 1.6% storage rather than
+        0.13%. The scales stay small enough to keep fully resident on the GPU
+        either way, so this does not change the design — only the constant.
+
+        Not a tolerance to be relaxed when it fails. The bar is a property of
+        the model's output, so missing it means the quantiser is too coarse, and
+        the answer is a finer grid.
+
+        Irreversible — the low bits are gone. A caller that wants to compare
+        against unquantised has to measure that first.
+
+        Returns the relative error, which is a sanity check on the quantiser
+        and *not* the acceptance test. Weight error does not linearly predict
+        output error; the acceptance test is greedy token ids on the real model
+        (troubleshoot.md 4.6).
+        """
+        shape = self.shape
+        m = shape.matrix_numel
+        matrix_shapes = {
+            "gate_proj": (shape.intermediate_size, shape.hidden_size),
+            "up_proj": (shape.intermediate_size, shape.hidden_size),
+            "down_proj": (shape.hidden_size, shape.intermediate_size),
+        }
+
+        squared_error = 0.0
+        squared_weight = 0.0
+        worst = 0.0
+        # A whole layer's projection promoted to fp32 is ~512 MB for OLMoE, and
+        # with the store itself resident this machine has run as low as 1.0 GB
+        # free. Chunking keeps the transient under 200 MB; the arithmetic is
+        # identical either way because every scale is per output channel and so
+        # never spans experts.
+        chunk = max(1, 8)
+        for layer in self.layers:
+            rows = self._layers[layer]
+            for i, name in enumerate(PROJECTIONS):
+                # Leaving a projection in fp16 costs capacity — two of three
+                # quantised is 8.39 MB per expert rather than 6.29, so 384 slots
+                # instead of 512 — and buys back accuracy. down_proj is the one
+                # worth exempting first: it consumes the product of two
+                # activations, so it sees the widest dynamic range of the three.
+                if name not in projections:
+                    continue
+                for start in range(0, self.num_experts, chunk):
+                    block = rows[start : start + chunk, i * m : (i + 1) * m]
+                    # fp32 for the quantiser's own arithmetic. In fp16 an amax
+                    # over 2,048 elements and a division by a small scale both
+                    # lose precision, and the measured error would then be the
+                    # quantiser's rounding rather than int8's.
+                    w = block.unflatten(1, matrix_shapes[name]).to(torch.float32)
+                    # Group along the *input* dimension, so a scale covers a
+                    # contiguous span of the dot product rather than a slice
+                    # across unrelated output channels. group_size=0, or a row
+                    # that does not divide evenly, falls back to the whole row.
+                    rows_, cols = w.shape[1], w.shape[2]
+                    grouped = bool(group_size) and cols % group_size == 0
+                    view = w.reshape(-1, rows_, cols // group_size, group_size) if grouped else w
+                    scale = view.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
+                    deq = (view / scale).round_().clamp_(-127, 127).mul_(scale)
+                    if grouped:
+                        deq = deq.reshape(w.shape)
+
+                    error = deq - w
+                    squared_error += float(error.pow(2).sum())
+                    squared_weight += float(w.pow(2).sum())
+                    worst = max(worst, float(error.abs().max() / w.abs().max()))
+                    block.copy_(deq.flatten(1).to(shape.dtype))
+                    del w, scale, deq, error
+
+        rms = (squared_error / squared_weight) ** 0.5 if squared_weight else 0.0
+        return {"rel_rms_error": rms, "worst_channel_rel_error": worst}
+
     # -- access ------------------------------------------------------------
 
     @property

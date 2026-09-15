@@ -847,6 +847,31 @@ def _run_phase(model, input_ids, gen_tokens: int, stats=None, cache=None) -> dic
     return result
 
 
+def _corpus_input_ids(tokenizer, count: int, prompt_tokens: int) -> list:
+    """`count` prompts from the Stage 0 corpus, interleaved across its domains.
+
+    The benchmark prompt is one phrase repeated 64 times, which is right for
+    timing — it fixes the sequence length — and narrow for anything fitted or
+    validated against the model's *output*. A repeated phrase has a highly
+    predictable continuation and therefore wide logit margins, so it is the
+    easiest possible test for a numerical change to survive. Round-robin the
+    domains so a small budget is a sample of the corpus rather than its first
+    topic; see troubleshoot.md 1.8.
+    """
+    import torch  # noqa: F401  (tokenizer returns torch tensors)
+
+    from .prompts import load_prompts
+
+    by_domain: dict[str, list[str]] = {}
+    for item in load_prompts():
+        by_domain.setdefault(item["domain"], []).append(item["text"])
+    interleaved = [text for group in zip(*by_domain.values()) for text in group]
+    return [
+        tokenizer(text, return_tensors="pt").input_ids[:, :prompt_tokens].to("cuda")
+        for text in interleaved[:count]
+    ]
+
+
 def _rate(hits: int, misses: int) -> float:
     total = hits + misses
     return hits / total if total else 0.0
@@ -1038,6 +1063,33 @@ def serve_main(argv: list[str] | None = None) -> int:
              "across its six domains, instead of the single repeated benchmark "
              "phrase. Only affects --dump-trace; the timed passes are untouched",
     )
+    parser.add_argument(
+        "--divergence-prompts", type=int, default=0, metavar="N",
+        help="also compare next-token predictions teacher-forced across N corpus "
+             "documents, reported as top-1 agreement and KL. Untimed, so it "
+             "cannot perturb the throughput columns. This is the bar for a path "
+             "that approximates; greedy identity is the bar for one that claims "
+             "to be exact, and the two are printed separately",
+    )
+    parser.add_argument(
+        "--quant-group", type=int, default=0, metavar="N",
+        help="weights per shared int8 scale, along the input dimension. 0 is one "
+             "scale per output channel (0.13%% storage overhead, measured at "
+             "98.32%% agreement); 128 is the standard finer grid (1.6%%)",
+    )
+    parser.add_argument(
+        "--quant-projections", default="gate_proj,up_proj,down_proj",
+        help="which projections to quantise. Dropping down_proj costs capacity "
+             "(8.39 MB per expert instead of 6.29, so 384 slots instead of 512) "
+             "and buys back accuracy, because it sees the widest dynamic range",
+    )
+    parser.add_argument(
+        "--fake-quant-int8", action="store_true",
+        help="add a final 'q8sim' path that round-trips the expert store through "
+             "per-channel int8 without changing its size. Isolates Stage 1e-2's "
+             "numerics risk from its bytes argument: throughput should be "
+             "unchanged, and the number to read is the greedy-divergence line",
+    )
     parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16"])
     parser.add_argument(
         "--baseline", action="store_true",
@@ -1102,6 +1154,14 @@ def serve_main(argv: list[str] | None = None) -> int:
             label = name if pin_gb is None else f"{name}/pin{pin_gb:g}"
             path_flags[label] = (grouped, prefetch_k, pin_gb)
             paths.append(label)
+
+    # Always last, and only once: fake-quantising the store is irreversible, so
+    # every unquantised path has to have been measured before it runs. It is
+    # appended here rather than being a `kind` so that no combination of flags
+    # can put it in the middle of a sweep.
+    if args.fake_quant_int8:
+        path_flags["q8sim"] = (True, None, pin_levels[-1])
+        paths.append("q8sim")
 
     import gc
 
@@ -1262,6 +1322,24 @@ def serve_main(argv: list[str] | None = None) -> int:
                 # starts from the same cold cache instead of inheriting the
                 # previous level's residency along with its warm-up.
                 report.cache.clear()
+            if path == "q8sim":
+                # Same bytes, same slot count, same bandwidth — only the values
+                # change. So this path's *throughput* should match the grouped
+                # path it follows, and if it does not, the difference is
+                # measurement noise rather than quantisation. The column that
+                # matters here is the greedy divergence one below.
+                projections = tuple(
+                    p for p in args.quant_projections.split(",") if p.strip()
+                )
+                error = report.store.fake_quantize_int8(
+                    group_size=args.quant_group, projections=projections
+                )
+                report.cache.clear()
+                grain = f"group-{args.quant_group}" if args.quant_group else "per-channel"
+                grain += f", {'+'.join(projections)}"
+                print(f"  fake-quantised the store to {grain} int8: "
+                      f"{error['rel_rms_error']:.3%} relative RMS weight error, "
+                      f"worst channel {error['worst_channel_rel_error']:.3%}")
             for block in report.blocks:
                 block.grouped = grouped
                 # The last block has no next_gate, so this is a no-op there.
@@ -1330,26 +1408,10 @@ def serve_main(argv: list[str] | None = None) -> int:
                 # pass can replay the real corpus instead. It is untimed, and the
                 # router's choices do not depend on cache state, so widening it
                 # cannot perturb anything that was measured above.
-                prompt_ids = [input_ids]
-                if args.trace_prompts:
-                    from .prompts import load_prompts
-
-                    corpus = load_prompts()
-                    by_domain: dict[str, list[str]] = {}
-                    for item in corpus:
-                        by_domain.setdefault(item["domain"], []).append(item["text"])
-                    # Round-robin the domains so a budget smaller than the corpus
-                    # is still a sample of it rather than the first topic in it.
-                    interleaved = [
-                        text
-                        for group in zip(*by_domain.values())
-                        for text in group
-                    ][: args.trace_prompts]
-                    prompt_ids = [
-                        tokenizer(text, return_tensors="pt")
-                        .input_ids[:, : args.prompt_tokens].to("cuda")
-                        for text in interleaved
-                    ] or prompt_ids
+                prompt_ids = (
+                    _corpus_input_ids(tokenizer, args.trace_prompts, args.prompt_tokens)
+                    if args.trace_prompts else []
+                ) or [input_ids]
 
                 prefill_keys: list[int] = []
                 decode_keys: list[int] = []
@@ -1382,9 +1444,35 @@ def serve_main(argv: list[str] | None = None) -> int:
                       f"({(len(keys) - start) / max(1, dump['decode_tokens']):.0f}/token) "
                       f"over {len(prompt_ids)} prompt(s) -> {out_path}")
 
+            # Greedy ids over a spread of real documents, untimed. One prompt is
+            # one sample of the model's sensitivity to a numerical change, and
+            # the benchmark prompt is the least sensitive sample available — its
+            # continuation is predictable, so its logit margins are wide. A
+            # change that survives it has not been tested; a change that survives
+            # six domains has.
+            # Teacher-forced, not generated. Greedy divergence compounds: one
+            # flipped argmax at position 3 makes every later token differ, so
+            # generation measures "how early did anything change" and calls it
+            # "how much changed". Feeding both models the same real document and
+            # comparing the argmax at every position independently is the
+            # question an approximation should actually be asked, and it costs
+            # one forward pass per document instead of 96.
+            corpus_logits: list = []
+            if args.divergence_prompts:
+                import torch
+
+                with torch.no_grad():
+                    for ids in _corpus_input_ids(
+                        tokenizer, args.divergence_prompts, args.prompt_tokens
+                    ):
+                        out = model(ids, use_cache=False)
+                        corpus_logits.append(out.logits[0].detach().to("cpu", torch.float32))
+                        del out
+
             rows.append({
                 "capacity": capacity,
                 "path": path,
+                "corpus_logits": corpus_logits,
                 "prefill_tok_s": _median(prefill_samples),
                 # Prefill gets a spread too. It is one short timed region per
                 # pass, so it is the noisiest number here and the most likely
@@ -1557,6 +1645,36 @@ def serve_main(argv: list[str] | None = None) -> int:
                         print(f"          {path}: greedy output diverges at token "
                               f"{diverged} of {shared} — not bit-exact, and at fp16 that "
                               "is visible in the text, not just the activations")
+
+                # An approximation cannot pass a bit-exactness test, so asking it
+                # to is a test nothing can fail informatively. This is the bar
+                # for a path that is *meant* to change the numbers: does it
+                # predict the same next token, position by position, on real
+                # text? Agreement and KL are pre-committed thresholds — 99% and
+                # 0.01 nats — so the verdict is not chosen after seeing it.
+                base_logits, other_logits = base["corpus_logits"], other["corpus_logits"]
+                if base_logits and len(base_logits) == len(other_logits):
+                    import torch
+
+                    agreed = positions = 0
+                    kl_total = 0.0
+                    worst_doc = 1.0
+                    for mine, theirs in zip(base_logits, other_logits):
+                        match = (mine.argmax(-1) == theirs.argmax(-1)).sum().item()
+                        agreed += match
+                        positions += mine.shape[0]
+                        worst_doc = min(worst_doc, match / mine.shape[0])
+                        p = mine.log_softmax(-1)
+                        q = theirs.log_softmax(-1)
+                        kl_total += float((p.exp() * (p - q)).sum())
+                    agreement = agreed / positions
+                    kl = kl_total / positions
+                    ok = agreement >= 0.99 and kl < 0.01
+                    print(f"          {path}: teacher-forced top-1 agreement "
+                          f"{agreement:.2%} over {positions:,} positions in "
+                          f"{len(base_logits)} documents, worst document "
+                          f"{worst_doc:.2%}, mean KL {kl:.5f} nats — "
+                          f"{'PASSES' if ok else 'FAILS'} the >=99% / <0.01 bar")
 
     # A capacity sweep is only informative if the differences it shows are
     # larger than the machine's own run-to-run variation. On this box they were
