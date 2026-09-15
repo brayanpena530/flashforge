@@ -376,6 +376,77 @@ onto it and a layer costs one copy. That alone took the loop path's blocking
 fill from 130.4 to 98.4 ms/token, and it preserves the ascending expert order
 that keeps the loop path bit-exact at *exactly zero* difference.
 
+## Stage 1d — pinning, the lever that was switched off the whole time
+
+Stage 1c established that the link is the constraint. The obvious follow-up was
+the one nobody had checked: **every measurement this project ever published ran
+with a fully pageable expert store.** On pageable memory a host-to-device copy
+cannot be a true async DMA, and Q7 had measured the difference back in Stage 0.
+
+`--pin-gb` existed. It defaulted to 0. The store dutifully printed
+`0.00 GB pinned` in a line nobody read as a performance number.
+
+```
+ff-serve --capacity 256 --path grouped --pin-sweep 10.5,9,6,0 --baseline --repeats 9 --gen-tokens 96
+```
+
+| pinned | decode t/s | GB/token | fill ms/tok | fill GB/s | % of Q7's 10.4 GB/s |
+|-------:|-----------:|---------:|------------:|----------:|--------------------:|
+| 0%     | 5.01       | 0.846    | 148.7       | 6.08      | 58% |
+| 50%    | 6.27       | 0.845    | 110.4       | 8.64      | 83% |
+| 75%    | 6.51       | 0.844    | 88.4        | 9.64      | 93% |
+| 88%    | **6.92**   | 0.846    | 91.1        | **10.16** | **98%** |
+
+**+38% decode, p=0.003, from a flag.** Bytes per token are constant to three
+decimals and the hit rate never moves off 47.5% — the cache does identical
+work, and only the speed those bytes cross at changed. That is exactly what a
+bandwidth-bound system predicts, and it is a larger lever than Stage 1b's
+grouped GEMM (+27%) or Stage 1c's prefetch (0%).
+
+Against accelerate's `device_map="auto"` measured in the **same invocation**:
+0.355 tok/s → 6.92 tok/s, **19.5x**, on a model 2.3x larger than the card.
+
+### Pinning is now finished, and the tool says so
+
+At 88% coverage the fill path runs at 98% of this machine's measured pinned
+PCIe rate. The two remaining unpinned layers are worth about 2%. `ff-serve
+--pcie-gbps` compares the two and prints the conclusion rather than leaving it
+as arithmetic:
+
+> the fill path is at 98% of this machine's measured pinned PCIe rate
+> (10.4 GB/s). Transfers are running at hardware speed — there is nothing left
+> to win by moving the same bytes faster.
+
+This also explains Stage 1c cleanly in hindsight. Prefetch tried to make
+transfers *overlap*; pinning made them *fast*. Once the link runs at hardware
+speed only the second kind of change exists, and the first was never going to
+pay for the bytes it spent.
+
+### Why the order was run backwards
+
+Pin levels were swept ascending first (0 → 88%) and the curve was monotone —
+which is also what thermal drift, or a machine quietly settling, would produce.
+Coverage only ever increases, so drift aliases perfectly onto the variable.
+
+So it was re-run descending. `pin0` read 4.99 in first position and 5.01 in
+last; `pin10.5` read 7.22 last and 6.92 first. The effect follows coverage, not
+the clock.
+
+This is only answerable at all because `ExpertStore.repin()` reallocates layers
+as pinned or pageable in place, so coverage is a variable you can flip between
+timed regions on one loaded model. Comparing pinned and pageable *invocations*
+would have compared two machines — the mistake that has produced a wrong answer
+every time it has been made here.
+
+### The ceiling is lower than free RAM suggests
+
+Idle, this 32 GB box page-locks 11.8 GiB. With the model loaded the 16th layer
+failed at 11.25 GiB, and reaching 94% coverage left so little headroom that the
+**forward pass** then OOM'd. There is a three-way budget between the slot pool,
+the pinned store and activations, so "pin everything" is not the goal — 88% is
+where this card settles. `ExpertStore` degrades to pageable rather than
+discarding the load when it hits that wall.
+
 ## Stage 0 — instrumentation
 
 Answers eight questions, each of which gates a later design decision. Q1–Q6
@@ -677,7 +748,8 @@ is a custom module and will need its own branch in `discover_moe()`.
 - **Stage 1** — expert cache in pure PyTorch, experts in host RAM, LRU eviction. *(done: 4.41 tok/s, 12.1x over a measured offload baseline. The Stage 1b run re-measured the same loop path at 4.69 against a 0.40 baseline, 11.8x — two runs, each internally consistent; do not cross them.)*
 - **Stage 1b** — grouped expert GEMM, promoted from Stage 2 because 95% of decode was per-expert dispatch rather than transfer. *(done: 5.98 tok/s, +27% on decode, 15.0x over the baseline measured in the same run. Prefill unchanged within noise.)*
 - **Stage 1c** — async prefetch on a side stream, one layer ahead with `stale_router` (Q3). *(built, measured, and **closed negative**. The "worth at most ~5%" this line used to carry came from a profile of an invalid configuration; the real fill budget at 256 slots is 50–71% of decode. The prefetcher works — blocking fill 116 → 36 ms/token, decode hit rate 47.5% → 82.4% — and is still 14% slower, p=0.010, because the link is saturated and it adds 23% more bytes. Off by default. The finding is that **transfer reordering cannot help here at all**; see "Stage 1c" above.)*
-- **Stage 1d — move fewer bytes.** The sustained-bandwidth column is now the design constraint: ~5.8 GB/s against Q7's 10.4 GB/s for a pinned transfer. In rough order of expected payoff: (1) **finish pinning** — only 9 of 16 layers fit under the 11.8 GB pinned ceiling today, and this is a memory-budget problem rather than a kernel one; (2) **Q7's CPU path** for experts under ~11 routed tokens, which at decode is all of them; (3) **eviction policy**, where Q5 measured 23.4 points of Belady headroom over LRU; (4) **quantised experts**, which halves bytes per miss outright.
+- **Stage 1d — pinning** *(done, and the largest single gain in the project: **+38% decode, p=0.003**, from a flag that already existed and defaulted to off. 19.5x the measured baseline. The fill path now runs at 98% of this card's pinned PCIe rate, so transfer optimisation is **finished** — see "Stage 1d" above.)*
+- **Stage 1e — move fewer bytes.** Transfer is still 60% of a decode token, so eliminating it would be +150%, but every way of moving the same bytes *faster* is now exhausted. In order of expected payoff: (1) **eviction policy**, where Q5 measured 23.4 points of Belady headroom over LRU at this capacity; (2) **Q7's CPU path** — break-even is 10.8 routed tokens and decode has exactly 1, so every decode expert is on the wrong side of it; (3) **quantised experts**, which halves bytes per miss and doubles what the cache holds for the same VRAM.
 - **Stage 2** — Triton kernels: fused gather-GEMM, dequant, fused router. *Needs sm_80+.*
 - **Stage 3** — scale to V4-Flash, where the routed pool may not fit in RAM either and experts stream disk→RAM→GPU. *Needs RAM and NVMe headroom.* Q8 is the go/no-go: if `t_disk` needs more lookahead than Q3 shows prediction surviving, the disk tier has to be driven by a longer-horizon signal rather than per-layer routing prediction.
 

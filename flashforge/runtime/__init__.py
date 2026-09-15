@@ -136,12 +136,52 @@ weights arrive, never which ones, so `ff-serve` treats any greedy divergence as
 a cross-stream race rather than rounding. It has been identical for 33 tokens
 in every run.
 
+STAGE 1D — THE LEVER THAT WAS SWITCHED OFF
+------------------------------------------
+Stage 1c established the link as the constraint. The follow-up nobody had
+checked: every measurement above ran with a **fully pageable** expert store.
+`--pin-gb` existed and defaulted to 0, and `ExpertStore.describe()` printed
+"0.00 GB pinned" on every run in a line that read as configuration.
+
+Swept in place on one loaded model, nine passes per level:
+
+    pinned   decode t/s   GB/token   fill ms   fill GB/s   vs Q7's 10.4
+        0%         5.01      0.846     148.7        6.08          58%
+       50%         6.27      0.845     110.4        8.64          83%
+       75%         6.51      0.844      88.4        9.64          93%
+       88%         6.92      0.846      91.1       10.16          98%
+
++38% decode (p=0.003) with bytes per token constant to three decimals and the
+hit rate fixed at 47.5%. The cache does identical work; only the rate those
+bytes cross at changed. That is a larger lever than the grouped GEMM (+27%) or
+the prefetcher (0%), and it was a flag.
+
+At 88% the fill path is at 98% of this machine's measured pinned PCIe rate, so
+**pinning is finished**: the last two layers are worth ~2%, and no further
+transfer optimisation can pay. It also explains Stage 1c in hindsight — prefetch
+made transfers *overlap*, pinning made them *fast*, and once a link runs at
+hardware speed only the second kind of change exists.
+
+The ceiling is lower than free RAM suggests. Idle this 32 GB box locks 11.8 GiB;
+with the model loaded the 16th layer failed at 11.25 GiB, and reaching 94% left
+so little headroom that the forward pass itself OOM'd. Slot pool, pinned store
+and activations share one budget.
+
+`ExpertStore.repin()` is what made this measurable: coverage is fixed at
+allocation, so it reallocates layers in place and lets `ff-serve --pin-sweep`
+flip the variable between timed regions. Comparing pinned and pageable
+*invocations* would have compared two machines.
+
 Against accelerate's `device_map="auto"` on the same prompt, timed by the same
 harness, in the **same `ff-serve --baseline --path both` invocation** — the
 baseline re-measured there at 0.40 tok/s (0.39-0.40 over five passes) rather
 than being carried over from the Stage 1 run — decode goes 0.40 -> 4.69 on the
 loop path and 0.40 -> 5.98 grouped. That is **15.0x**, on a model 2.3x larger
 than the card.
+
+Stage 1d re-ran that comparison with the store pinned, again in one invocation:
+baseline 0.355 tok/s (0.34-0.36 over nine passes) against 6.92 grouped, which
+is **19.5x**. Quote one of these two lines, never a mix of them.
 """
 
 from __future__ import annotations

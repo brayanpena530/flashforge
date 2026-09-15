@@ -240,39 +240,108 @@ it, from code that was never the subject of a benchmark.
 
 ---
 
+## Stage 1d — the lever that was switched off
+
+Stage 1c proved the link was the constraint. So the next question was how fast
+the link actually goes — and the answer was that **nobody had ever turned it
+on**. Every measurement above ran with a fully pageable expert store, where a
+host→device copy cannot be a true async DMA.
+
+`--pin-gb` existed. It defaulted to 0. The store printed `0.00 GB pinned` every
+single run, in a line that read as configuration rather than as a finding.
+
+```
+pinned    decode t/s   fill GB/s   % of this card's pinned PCIe rate (10.4)
+   0%        5.01        6.08      ████████████         58%
+  50%        6.27        8.64      █████████████████    83%
+  75%        6.51        9.64      ███████████████████  93%
+  88%        6.92       10.16      ████████████████████ 98%
+```
+
+**+38% decode, p=0.003, from a flag.** Bytes per token constant at 0.845, hit
+rate constant at 47.5% — the cache does identical work, only the speed changed.
+Bigger than the grouped GEMM (+27%) and bigger than everything Stage 1c built
+(0%).
+
+### Pinning is now finished
+
+At 88% coverage the fill path runs at **98% of the card's measured pinned PCIe
+rate**. The last two layers are worth ~2%, and no further transfer optimisation
+can pay at all. `ff-serve --pcie-gbps` prints that comparison and says so.
+
+It also explains Stage 1c in hindsight: prefetch made transfers *overlap*,
+pinning made them *fast*. Once the link runs at hardware speed, only the second
+kind of change exists.
+
+### The curve was run backwards to make sure
+
+Ascending order (0 → 88%) gives a monotone curve — which is also what thermal
+drift or a machine settling would produce, since coverage only ever increases.
+So it was re-run descending:
+
+```
+              ascending run    descending run
+   0%          4.99 (first)      5.01 (last)
+  88%          7.22 (last)       6.92 (first)
+```
+
+`pin0` reads the same in the position where drift would flatter it most. The
+effect follows coverage, not the clock.
+
+This is answerable only because `ExpertStore.repin()` reallocates layers in
+place, making coverage a variable you can flip between timed regions on one
+loaded model. Comparing pinned and pageable *invocations* would have compared
+two machines.
+
+### The ceiling is lower than free RAM suggests
+
+Idle, this 32 GB box page-locks 11.8 GiB. With the model loaded the 16th layer
+failed at 11.25 GiB — and reaching 94% left so little headroom that the forward
+pass itself OOM'd. Slot pool, pinned store and activations share one budget, so
+"pin everything" is not the goal. 88% is where this card settles.
+
 ## Where it stands
 
+Two invocations, each internally consistent. **Never cross them.**
+
 ```
-0.40 ─────────► 4.69 ─────────► 5.98 ─────────► (6.86 on a later run)
-baseline        Stage 1         Stage 1b         same grouped path,
-(accelerate)    offload+LRU     grouped GEMM     quieter machine
+run A   ff-serve --baseline --path both              (32 gen-tokens, 5 passes)
+        0.40  baseline   ██▌
+        4.69  Stage 1    ██████████████████████████████
+        5.98  Stage 1b   ██████████████████████████████████████    15.0x
+
+run B   ff-serve --baseline --pin-sweep ... (96 gen-tokens, 9 passes, 88% pinned)
+        0.355 baseline   ██
+        5.01  unpinned   ████████████████████████████
+        6.92  Stage 1d   ███████████████████████████████████████   19.5x
 ```
 
-⚠️ **The first three are one measurement.** 0.40 / 4.69 / 5.98 come from a
-single `ff-serve --baseline --path both` invocation and can be compared: that
-is the **15.0x**. The 6.86 is the same grouped path re-measured later at 96
-gen-tokens on an idle box — it is not a fourth improvement, and there is no
-baseline beside it. Stage 1c added **no throughput at all**.
+Stage 1c appears in neither, because it added nothing. That is the honest
+accounting: two of the three things built in Stage 1 moved the number, and the
+single largest gain came from a flag that was already there.
 
 **Shipping defaults:** grouped **on** (measured bit-identical output at fp16 on
 the real model). Prefetch **off** — not "unproven" but *measured worse*: −14% at
-full budget, p=0.010.
+full budget, p=0.010. `--pin-gb` still defaults to 0 because page-locking is a
+hard claim on the user's RAM, but `ff-serve` now says out loud that 0 is the
+slowest setting and suggests a value.
 
 **Test suite:** 36 checks, CPU-only, no model download. The loop path is held to
 a difference of **exactly 0.0** against the stock block; everything else is
 measured against it.
 
-**Open — and now sharply pointed.** The system delivers ~5.8 GB/s sustained
-against Q7's 10.4 GB/s for a *pinned* transfer, and only 9 of 16 layers are
-pinned. Every remaining lever reduces bytes or raises that constant; none of
-them reorder transfers:
+**Open, and now narrow.** The fill path runs at 98% of the card's pinned PCIe
+rate, so *every* way of moving the same bytes faster is exhausted. Transfer is
+still **60% of a decode token**, which means eliminating it entirely would be
++150% — a large budget, reachable only by moving fewer bytes:
 
-1. **Finish pinning** — the largest single lever, and a memory-budget problem
-   rather than a kernel one. The ceiling is 11.8 GB against a 12.0 GB store.
-2. **Q7's CPU path** — an expert computed in place is a transfer not made, and
-   at decode every expert has 1 token routed to it against a break-even of 10.8.
-3. **Eviction policy** — Q5 measured 23.4 points of Belady headroom over LRU.
-   Fewer misses is fewer bytes.
-4. **Quantised experts** — halves the bytes per miss directly.
+1. **Eviction policy** — Q5 measured 23.4 points of Belady headroom over LRU at
+   this capacity. Fewer misses is directly fewer bytes.
+2. **Q7's CPU path** — break-even is 10.8 routed tokens and decode has exactly
+   1, so every decode expert is on the wrong side of it. An expert computed in
+   place is a transfer that never happens.
+3. **Quantised experts** — halves bytes per miss outright, and the cache holds
+   twice as many for the same VRAM.
 
-Prefetch is closed, not parked. It works, and it cannot help here.
+Prefetch is closed, not parked: it works, and it cannot help here. Pinning is
+closed because it is finished.

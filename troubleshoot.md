@@ -127,7 +127,7 @@ transfer volume is seven times higher (0.859 vs 0.120 GB/token). Measured
 there, fill is **71% of decode**, not 5%. The prefetch ceiling was not 5%; it
 was +244%.
 
-Worse, the 384-slot row should never have been used for anything — see 1.8.
+Worse, the 384-slot row should never have been used for anything — see 1.10.
 
 **Rule:** a breakdown is a property of an operating point, not of a system. If
 the number is going to be used to rank work, measure it at the configuration
@@ -149,7 +149,45 @@ makes moving work out of frame look like removing it.
 location will show the win whether or not the win happened. Scope counters to
 the work, not to the function.
 
-### 1.6 Truncating an ordered stream is not sampling
+### 1.6 A default is a claim, and nobody audits the defaults
+
+Every throughput number this project published before Stage 1d ran with a fully
+pageable expert store. `--pin-gb` existed, defaulted to 0, and the store printed
+`0.00 GB pinned (0% of it, 0 layers)` on every single run — in a line that read
+as configuration rather than as a finding.
+
+Pinning 88% of it is **+38% decode, p=0.003**, with bytes per token and hit rate
+unchanged. It is the largest single lever found in the project, larger than
+either optimisation that was actually designed and built, and it was a flag.
+
+The tell was available from Stage 0: Q7 measured pinned transfer at 10.4 GB/s,
+the runtime was sustaining 6.08 GB/s on the fill path, and nothing compared the
+two numbers because they lived in different tools.
+
+**Rule:** before optimising, list the knobs already in the code and what they are
+set to. A default that has never been varied has never been measured, and "it
+defaults to off" is not the same as "off is right". Where a microbenchmark and a
+runtime measure the same physical thing, make one of them print the ratio.
+
+### 1.7 An advisory that fires on a sweep of its own assumption
+
+`ff-serve` grew a check that flags a saturated link: if sustained bandwidth is
+flatter than throughput across the rows, then throughput is bandwidth over
+bytes-per-token and only byte reduction can help. Correct reasoning — and it
+fired on a **pin sweep**, which varies bandwidth deliberately, off a 31%-vs-31%
+comparison, printing "the link is the constraint at ~5.2 GB/s" under a table
+demonstrating the opposite.
+
+The rule was `if gbs < tps`. Two quantities that vary by the same amount satisfy
+it half the time by chance. It now requires bandwidth to be at least twice as
+stable as throughput, which is what "roughly constant" has to mean if the
+conclusion is going to follow.
+
+**Rule:** an automated verdict inherits every assumption of the argument behind
+it. Write down what has to be *constant* for the conclusion to hold, and make
+the check refuse to fire when that thing is the variable being swept.
+
+### 1.8 Truncating an ordered stream is not sampling
 
 Q5's simulator took `--max-accesses`, applied to a trace ordered by
 `(seq_id, pos, layer)`. Truncation therefore handed the simulator the first
@@ -162,7 +200,7 @@ Fixed with `subsample_sequences()`, which samples whole sequences.
 **Rule:** if a trace is sorted by anything, a prefix is a biased sample. Subsample
 at the granularity of the unit the sort key groups by.
 
-### 1.7 Isolate phases before averaging them
+### 1.9 Isolate phases before averaging them
 
 The first `ff-serve` printed a single hit rate over prefill + decode. Meaningless:
 prefill misses are compulsory (a prefill batch touches nearly every expert), so
@@ -171,7 +209,7 @@ the blended figure mostly measures the prefill/decode token ratio.
 `_run_phase()` now snapshots the counters between phases. Prefill hit 8.3% and
 decode 46.8% at the same capacity — averaging those describes nothing.
 
-### 1.8 A resource bug reads exactly like a cache-policy finding
+### 1.10 A resource bug reads exactly like a cache-policy finding
 
 In the capacity sweep the previous iteration's `report` (12 GB host store + 3 GB
 VRAM pool) stayed alive while the next model loaded. The machine swapped.
@@ -210,7 +248,7 @@ machine left. Row one is the only row measured on a clean box. `ff-serve` now
 warns when free RAM has drifted more than 1 GB from row one's, but the real fix
 is one capacity per invocation.
 
-### 1.9 Environmental contamination
+### 1.11 Environmental contamination
 
 - **Page cache.** A disk benchmark whose scratch file is smaller than RAM
   measures the page cache. Size the file above RAM or drop caches.

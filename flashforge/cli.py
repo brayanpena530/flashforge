@@ -972,7 +972,10 @@ def serve_main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--pin-gb", type=float, default=0.0,
         help="host RAM to page-lock for async DMA. Pinned pages cannot be swapped, "
-             "so this is a hard claim on physical memory — see runtime/store.py",
+             "so this is a hard claim on physical memory — see runtime/store.py. "
+             "It defaults to 0 because it is a claim on the machine, not because "
+             "0 is a good value: measured on a bandwidth-bound decode, going from "
+             "0%% to 88%% coverage is +45%% (p=0.011) with no other change",
     )
     parser.add_argument(
         "--path", default="both",
@@ -983,6 +986,13 @@ def serve_main(argv: list[str] | None = None) -> int:
              "loop+grouped, 'all' adds prefetch. Several paths are timed back to "
              "back on the same loaded model and the same warm cache, which is the "
              "only way to attribute a difference to the path",
+    )
+    parser.add_argument(
+        "--pcie-gbps", type=float, default=None,
+        help="this machine's pinned host-to-device rate, from ff-bench's Q7 "
+             "(hardware.json -> pcie_gbps). Given it, ff-serve reports the fill "
+             "path as a fraction of it, which is the signal that transfer "
+             "optimisation is finished and only byte reduction is left",
     )
     parser.add_argument(
         "--pin-sweep", default=None,
@@ -1169,6 +1179,21 @@ def serve_main(argv: list[str] | None = None) -> int:
                   "gather buffer still have to fit; past this point the driver "
                   "pages the slot pool to host memory and these timings measure "
                   "that, not the cache. Treat this row as invalid, not as a result.")
+
+        # A default that is also the worst configuration deserves to say so.
+        # Every measurement this project published before Stage 1d ran fully
+        # pageable, and nothing pointed at it: the store reported "0.00 GB
+        # pinned" in a line nobody was reading as a performance number.
+        if not args.pin_gb and not args.pin_sweep:
+            store_gb = report.store.total_bytes / (1 << 30)
+            print(f"  NOTE: nothing is pinned. On a bandwidth-bound decode this is "
+                  f"the slowest configuration — measured at +45% from 0% to 88% "
+                  f"coverage.")
+            print(f"        Try --pin-gb {store_gb * 0.875:.0f} (the store is "
+                  f"{store_gb:.1f} GB). Pinned pages cannot be swapped, and the "
+                  "ceiling is lower")
+            print("        than free RAM suggests — ExpertStore degrades to "
+                  "pageable rather than failing.")
 
         free = hardware.available_ram_bytes()
         if free is not None:
@@ -1368,7 +1393,14 @@ def serve_main(argv: list[str] | None = None) -> int:
 
         gbs = _relspread(sustained)
         tps = _relspread([r["decode_tok_s"] for r in rows if r["decode_tok_s"]])
-        if gbs < tps:
+        # The conclusion below only follows if delivered bandwidth is roughly
+        # *constant* across these rows — that is what makes bytes the only
+        # remaining lever. A pin sweep varies bandwidth on purpose, and the
+        # first version of this check fired on one, reporting "the link is the
+        # constraint at ~5.2 GB/s" off a 31%-vs-31% comparison that showed
+        # nothing of the kind. Requiring bandwidth to be at least twice as
+        # stable as throughput is what "roughly constant" has to mean here.
+        if gbs < 0.5 * tps:
             print(f"\n[serve] sustained bandwidth varies {gbs:.0%} across these paths while "
                   f"throughput varies {tps:.0%}.")
             print(f"        The link is the constraint at ~{sum(sustained) / len(sustained):.1f} "
@@ -1463,21 +1495,37 @@ def serve_main(argv: list[str] | None = None) -> int:
     # Saying so here is cheaper than building the prefetcher and then finding out.
     timed = [r for r in rows if r.get("decode_fill_share") is not None]
     if timed:
-        print(f"\n{'slots':>7} {'path':>8} {'fill ms/tok':>12} {'fill % decode':>14} "
-              f"{'spread':>8}  prefetch ceiling")
+        print(f"\n{'slots':>7} {'path':>14} {'fill ms/tok':>12} {'fill % decode':>14} "
+              f"{'fill GB/s':>10} {'vs PCIe':>8}  no-transfer ceiling")
         for row in timed:
-            spread = ((row["decode_hi"] - row["decode_lo"]) / row["decode_tok_s"]
-                      if row["decode_tok_s"] else 0.0)
             share = row["decode_fill_share"]
+            fill_s = row["decode_fill_ms_per_token"] / 1e3
+            # Bandwidth *while transferring*, as distinct from the sustained
+            # figure in the table above, which is averaged over compute too.
+            # This one is comparable to Q7's PCIe microbenchmark, and that is
+            # the comparison that says when to stop optimising transfers.
+            fill_gbs = row["decode_gb_per_token"] / fill_s if fill_s else 0.0
+            versus = f"{fill_gbs / args.pcie_gbps:.0%}" if args.pcie_gbps else "n/a"
             # Removing a fraction s of a token speeds it by s/(1-s), not s.
             ceiling = share / (1 - share) if share < 1 else float("inf")
-            verdict = (f"+{ceiling:.0%} at best — above the {spread:.0%} spread, worth building"
-                       if ceiling > spread else
-                       f"+{ceiling:.0%} at best — under the {spread:.0%} spread, "
-                       "not measurable on this box")
-            print(f"{row['capacity']:>7} {row['path']:>8} "
+            print(f"{row['capacity']:>7} {row['path']:>14} "
                   f"{row['decode_fill_ms_per_token']:>12.1f} {share:>13.1%} "
-                  f"{spread:>7.0%}  {verdict}")
+                  f"{fill_gbs:>10.2f} {versus:>8}  +{ceiling:.0%} if transfers were free")
+
+        if args.pcie_gbps:
+            best_fill = max(
+                r["decode_gb_per_token"] / (r["decode_fill_ms_per_token"] / 1e3)
+                for r in timed if r["decode_fill_ms_per_token"]
+            )
+            if best_fill >= 0.9 * args.pcie_gbps:
+                print(f"\n[serve] the fill path is at {best_fill / args.pcie_gbps:.0%} of this "
+                      f"machine's measured pinned PCIe rate ({args.pcie_gbps:.1f} GB/s).")
+                print("        Transfers are running at hardware speed — there is nothing "
+                      "left to win by moving")
+                print("        the same bytes faster. Everything from here has to move "
+                      "*fewer* bytes: a better")
+                print("        eviction policy, experts computed on the CPU, or quantised "
+                      "weights.")
 
     best = max(rows, key=lambda r: r["decode_tok_s"])
     print(f"\n[serve] best decode {best['decode_tok_s']:.2f} tok/s at {best['capacity']} slots "
