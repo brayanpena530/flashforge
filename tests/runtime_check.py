@@ -306,6 +306,28 @@ check("gather stacks the right experts in the right shapes",
       and torch.equal(down_w[1], reference.layers[0].mlp.experts[7].down_proj.weight),
       f"gate {tuple(gate_w.shape)}, down {tuple(down_w.shape)} — down keeps its transpose")
 
+print("\nRepinning (Stage 1d)")
+
+# repin exists so pin coverage can be A/B'd on one loaded model. The thing that
+# would make it useless is silently losing weights during the reallocation, and
+# that would show up as garbage output rather than an error — so check the bytes
+# survive a full round trip, not just that the flags flipped.
+before_rows = probe_store.row(0, 3).clone()
+pinned_all = probe_store.repin(pin_gb=64.0)
+check("repin can pin the whole store",
+      pinned_all == len(probe_store.layers) and probe_store.pinned_bytes == probe_store.total_bytes,
+      f"{pinned_all} of {len(probe_store.layers)} layers, "
+      f"{probe_store.pinned_bytes / 1e6:.1f} MB")
+check("repin preserves every byte it moves",
+      torch.equal(probe_store.row(0, 3), before_rows),
+      "expert (0, 3) is bit-identical after being reallocated into pinned memory")
+
+pinned_none = probe_store.repin(pin_gb=0.0)
+check("repin is reversible",
+      pinned_none == 0 and torch.equal(probe_store.row(0, 3), before_rows),
+      "back to fully pageable, contents still identical — so a pin sweep can "
+      "revisit a level without reloading the model")
+
 print("\nPrefetch (Stage 1c)")
 
 # The GPU half of prefetch — the side stream and the events ordering it against

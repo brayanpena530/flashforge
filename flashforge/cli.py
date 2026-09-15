@@ -985,6 +985,14 @@ def serve_main(argv: list[str] | None = None) -> int:
              "only way to attribute a difference to the path",
     )
     parser.add_argument(
+        "--pin-sweep", default=None,
+        help="comma-separated --pin-gb values to compare, re-pinned in place on "
+             "the same loaded model. This is the honest way to measure pinning: "
+             "coverage is fixed at allocation time, so comparing a pinned run "
+             "against a pageable one across two invocations compares two "
+             "machines, not two configurations",
+    )
+    parser.add_argument(
         "--prefetch-k", default="0",
         help="how many predicted experts to speculatively fetch per layer, "
              "comma-separated to sweep. 0 means all top_k, which is what the "
@@ -1033,19 +1041,34 @@ def serve_main(argv: list[str] | None = None) -> int:
     # outweigh its overlap? — is only answerable if every budget is timed on the
     # same loaded model and the same warm cache. Across invocations the spread
     # is wider than the effect.
-    path_flags: dict[str, tuple[bool, int | None]] = {}
-    paths: list[str] = []
+    # `--pin-sweep` multiplies through the same way, for the same reason: pin
+    # coverage is fixed at allocation, so the only controlled comparison is one
+    # that re-pins in place between timed regions on a single loaded model.
+    kinds: list[tuple[str, bool, int | None]] = []
     for name in {
         "both": ["loop", "grouped"],
         "all": ["loop", "grouped", "prefetch"],
     }.get(args.path) or [n for n in args.path.split(",") if n.strip()]:
         if name != "prefetch":
-            path_flags[name] = (name == "grouped", None)
-            paths.append(name)
+            kinds.append((name, name == "grouped", None))
             continue
         for value in (int(v) for v in args.prefetch_k.split(",") if v.strip()):
-            label = f"pf-k{value}" if value else "pf-all"
-            path_flags[label] = (True, value or None)
+            kinds.append((f"pf-k{value}" if value else "pf-all", True, value or None))
+
+    pin_levels: list[float | None] = (
+        [float(v) for v in args.pin_sweep.split(",") if v.strip()]
+        if args.pin_sweep else [None]
+    )
+
+    # label -> (grouped, prefetch_k, pin_gb). Ordered so the first entry is
+    # always the comparison base, and so `loop` stays first when it is present:
+    # it is the bit-exact oracle and every other path is a claim against it.
+    path_flags: dict[str, tuple[bool, int | None, float | None]] = {}
+    paths: list[str] = []
+    for pin_gb in pin_levels:
+        for name, grouped, prefetch_k in kinds:
+            label = name if pin_gb is None else f"{name}/pin{pin_gb:g}"
+            path_flags[label] = (grouped, prefetch_k, pin_gb)
             paths.append(label)
 
     import gc
@@ -1172,28 +1195,53 @@ def serve_main(argv: list[str] | None = None) -> int:
                       "not the cache. Compare capacities across separate runs instead.")
 
         stats = report.cache.stats
+        applied_pin: float | None = None
         # Both paths share this model and this cache. Flipping the flag on the
         # already-installed blocks is what makes the comparison controlled: same
         # weights, same slot pool, same residency, one variable.
         for path in paths:
-            grouped, prefetch_k = path_flags[path]
+            grouped, prefetch_k, pin_gb = path_flags[path]
+            if pin_gb is not None and pin_gb != applied_pin:
+                pinned_layers = report.store.repin(pin_gb)
+                applied_pin = pin_gb
+                print(f"  re-pinned for {path}: {pinned_layers} of "
+                      f"{len(report.store.layers)} layers, "
+                      f"{report.store.pinned_bytes / (1 << 30):.2f} GB "
+                      f"({report.store.pinned_bytes / report.store.total_bytes:.0%} "
+                      "of the store)")
+                # Repinning does not move the cache, but it does replace the host
+                # pages every future fill reads from. Clear so each pin level
+                # starts from the same cold cache instead of inheriting the
+                # previous level's residency along with its warm-up.
+                report.cache.clear()
             for block in report.blocks:
                 block.grouped = grouped
                 # The last block has no next_gate, so this is a no-op there.
                 block.prefetch = prefetch_k is not None or path.startswith("pf-")
                 block.prefetch_k = prefetch_k
 
-            for _ in range(args.warmup):
-                _run_phase(model, input_ids, min(4, args.gen_tokens))
+            # A path that cannot run must not discard the paths that already
+            # did. A pin sweep found this the hard way: the highest coverage
+            # level OOM'd in its warmup and took two completed conditions and
+            # the whole summary table with it. Same lesson as writing the
+            # manifest last — the expensive part is already done by here.
+            try:
+                for _ in range(args.warmup):
+                    _run_phase(model, input_ids, min(4, args.gen_tokens))
 
-            prefill_samples, decode_samples = [], []
-            for _ in range(max(1, args.repeats)):
-                stats.reset()
-                timing = _run_phase(model, input_ids, args.gen_tokens, stats)
-                if timing["prefill_s"]:
-                    prefill_samples.append(timing["prefill_tokens"] / timing["prefill_s"])
-                if timing["decode_s"]:
-                    decode_samples.append(timing["decode_tokens"] / timing["decode_s"])
+                prefill_samples, decode_samples = [], []
+                for _ in range(max(1, args.repeats)):
+                    stats.reset()
+                    timing = _run_phase(model, input_ids, args.gen_tokens, stats)
+                    if timing["prefill_s"]:
+                        prefill_samples.append(timing["prefill_tokens"] / timing["prefill_s"])
+                    if timing["decode_s"]:
+                        decode_samples.append(timing["decode_tokens"] / timing["decode_s"])
+            except RuntimeError as exc:
+                print(f"  [{path:>7}] FAILED: {str(exc).splitlines()[0]}")
+                print(f"  [{path:>7}] skipping this path; rows already measured are kept")
+                torch.cuda.empty_cache()
+                continue
 
             # Counters come from the final pass. They are deterministic given the
             # prompt — the same experts are routed to every time — so unlike the

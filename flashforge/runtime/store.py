@@ -171,6 +171,60 @@ class ExpertStore:
             )
         return store
 
+    def repin(self, pin_gb: float) -> int:
+        """Re-allocate layers so pinned coverage matches a new budget.
+
+        Whether memory is page-locked is fixed when it is allocated, so changing
+        it means allocating again and copying. That is worth the cost for one
+        reason: pin coverage is the largest remaining lever on a system whose
+        link is saturated, and the only honest way to measure a lever is to
+        A/B it on one loaded model. Comparing a pinned invocation against a
+        pageable one would compare two machines — see troubleshoot.md 1.8, where
+        free RAM fell 12.4 -> 5.8 GB across a single sweep and the same capacity
+        measured 2.77 against 5.53 tok/s.
+
+        Peak overhead is two layers (~1.6 GB), not the whole store: each layer
+        is replaced before the next is touched.
+
+        Returns the number of layers pinned afterwards.
+        """
+        budget = int(pin_gb * (1 << 30))
+        layer_bytes = self.num_experts * self.shape.nbytes
+        claimed = 0
+
+        for layer in self.layers:
+            want = claimed + layer_bytes <= budget
+            if want:
+                claimed += layer_bytes
+            if want == self.is_pinned(layer):
+                continue
+
+            old = self._layers[layer]
+            try:
+                fresh = torch.empty_like(old, pin_memory=want)
+            except RuntimeError as exc:
+                # The pinned ceiling is well below free RAM and is reported as a
+                # CUDA OOM from a host allocation. Stop climbing, keep what is
+                # already pinned, and say so — a partly pinned store is fine.
+                log.warning(
+                    "Pinned ceiling reached at layer %d (%.2f GB pinned): %s",
+                    layer, (claimed - layer_bytes) / (1 << 30), str(exc).splitlines()[0],
+                )
+                claimed -= layer_bytes
+                budget = 0  # every later layer falls to pageable
+                continue
+
+            fresh.copy_(old)
+            self._layers[layer] = fresh
+            del old
+            if want:
+                self._pinned.add(layer)
+            else:
+                self._pinned.discard(layer)
+
+        gc.collect()
+        return len(self._pinned)
+
     # -- access ------------------------------------------------------------
 
     @property
