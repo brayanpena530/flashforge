@@ -99,24 +99,37 @@ The mechanism works and reproduces: hit rate 46.8 -> 81.8%, blocking fill down
 by two thirds, predictor precision 78.2% *in the runtime* (Q3's 0.835 was
 recall, offline, on a trace).
 
-The throughput win is **not established**. Measured against grouped three
-times, prefetch came in at **-15%, +4% and +29%** — and every one of those sat
-inside a within-path spread of 18-53%. Three runs that disagree on the sign are
-not three noisy estimates of a real effect; they are the harness saying it
-cannot resolve this. Sixty-eight ms per token left the critical path and did
-not come back as tokens.
+The throughput is **worse**, and at nine passes per path that is a measurement
+rather than a shrug:
 
-(The -15% is the unpinned run, and belongs to a different configuration: with a
-pageable store `copy_(non_blocking=True)` is synchronous, so the side stream
-could not overlap at all and the extra bytes were pure loss. Pinning is a
-prerequisite for prefetch, not an optimisation alongside it.)
+    path      decode t/s   GB/token   change   permutation test
+    grouped         6.86      0.846        -   -
+    pf-all          5.92      1.045     -14%   real, p=0.010
+    pf-k4           6.36      0.872      -7%   not distinguishable, p=0.09
 
-The live hypothesis is bandwidth, not latency. Prefetch moves 24% more bytes
-(0.859 -> 1.069 GB/token) because 22% of its guesses are wrong, and it spends
-them on a link that was already the constraint. Removing a *stall* does not help
-when the *link* is what is saturated. That predicts a specific fix — spend the
-speculation budget only on the highest-weighted predictions rather than all
-top_k — and that is where Stage 1c resumes.
+An earlier five-pass run showed the opposite — k=4 peaking at 6.50 against 5.97
+— and it was the *baseline* that was noisy, not the treatment. Nine passes put
+grouped at 6.86 with a 5.77-6.90 spread. Prefetch never beat it at any budget.
+
+WHY, AND IT IS THE USEFUL PART
+------------------------------
+Multiply each path's throughput by its bytes per token: 5.80, 6.19, 5.55 GB/s.
+Throughput varies 8% across those paths and bytes vary 11%, but the product is
+flat. That is a saturated link, and on a saturated link
+
+    decode tok/s = bandwidth / bytes-per-token
+
+Prefetch only ever raises the denominator. It did everything it promised — 80
+ms/token of blocking transfer off the critical path (116.1 -> 36.0 ms), decode
+hit rate 47.5% -> 82.4% — and lost anyway, because the side stream contends for
+the same PCIe link and that link was already the constraint.
+
+So the conclusion is not "prefetch is slow". It is that **no reordering of
+transfers can help at this operating point**; only moving fewer bytes can.
+`ff-serve` prints a sustained-GB/s column so the next person sees this without
+doing the arithmetic. The levers that remain are pinning the rest of the store
+(5.8 GB/s sustained against Q7's 10.4 GB/s pinned, with 9 of 16 layers done),
+Q7's CPU-side path, Q5's 23.4 points of Belady headroom, and quantisation.
 
 One thing the prefetcher is not allowed to be is approximate. It changes when
 weights arrive, never which ones, so `ff-serve` treats any greedy divergence as

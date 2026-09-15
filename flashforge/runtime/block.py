@@ -74,6 +74,12 @@ class CachedMoEBlock(nn.Module):
         self.prefetch = False
         self.next_gate: nn.Linear | None = None
         self.next_layer_idx: int | None = None
+        # How many of the predicted experts to actually fetch. `None` means
+        # top_k — every expert the prediction names, which is what the first
+        # version did and what made it move 24% more bytes than the demand path
+        # for a 78% precision return. Fetching fewer spends the speculation
+        # budget on the confident end of the prediction only.
+        self.prefetch_k: int | None = None
         # A prefill batch routes to every expert in the layer, and gathering all
         # 64 of OLMoE's costs 805 MB of transient VRAM — on a 6 GB card holding a
         # 3.9 GB slot pool, that is the difference between running and OOM. The
@@ -268,9 +274,17 @@ class CachedMoEBlock(nn.Module):
         cache slot, never a wrong expert. That is what makes a predictor at
         0.835 recall usable at all, and it is why this is allowed to be cheap
         and approximate when the thing it feeds is not.
+
+        `prefetch_k` truncates the guess. `topk` returns logits in descending
+        order, so taking fewer keeps the router's most confident predictions and
+        drops the marginal ones — which are also the ones most likely to be
+        wrong. The point is not to predict better but to spend less: the first
+        version fetched all `top_k` and paid full freight for a 22% error rate
+        on the link that was already the bottleneck.
         """
+        k = min(self.prefetch_k or self.top_k, self.num_experts)
         with torch.no_grad():
-            _, predicted = torch.topk(self.next_gate(hidden_states), self.top_k, dim=-1)
+            _, predicted = torch.topk(self.next_gate(hidden_states), k, dim=-1)
             return torch.bincount(predicted.reshape(-1), minlength=self.num_experts)
 
     def _run_expert(self, slot: int, x: torch.Tensor) -> torch.Tensor:

@@ -323,16 +323,41 @@ Every intermediate metric says it worked: hit rate 46.8 → 81.8%, blocking fill
 down by two thirds, predictor precision 78.2% measured in the runtime rather
 than quoted from Q3's offline recall.
 
-Decode throughput, measured against grouped three times, came in at **−15%, +4%
-and +29%** — each inside a within-path spread of 18–53%. Three runs that
-disagree on the *sign* are not three noisy estimates of a real effect. Prefetch
-is therefore **off by default** and `--path prefetch` is opt-in.
+Decode throughput is **worse**. Nine passes per path, one invocation, with a
+two-sided permutation test on the difference of medians:
 
-The live hypothesis is that removing a stall does not help when the link, not
-the ordering, is the constraint: prefetch moves 24% more bytes because 22% of
-its guesses are wrong, and it pays full price for them. That predicts a fix —
-spend the speculation budget on the highest-weighted predictions only — which is
-where this resumes.
+| path | decode t/s | GB/token | change | verdict |
+|------|-----------:|---------:|-------:|---------|
+| grouped | **6.86** | 0.846 | — | — |
+| `pf-all` (all top_k) | 5.92 | 1.045 | −14% | **real, p=0.010** |
+| `pf-k4` (top 4 only) | 6.36 | 0.872 | −7% | not distinguishable, p=0.09 |
+
+An earlier five-pass run showed the opposite — `pf-k4` peaking at 6.50 against
+5.97 — and the *baseline* was the noisy one. Prefetch never beat it at any
+speculation budget. It is **off by default**: not unproven, measured worse.
+
+### Why — and this is the part worth keeping
+
+Multiply each path's throughput by its bytes per token:
+
+```
+                tok/s   ×   GB/token   =   GB/s sustained
+grouped          6.86       0.846          5.80
+pf-all           5.92       1.045          6.19
+pf-k4            6.36       0.872          5.55
+
+throughput varies  ±8%   |   bytes vary ±11%   |   the product is flat
+```
+
+That is a saturated link. On one, `decode tok/s = bandwidth ÷ bytes-per-token`,
+and prefetch only ever raises the denominator. It did everything it promised —
+80 ms/token of blocking transfer removed from the critical path, hit rate 47.5%
+→ 82.4% — and lost anyway, because the side stream contends for the same PCIe
+link that was already the constraint.
+
+**No reordering of transfers can help at this operating point. Only moving
+fewer bytes can.** `ff-serve` now prints a sustained-GB/s column and says so
+when that column is flatter than the throughput it derives from.
 
 ### Two things that fell out of it
 
@@ -651,8 +676,8 @@ is a custom module and will need its own branch in `discover_moe()`.
 - **Stage 0** — instrumentation and routing analysis *(complete; see "Measured results")*
 - **Stage 1** — expert cache in pure PyTorch, experts in host RAM, LRU eviction. *(done: 4.41 tok/s, 12.1x over a measured offload baseline. The Stage 1b run re-measured the same loop path at 4.69 against a 0.40 baseline, 11.8x — two runs, each internally consistent; do not cross them.)*
 - **Stage 1b** — grouped expert GEMM, promoted from Stage 2 because 95% of decode was per-expert dispatch rather than transfer. *(done: 5.98 tok/s, +27% on decode, 15.0x over the baseline measured in the same run. Prefill unchanged within noise.)*
-- **Stage 1c** — async prefetch on a side stream, one layer ahead with `stale_router` (Q3). *(built and measured; see "Stage 1c" above. The "worth at most ~5%" this line used to carry came from a profile of an invalid configuration — the real budget at 256 slots is 50–71% of decode. The prefetcher removes two thirds of the blocking fill and lifts the decode hit rate to 81.8%, but the throughput win does not reproduce: −15%, +4%, +29% across three runs, all inside the spread. Off by default.)*
-- **Stage 1c, resumed** — cut the speculation's bandwidth waste before re-measuring: prefetch only the highest-weighted predictions rather than all `top_k`, since 22% of guesses are wrong and paid for in full on a link that is the bottleneck. Then the CPU path for experts under ~11 routed tokens (Q7), which is the same lever from the other side — an expert computed in place is a transfer not made.
+- **Stage 1c** — async prefetch on a side stream, one layer ahead with `stale_router` (Q3). *(built, measured, and **closed negative**. The "worth at most ~5%" this line used to carry came from a profile of an invalid configuration; the real fill budget at 256 slots is 50–71% of decode. The prefetcher works — blocking fill 116 → 36 ms/token, decode hit rate 47.5% → 82.4% — and is still 14% slower, p=0.010, because the link is saturated and it adds 23% more bytes. Off by default. The finding is that **transfer reordering cannot help here at all**; see "Stage 1c" above.)*
+- **Stage 1d — move fewer bytes.** The sustained-bandwidth column is now the design constraint: ~5.8 GB/s against Q7's 10.4 GB/s for a pinned transfer. In rough order of expected payoff: (1) **finish pinning** — only 9 of 16 layers fit under the 11.8 GB pinned ceiling today, and this is a memory-budget problem rather than a kernel one; (2) **Q7's CPU path** for experts under ~11 routed tokens, which at decode is all of them; (3) **eviction policy**, where Q5 measured 23.4 points of Belady headroom over LRU; (4) **quantised experts**, which halves bytes per miss outright.
 - **Stage 2** — Triton kernels: fused gather-GEMM, dequant, fused router. *Needs sm_80+.*
 - **Stage 3** — scale to V4-Flash, where the routed pool may not fit in RAM either and experts stream disk→RAM→GPU. *Needs RAM and NVMe headroom.* Q8 is the go/no-go: if `t_disk` needs more lookahead than Q3 shows prediction surviving, the disk tier has to be driven by a longer-horizon signal rather than per-layer routing prediction.
 

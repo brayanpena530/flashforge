@@ -369,6 +369,35 @@ check("a correct prefetch converts a miss into a hit",
       f"layer 1 cost 0 further misses (used counter is GPU-only: it increments "
       f"when an event had to be awaited, and CPU fills are already complete)")
 
+# prefetch_k is the bandwidth knob, so the thing to assert is that it actually
+# bounds bandwidth — not that it exists. A single decode token predicts top_k
+# experts per layer; capping at 2 has to issue at most 2 per layer regardless.
+budget = copy.deepcopy(model)
+budget_report = install_expert_cache(budget, capacity=L * E, device="cpu", prefetch=True)
+for block in budget_report.blocks:
+    block.prefetch_k = 2
+budget_report.cache.clear()
+budget_report.cache.stats.reset()
+with torch.no_grad():
+    budget(torch.randn(1, 1, H))
+issued = budget_report.cache.stats.prefetch_issued
+check("prefetch_k bounds how much the speculation may fetch",
+      0 < issued <= 2 * (len(budget_report.blocks) - 1),
+      f"{issued} experts fetched across {len(budget_report.blocks) - 1} predicting "
+      f"layers at prefetch_k=2 (top_k is {budget_report.spec.top_k}, so uncapped "
+      f"would allow {budget_report.spec.top_k * (len(budget_report.blocks) - 1)})")
+
+# And that capping it does not change the answer — the demand path still fetches
+# whatever the speculation declined to.
+budget_ref = copy.deepcopy(model)
+install_expert_cache(budget_ref, capacity=L * E, device="cpu")
+probe_in = torch.randn(1, 1, H)
+with torch.no_grad():
+    delta = (budget(probe_in) - budget_ref(probe_in)).abs().max().item()
+check("a truncated prefetch still produces the full answer", delta == 0.0,
+      f"max abs difference {delta:.3e} — prefetch_k changes what is speculated, "
+      "never what is computed")
+
 print("\nRouting is untouched")
 patched = copy.deepcopy(model)
 install_expert_cache(patched, capacity=L * E, device="cpu")

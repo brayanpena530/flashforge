@@ -897,6 +897,35 @@ def _measure_baseline_subprocess(args) -> float | None:
     return None
 
 
+def _permutation_p(a: list[float], b: list[float], trials: int = 20_000) -> float | None:
+    """Two-sided permutation test on the difference of medians.
+
+    This replaces "is the change bigger than the min-max spread?", which was the
+    verdict rule through Stage 1b and is wrong in a way that matters: min-max
+    *grows* with sample count, so collecting more data made the old rule harder
+    to satisfy. It punished exactly the response a noisy result calls for.
+
+    A permutation test asks the right question — could this difference of
+    medians have come from relabelling the same pool of passes? — and it
+    tightens as passes accumulate. It assumes only that passes are exchangeable
+    under the null, which is why `ff-serve` interleaves paths on one loaded
+    model rather than timing them in separate runs.
+    """
+    import random
+
+    if len(a) < 4 or len(b) < 4:
+        return None  # not enough passes for the test to say anything
+    observed = abs(_median(b) - _median(a))
+    pool = list(a) + list(b)
+    split = len(a)
+    rng = random.Random(0xF1A5)
+    atleast = sum(
+        abs(_median(shuffled[split:]) - _median(shuffled[:split])) >= observed - 1e-12
+        for shuffled in (rng.sample(pool, len(pool)) for _ in range(trials))
+    )
+    return (atleast + 1) / (trials + 1)
+
+
 def _median(values: list[float]) -> float:
     if not values:
         return 0.0
@@ -946,13 +975,22 @@ def serve_main(argv: list[str] | None = None) -> int:
              "so this is a hard claim on physical memory — see runtime/store.py",
     )
     parser.add_argument(
-        "--path", default="both", choices=["loop", "grouped", "prefetch", "both", "all"],
-        help="expert execution path. 'loop' is the bit-exact reference, one GEMM "
+        "--path", default="both",
+        help="expert execution path, or several comma-separated. 'loop' is the "
+             "bit-exact reference, one GEMM "
              "per expert; 'grouped' is Stage 1b's batched bmm; 'prefetch' is "
              "grouped plus Stage 1c's side-stream speculative fill. 'both' is "
              "loop+grouped, 'all' adds prefetch. Several paths are timed back to "
              "back on the same loaded model and the same warm cache, which is the "
              "only way to attribute a difference to the path",
+    )
+    parser.add_argument(
+        "--prefetch-k", default="0",
+        help="how many predicted experts to speculatively fetch per layer, "
+             "comma-separated to sweep. 0 means all top_k, which is what the "
+             "first prefetcher did and what made it move 24%% more bytes for a "
+             "78%% precision return. Lower values keep only the router's most "
+             "confident predictions. Each value is timed as its own path",
     )
     parser.add_argument(
         "--no-fill-timing", dest="fill_timing", action="store_false",
@@ -986,14 +1024,29 @@ def serve_main(argv: list[str] | None = None) -> int:
 
     model_id = args.model or DEFAULT_MODEL
     capacities = [int(c) for c in args.capacity.split(",") if c.strip()]
-    # name -> (grouped, prefetch). Ordered so the first entry is always the
+    # name -> (grouped, prefetch_k). Ordered so the first entry is always the
     # comparison base, and so `loop` stays first when it is present: it is the
     # bit-exact oracle and every other path is a claim measured against it.
-    path_flags = {"loop": (False, False), "grouped": (True, False), "prefetch": (True, True)}
-    paths = {
+    #
+    # `prefetch` expands into one path per --prefetch-k value, because the
+    # question that variable answers — does the speculation's bandwidth cost
+    # outweigh its overlap? — is only answerable if every budget is timed on the
+    # same loaded model and the same warm cache. Across invocations the spread
+    # is wider than the effect.
+    path_flags: dict[str, tuple[bool, int | None]] = {}
+    paths: list[str] = []
+    for name in {
         "both": ["loop", "grouped"],
         "all": ["loop", "grouped", "prefetch"],
-    }.get(args.path, [args.path])
+    }.get(args.path) or [n for n in args.path.split(",") if n.strip()]:
+        if name != "prefetch":
+            path_flags[name] = (name == "grouped", None)
+            paths.append(name)
+            continue
+        for value in (int(v) for v in args.prefetch_k.split(",") if v.strip()):
+            label = f"pf-k{value}" if value else "pf-all"
+            path_flags[label] = (True, value or None)
+            paths.append(label)
 
     import gc
 
@@ -1123,11 +1176,12 @@ def serve_main(argv: list[str] | None = None) -> int:
         # already-installed blocks is what makes the comparison controlled: same
         # weights, same slot pool, same residency, one variable.
         for path in paths:
-            grouped, prefetching = path_flags[path]
+            grouped, prefetch_k = path_flags[path]
             for block in report.blocks:
                 block.grouped = grouped
                 # The last block has no next_gate, so this is a no-op there.
-                block.prefetch = prefetching
+                block.prefetch = prefetch_k is not None or path.startswith("pf-")
+                block.prefetch_k = prefetch_k
 
             for _ in range(args.warmup):
                 _run_phase(model, input_ids, min(4, args.gen_tokens))
@@ -1190,6 +1244,10 @@ def serve_main(argv: list[str] | None = None) -> int:
                 "tokens": timing["tokens"],
                 "prefetch_issued": issued,
                 "prefetch_used": used,
+                # Kept so the verdict can run a permutation test rather than
+                # compare a change against a min-max range.
+                "prefill_samples": list(prefill_samples),
+                "decode_samples": list(decode_samples),
                 # Shares are computed against the probe pass's *own* wall clock,
                 # not the median above. Mixing a numerator from one pass with a
                 # denominator from another is how this project has produced
@@ -1234,16 +1292,42 @@ def serve_main(argv: list[str] | None = None) -> int:
                           f"{row['decode_spec_ms_per_token']:8.1f} ms/token on the side "
                           "stream, which only helps if it overlapped")
 
-    print("\n" + "=" * 100)
+    print("\n" + "=" * 112)
     print(f"{'slots':>7} {'path':>8} {'VRAM GB':>8} {'prefill t/s':>12} {'spread':>13} "
-          f"{'decode t/s':>11} {'spread':>13} {'dec hit':>8} {'GB/tok':>7}")
+          f"{'decode t/s':>11} {'spread':>13} {'dec hit':>8} {'GB/tok':>7} {'GB/s':>6}")
     for row in rows:
+        # tok/s x GB/token. If this column is flatter than either of the two
+        # columns it is the product of, the link is saturated and the system is
+        # bandwidth-bound: throughput is bandwidth / bytes-per-token, and the
+        # only lever left is bytes. Stage 1c's prefetcher was rejected on this
+        # column — it held at ~5.8 GB/s across paths whose throughput differed
+        # by 14%, which is what "reordering transfers cannot help" looks like.
         print(f"{row['capacity']:>7} {row['path']:>8} {row['vram_gb']:>8.2f} "
               f"{row['prefill_tok_s']:>12.1f} "
               f"{row['prefill_lo']:.1f}-{row['prefill_hi']:<8.1f} "
               f"{row['decode_tok_s']:>11.2f} "
               f"{row['decode_lo']:.2f}-{row['decode_hi']:<8.2f} "
-              f"{row['decode_hit_rate']:>7.1%} {row['decode_gb_per_token']:>7.3f}")
+              f"{row['decode_hit_rate']:>7.1%} {row['decode_gb_per_token']:>7.3f} "
+              f"{row['decode_tok_s'] * row['decode_gb_per_token']:>6.2f}")
+
+    # The test above compares paths pairwise. This asks a different question of
+    # the same rows: is the machine's delivered bandwidth the thing holding
+    # every path down?
+    sustained = [r["decode_tok_s"] * r["decode_gb_per_token"] for r in rows if r["decode_tok_s"]]
+    if len(sustained) > 2:
+        def _relspread(values):
+            return (max(values) - min(values)) / (sum(values) / len(values))
+
+        gbs = _relspread(sustained)
+        tps = _relspread([r["decode_tok_s"] for r in rows if r["decode_tok_s"]])
+        if gbs < tps:
+            print(f"\n[serve] sustained bandwidth varies {gbs:.0%} across these paths while "
+                  f"throughput varies {tps:.0%}.")
+            print(f"        The link is the constraint at ~{sum(sustained) / len(sustained):.1f} "
+                  "GB/s, so decode speed is bandwidth / bytes-per-token. Reordering "
+                  "transfers cannot")
+            print("        help; only moving fewer bytes can — pinning the rest of the "
+                  "store, a better eviction policy, CPU-side experts, or quantisation.")
 
     # Same rule as the capacity sweep: a path difference narrower than the
     # machine's own run-to-run spread is not a result.
@@ -1263,16 +1347,20 @@ def serve_main(argv: list[str] | None = None) -> int:
                 other = by_path.get(path)
                 if other is None:
                     continue
-                for phase, key, lo, hi in [
-                    ("prefill", "prefill_tok_s", "prefill_lo", "prefill_hi"),
-                    ("decode", "decode_tok_s", "decode_lo", "decode_hi"),
+                for phase, key, samples in [
+                    ("prefill", "prefill_tok_s", "prefill_samples"),
+                    ("decode", "decode_tok_s", "decode_samples"),
                 ]:
                     if not base[key]:
                         continue
                     change = other[key] / base[key] - 1.0
-                    noise = max((r[hi] - r[lo]) / r[key] for r in (base, other) if r[key])
-                    verdict = ("real" if abs(change) > noise
-                               else f"inside the {noise:.0%} within-path spread — no finding")
+                    p = _permutation_p(base[samples], other[samples])
+                    if p is None:
+                        verdict = "too few passes to test — raise --repeats"
+                    elif p < 0.05:
+                        verdict = f"real (p={p:.3f}, {len(base[samples])} passes each)"
+                    else:
+                        verdict = f"not distinguishable from noise (p={p:.2f})"
                     print(f"{capacity:>7} {path:>9} {phase:>8} {base[key]:>12.2f} "
                           f"{other[key]:>10.2f} {change:>+8.0%}  {verdict}")
 
@@ -1294,7 +1382,7 @@ def serve_main(argv: list[str] | None = None) -> int:
                     if diverged is None:
                         print(f"          {path}: greedy output identical for all "
                               f"{shared} tokens")
-                    elif path == "prefetch":
+                    elif path.startswith("pf-"):
                         print(f"          {path}: DIVERGES at token {diverged} of {shared}. "
                               "Prefetch does not change which experts run, so this is a "
                               "read/write race between the side stream and the compute "

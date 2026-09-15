@@ -77,16 +77,23 @@ def install_expert_cache(
     bit-exact loop path, which is what the parity tests hold to zero.
 
     `prefetch` selects Stage 1c's side-stream speculative fill. It defaults
-    **off**, which is the opposite call from `grouped` and for a documented
-    reason: its mechanism reproduces (blocking fill 100.5 -> 32.7 ms/token,
-    decode hit rate 46.8% -> 81.8%, predictor precision 78.2%) but its effect on
-    throughput does not — measured against the grouped path three times it came
-    out at -15%, +4% and +29%, every one inside a within-path spread of 18-53%.
-    A default is a claim, and that claim is not supported yet.
+    **off**, and unlike `grouped` that is not caution — it is a measurement.
+    Over nine passes it is 14% *slower* than the demand path (p=0.010), and
+    truncating it to the four most confident predictions only gets it back to
+    indistinguishable (p=0.09).
 
-    Note it requires pinned host memory to do anything at all: on a pageable
-    store `copy_(non_blocking=True)` is synchronous, so the side stream cannot
-    overlap and the speculation is pure extra bandwidth. Pass `pin_gb`.
+    The mechanism is not what failed. Blocking fill drops 116.1 -> 36.0 ms/token
+    and the decode hit rate goes 47.5% -> 82.4%. But the link is saturated at
+    ~5.8 GB/s, so decode speed is bandwidth / bytes-per-token, and speculation
+    at 78.7% precision adds 23% more bytes. Overlap cannot pay for them.
+
+    It is kept because it is correct, cheap to re-test, and the conclusion is
+    operating-point-specific: a machine with bandwidth to spare, or a store
+    pinned well past this one's 9-of-16 layers, changes the arithmetic. Run
+    `ff-serve --path grouped,prefetch` and read the sustained-GB/s column before
+    turning it on. It requires pinned host memory to do anything at all — on a
+    pageable store `copy_(non_blocking=True)` is synchronous, the side stream
+    cannot overlap, and the speculation is pure loss. Pass `pin_gb`.
     """
     device = torch.device(device)
     spec = discover_moe(model)

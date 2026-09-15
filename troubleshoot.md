@@ -64,6 +64,47 @@ The available explanation is the trap. A number that confirms a mechanism you
 already believe gets less scrutiny, not more. Put a spread on **every**
 reported median, not just the one you are currently arguing about.
 
+**But do not make the spread the verdict.** The rule above — "call it real if
+the change exceeds the min–max spread" — is right for *describing* one
+measurement and wrong for *deciding* between two, because min–max **grows with
+sample count**. Every extra pass raises the bar. Stage 1c ran the same
+prefetch-vs-grouped comparison three times, got "inside the spread — no
+finding" every time, and could never separate *the effect is absent* from *the
+test cannot see it*.
+
+`ff-serve` now runs a two-sided permutation test on the difference of medians:
+could relabelling this pool of passes produce this gap? That tightens as passes
+accumulate, which is the behaviour you want from a stopping rule. It assumes
+only that passes are exchangeable under the null — which is why the paths are
+interleaved on one loaded model and one warm cache rather than timed in
+separate invocations.
+
+**Rule:** spread describes, a test decides. If a comparison keeps coming back
+"inside the noise", check whether your noise rule is capable of ever saying
+anything else.
+
+**And the baseline is a sample too.** Within an hour of writing the rule above,
+Stage 1c ran a five-pass sweep of prefetch budgets and found a clean inverted-U:
+k=8 at 5.80, k=4 at **6.50**, k=2 at 6.22, against 5.97 for no prefetch. It
+matched a mechanism that had just been predicted out loud — fewer speculative
+fetches, higher precision, less wasted bandwidth — and every supporting column
+moved the right way. It was reported as a confirmation.
+
+Nine passes reversed it. The no-prefetch baseline read **6.86**, with a
+5.77–6.90 spread; the five-pass run had caught it low. Prefetch never beat it at
+any budget, and the full-budget version is a *measured regression* (−14%,
+p=0.010).
+
+Note what was and was not noisy: the treatments were fine. The **baseline** was
+the unstable one, and it is the number least likely to be re-examined, because
+it is not the thing being argued about. Section 1.2 already said an available
+explanation gets less scrutiny rather than more. It happens to the person who
+wrote that sentence.
+
+**Rule:** run the control at the same power as the treatment, and when a result
+confirms a mechanism you predicted in advance, that is the moment to add passes
+— not the moment to write it up.
+
 ### 1.3 Don't mix constants from different runs
 
 The README's Q7 row quoted `0.0338m + 0.774`, m\* = 18.0, disk ratio 40.1x from
@@ -295,6 +336,28 @@ help when bandwidth is the problem; it makes bandwidth worse.
 is wired up, not evidence the change is worth having. Name the end-to-end number
 before you start, and if the mechanism improves while it does not, look for the
 resource the change is *spending* rather than the one it is saving.
+
+**How that one ended.** Spending less did not rescue it either — truncating the
+speculation to the four most confident predictions raised precision to 92.8% and
+brought bandwidth back to within 3% of the demand path, and it was still not
+distinguishable from no prefetch at all (p=0.09). The answer came from a column
+nobody had thought to print:
+
+```
+            tok/s  ×  GB/token  =  GB/s sustained
+grouped      6.86     0.846        5.80
+pf-all       5.92     1.045        6.19
+pf-k4        6.36     0.872        5.55
+```
+
+Throughput varied 8%, bytes varied 11%, and the product was flat. The link was
+saturated, so `tok/s = bandwidth / bytes-per-token` and *any* scheme that adds
+bytes loses regardless of how well it overlaps them.
+
+**Rule:** when throughput and the resource it consumes move in opposite
+directions, multiply them. If the product is flatter than either factor, you
+have found the bottleneck, and every optimisation that does not reduce that
+resource is already dead — including the one you are holding.
 
 ### 4.5 Count the synchronizations, not just the milliseconds
 
