@@ -700,6 +700,52 @@ with torch.no_grad():
 check("router logits are identical", torch.equal(ref_logits, new_logits),
       "the gate is the original module, so selection cannot drift")
 
+print("\nThe widened gather (Stage 1e-2c)")
+# `gather` selects through a wider reinterpretation of the pool, because
+# `index_select` picks its kernel on element count and an int8 pool has one
+# element per byte. The speedup is not what needs guarding — a reinterpretation
+# that moved the wrong bytes would still be fast, and would produce a model that
+# is subtly, silently wrong. So: same rows, in the same order, bit for bit.
+widen_model = copy.deepcopy(model)
+widen_report = install_expert_cache(widen_model, capacity=L * E, device="cpu")
+widen_cache = widen_report.cache
+for layer in range(L):
+    widen_cache.acquire(layer, list(range(E)))
+
+picked = torch.tensor([3, 1, 0, 2, 3], dtype=torch.long)
+narrow = widen_cache._slots.index_select(0, picked)
+wide = widen_cache._gather_pool.index_select(0, picked)
+if wide.dtype is not widen_cache._shape.row_dtype:
+    wide = wide.view(widen_cache._shape.row_dtype)
+check("the widened gather selects byte-identical rows",
+      torch.equal(narrow, wide),
+      f"pool {widen_cache._slots.dtype} viewed as {widen_cache._gather_pool.dtype}; "
+      "repeats and out-of-order indices included, because both are real")
+
+check("widening never changes the row count or width",
+      widen_cache._gather_pool.shape[0] == widen_cache.capacity
+      and widen_cache._gather_pool.numel() * widen_cache._gather_pool.element_size()
+      == widen_cache._slots.numel() * widen_cache._slots.element_size(),
+      "same rows, same bytes — only the element size moves")
+
+# A row that does not divide into 8 bytes must fall back rather than raise. This
+# is the case a real model never hits and a toy shape hits immediately, which is
+# exactly why it is worth a check rather than an assertion in the constructor.
+odd = ExpertCache.__new__(ExpertCache)
+odd_pool = torch.empty((4, 6), dtype=torch.int8)
+check("an indivisible row falls back to the pool itself",
+      ExpertCache._widen(odd_pool) is odd_pool,
+      "6 bytes divides neither 8 nor 4, so there is nothing to widen to")
+check("a 4-byte-divisible row still widens",
+      ExpertCache._widen(torch.empty((4, 12), dtype=torch.int8)).dtype is torch.int32,
+      "12 bytes is 3 int32s and not a whole number of int64s")
+
+widen_cache.release()
+check("release drops the widened view too",
+      widen_cache._gather_pool.numel() == 0,
+      "it aliases the pool's storage, so leaving it behind pins every byte")
+del widen_model, widen_report, widen_cache
+
 print("\nThe loop path is bit-reproducible, and the grouped path is not")
 # This is the property that makes `tools/int8_accuracy.py` able to resolve a
 # 0.233-point agreement gap at all, and it is a property of the accumulator, not

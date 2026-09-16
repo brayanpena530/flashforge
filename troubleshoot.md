@@ -687,6 +687,60 @@ grid, and fp16's mantissa is already three bits finer than the grid it defines.
 The lever could never have moved anything. Cost of measuring: three minutes.
 Cost of building first: a day, and a docstring claiming a mechanism.
 
+### 4.13 A step is not a slope, and the difference names the cause
+
+Stage 1e-2's capacity ladder had an 18% hole in it that survived four commits as
+"an open question rather than a mechanism". Every reasonable story was about
+pressure — a bigger pool, less free VRAM, an allocator under strain — and all of
+them were wrong for the same structural reason, visible in the table the whole
+time. Splitting token time into the part blocked on fill and the part that is
+not:
+
+    slots   fill   non-fill
+      200   64.4       66.1
+      238   54.2       66.0
+      270   53.4       92.4
+      357   38.2       92.7
+
+Flat, one jump, flat. **Pressure produces slopes; thresholds produce steps.** A
+quantity that is constant on both sides of a single discontinuity is not
+responding to how much of something you have, it is responding to which side of
+a boundary you are on — so stop looking for a resource and start looking for a
+comparison. Here the boundary was `INT32_MAX`: a quantised pool is int8, so its
+element count equals its byte count, `index_select` chooses between 32- and
+64-bit index math on element count, and 8.39 MB rows cross it at 256 slots.
+
+Two things made this findable only after the decomposition. The total (`ms per
+token`) is *not* a step — fill time falls as capacity rises, so the sum is a
+messy non-monotonic curve that invites exactly the noise explanation it got. And
+the step is in the component nobody was instrumenting, because the stage was
+about bytes and every counter was about bytes.
+
+**Rule:** before theorising about a performance anomaly, decompose the measured
+total into components you can time separately, and check whether the residue is
+a step or a slope. A step means a threshold — a dtype boundary, an index width,
+a cache size, a kernel-selection heuristic — and those are found by arithmetic,
+not by sweeping harder.
+
+**Corollary:** confirm a threshold at the threshold. `tools/gather_cliff.py`
+predicted capacity 256 from `INT32_MAX / row_bytes` and then measured 254, 255,
+256, 257 — with no model, no checkpoint, two minutes. A hypothesis that names an
+exact boundary is cheap to falsify and should be falsified before anything is
+built on it.
+
+**Corollary:** when the fix is a reinterpretation rather than a computation, the
+thing to test is not that it is faster but that it is *the same*. An int64 view
+of an int8 pool that silently mis-strided would still be fast, and would produce
+a model that is quietly wrong. The check that earns its place asserts
+byte-identical rows against the slow path, with repeated and out-of-order
+indices, because both occur.
+
+**Corollary:** an optimisation aimed at one dtype may be helping the control
+too. Widening is not an int8 feature — an fp16 pool divides into int64 just as
+well — so the fp16 baseline had to be re-measured widened before any int8-vs-fp16
+ratio could be quoted again. Speeding up shared machinery invalidates every
+comparison that ran through it, in both arms.
+
 ---
 
 ## Checklist before publishing a number

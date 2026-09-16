@@ -283,12 +283,37 @@ already present on both sides and anything left over would be the runtime's.
     int8        330     2.58     1.16        7.50  61.2%   0.417     40.7
     int8        357     2.79     0.92        7.64  63.5%   0.392     38.2
 
-**Spending the savings on slots is not what pays.** The +42% prediction assumed
-357 slots; the measured peak is **+17% at 238**, where the pool is *smaller*
-than the fp16 one it replaces. The curve is not monotonic, and the 238-vs-270
-pair refuses every easy explanation: identical bytes per token, identical fill
-time, 18% different throughput. 26 ms/token goes somewhere that is neither
-transfer nor cache behaviour. That is an open question, not a mechanism.
+**That curve was not measuring capacity, and the peak at 238 was an artifact.**
+The 238-vs-270 pair refused every easy explanation — identical bytes per token,
+identical fill time, 18% different throughput — because the variable was neither
+transfer nor cache behaviour. Split the token time and it is a step function:
+non-fill time is 66.0 ms at 200 and 238 slots, 92.6 ms at 270 and above, flat on
+both sides of one jump.
+
+A quantised pool is int8, so its **element** count equals its byte count, and
+`index_select` picks between 32- and 64-bit index math on element count. At 8.39
+MB per row the pool crosses `INT32_MAX` elements at **256 slots**, the kernel
+loses its vectorised loads, and gather bandwidth halves: 116 GB/s at 255 slots,
+49 GB/s at 256. Sixteen layers of that is the whole 26 ms.
+
+`ExpertCache._widen` selects through an int64 view of the same bytes instead —
+same rows, same order, one eighth the elements — which moves the boundary to
+2,047 slots and is faster below it as well. Re-measured with it in place:
+
+    slots   raw gather   widened   change
+      238     8.37         9.15     +9.3%   p=0.0028
+      270     6.86         9.21    +34.2%   p=0.0027
+      357     7.67        10.71    +39.6%   p=0.0022
+
+Non-fill time is now 55.1-55.4 ms across all three, the curve is monotonic, and
+the operating point is **357 slots at 10.71 tok/s**. See troubleshoot.md 4.13;
+the rule is that a step means a threshold and a slope means a resource.
+
+476 slots is a *different* failure and is kept in the table for it: 97.3% hit
+rate, 0.029 GB/token, 2.5 ms fill — every intermediate metric the best in the
+project — and 1.21 tok/s, because the pool no longer fits and the driver is
+paging it. That is troubleshoot.md 1.10, and it is why capacity is chosen to
+leave headroom rather than to fill the card.
 
 **The accuracy claim did not replicate, and then the instrument was rebuilt.**
 The bar was read three times as 99.13%, 98.82% and 98.70% — not a drifting

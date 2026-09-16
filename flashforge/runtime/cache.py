@@ -147,6 +147,27 @@ class ExpertCache:
         # transpose of the other two — see ExpertStore._flatten_expert.
         self._views = {name: self._unpack(self._slots, name) for name in PROJECTIONS}
 
+        # Stage 1e-2c. `gather` reads the pool with one `index_select`, and
+        # PyTorch chooses that kernel by asking whether the tensor's **element**
+        # count fits in an int32. A quantised pool is int8, so elements are
+        # bytes, and at 8.39 MB per row it crosses INT32_MAX at 256 slots —
+        # after which the kernel falls to 64-bit index math and loses its
+        # vectorised loads. Measured on this card: 116 GB/s at 255 slots, 49
+        # GB/s at 256, flat on both sides. A step, not a slope. That step is the
+        # 26 ms/token the int8 capacity ladder could not explain.
+        #
+        # Selecting through a *wider* view of the same bytes fixes both halves
+        # of it. The rows are contiguous and identically sized, so viewing the
+        # pool as int64 divides the element count by eight — which puts the
+        # boundary out of reach until 2,047 slots — and hands the kernel eight
+        # bytes per element to move instead of one. It is faster below the old
+        # boundary too: 100 -> 280 GB/s at the shipping 238 slots. Not a
+        # workaround for the cliff so much as the gather this always wanted.
+        #
+        # `view(dtype)` needs the row to divide evenly into the wider type, and
+        # a toy row in the tests may not, so the fallback is the pool itself.
+        self._gather_pool = self._widen(self._slots)
+
         self._slot_of: OrderedDict[ExpertKey, int] = OrderedDict()
         self._free: list[int] = list(range(self.capacity))
 
@@ -191,6 +212,33 @@ class ExpertCache:
         return self.time_fills and self.device.type == "cuda"
 
     # -- geometry ----------------------------------------------------------
+
+    @staticmethod
+    def _widen(pool: torch.Tensor) -> torch.Tensor:
+        """The widest reinterpretation of `pool` that `index_select` can use.
+
+        Widest first: int64 divides the element count by eight against an int8
+        pool, int32 by four. Both are pure reinterpretations — same bytes, same
+        rows, same order — so the selected block views back to `row_dtype`
+        exactly. Returns `pool` unchanged when no width divides the row, which
+        is the only correctness question here and is why this is a fallback
+        rather than an assertion: a toy row in the tests need not be a multiple
+        of eight bytes, and the slow gather is still a *right* gather.
+        """
+        for wider in (torch.int64, torch.int32):
+            if pool.element_size() >= wider.itemsize:
+                continue
+            per = wider.itemsize // pool.element_size()
+            if pool.shape[-1] % per:
+                continue
+            try:
+                return pool.view(wider)
+            except RuntimeError:
+                # Unaligned storage or a non-contiguous last axis. Neither can
+                # happen for a freshly allocated pool, and neither is worth
+                # crashing over if it ever does.
+                continue
+        return pool
 
     @property
     def bytes_resident(self) -> int:
@@ -248,6 +296,14 @@ class ExpertCache:
         views, because the three projections of a slot are adjacent in the row —
         the same argument that made a fill one `copy_` instead of three.
 
+        It runs over `_gather_pool`, a wider reinterpretation of the same bytes.
+        See `_widen` and the note beside it in `__init__`: the element count, not
+        the byte count, is what picks the kernel, and an int8 pool has one
+        element per byte. Selecting through int64 moves the same rows at up to
+        5.4x the bandwidth and takes a 26 ms/token cliff out of the capacity
+        curve. The result is viewed straight back, so nothing below this line
+        can tell the difference.
+
         This *copies* the weights, which is the whole cost of the grouped path:
         E x 12.58 MB read and written on-device per layer. It buys the removal
         of 3E kernel launches, and Stage 1's profile said launches were 95% of
@@ -261,7 +317,9 @@ class ExpertCache:
         VRAM are unchanged — what changed is that the *input* to this copy is
         half the size, which is the whole point.
         """
-        rows = self._slots.index_select(0, slots)
+        rows = self._gather_pool.index_select(0, slots)
+        if rows.dtype is not self._shape.row_dtype:
+            rows = rows.view(self._shape.row_dtype)
         out = []
         for name in PROJECTIONS:
             weight, scale = self._unpack(rows, name)
@@ -526,11 +584,15 @@ class ExpertCache:
         at `model.to(device)` with 0 bytes free. Whatever the surviving
         reference is, dropping the pool by hand does not depend on finding it —
         `_views` and `_layout` are views over `_slots`, so clearing them first
-        is what makes the storage actually reachable for free.
+        is what makes the storage actually reachable for free. `_gather_pool` is
+        another one, and is the reason this is a list rather than a line: adding
+        a view of the pool anywhere means adding it here, or a sweep silently
+        keeps every capacity it has already measured.
         """
         self.clear()
         self._views.clear()
         self._slots = torch.empty(0, dtype=self._shape.row_dtype, device=self.device)
+        self._gather_pool = self._slots
 
     def describe(self) -> str:
         total_slots = len(self.store.layers) * self.store.num_experts

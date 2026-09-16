@@ -583,7 +583,13 @@ Every arm is p≤0.027 over nine passes, and 238 was run twice (8.32, 8.29).
 usual explanations do not survive the 238-vs-270 pair: identical bytes per token
 (0.566 vs 0.557), identical fill time (54.2 vs 53.4 ms), 18% different
 throughput. 26 ms/token goes somewhere that is neither transfer nor cache
-behaviour, and that is recorded as an open question rather than a mechanism.
+behaviour.
+
+**That was an open question for four commits, and it is now closed: the pool
+crossed `INT32_MAX` elements and `index_select` fell off its vectorised path.**
+Fixing it makes the curve monotonic, moves the operating point to 357 slots, and
+is worth +28% on its own — so the table above is the *before*. See "Stage
+1e-2c" below.
 
 **The accuracy claim did not replicate**, reading **98.76% ± 0.15%** against the
 99% bar. That verdict happened to be right and could not have been known to be.
@@ -673,6 +679,107 @@ decide whether that trade is yours to make.**
 
 ```bash
 uv run python tools/scale_precision.py
+```
+
+## Stage 1e-2c — the 26 ms/token was a tensor crossing 2 GiB
+
+Stage 1e-2 left one thing unexplained, and recorded it honestly as an open
+question: 238 and 270 int8 slots move the same bytes per token (0.566 vs 0.557),
+block on fill for the same time (54.2 vs 53.4 ms), have the same hit rate — and
+differ by 18% in throughput. It sat directly under the shipped `+17%` headline.
+
+**The first step was to stop assuming it was about capacity.** The ladder runs
+seven arms in one process in ascending order, so capacity and sweep position
+were the same variable. Crossing them — 238, 270, 238, 270, 238, 270 — separates
+them, and the answer is unambiguous:
+
+| | 238 slots | 270 slots |
+|---|---|---|
+| visit 1 / 2 / 3 | 8.23 / 8.24 / 8.17 | 6.81 / 6.77 / 6.77 |
+| pooled, 27 passes each | **8.21 tok/s** | **6.78 tok/s** |
+
+−17.4% at p<0.0001, position worth −0.7%, zero allocator retries.
+
+**Then split the token time.** This is the reading that gave it away:
+
+| slots | ms/token | fill | non-fill |
+|---:|---:|---:|---:|
+| 200 | 130.5 | 64.4 | **66.1** |
+| 238 | 120.2 | 54.2 | **66.0** |
+| 270 | 145.8 | 53.4 | **92.4** |
+| 300 | 137.0 | 44.1 | **92.9** |
+| 330 | 133.3 | 40.7 | **92.6** |
+| 357 | 130.9 | 38.2 | **92.7** |
+
+Not a curve — a **step**. Flat at 66 ms, one jump of +26.5 ms, flat at 92.6 ms.
+Pressure would grow with the pool; this does not. 357 slots pays exactly what
+270 pays while holding 1.2 GB less VRAM free.
+
+### The mechanism
+
+`ExpertCache` allocates its pool as `(capacity, row_numel)` of `row_dtype`, and
+once the store is quantised that dtype is **int8** — so the tensor's element
+count equals its byte count. `gather` reads it with one `index_select`, and
+PyTorch picks that kernel by asking whether the tensor's **elements** fit in an
+int32. At 8.39 MB per row, that boundary falls at:
+
+```
+2,147,483,647 / 8,390,656 = 255.9   ->   capacity 256
+```
+
+Which `tools/gather_cliff.py` confirms directly, with no model loaded at all:
+
+| slots | pool | elements | 32-bit? | gather | GB/s |
+|---:|---:|---:|:---:|---:|---:|
+| 254 | 1.985 GB | 2,131,226,624 | yes | 1.176 ms | 114.2 |
+| **255** | 1.993 GB | 2,139,617,280 | **yes** | **1.158 ms** | **116.0** |
+| **256** | 2.000 GB | 2,148,007,936 | **NO** | **2.712 ms** | **49.5** |
+| 257 | 2.008 GB | 2,156,398,592 | NO | 2.726 ms | 49.2 |
+
+The kernel drops to 64-bit index arithmetic and loses its vectorised loads.
+×16 layers = 23.4 ms/token predicted, 25.7 ms measured.
+
+### The fix is one view, and it is faster on both sides of the cliff
+
+The rows are contiguous and identically sized, so the pool can be
+*reinterpreted* as int64 before selecting: same bytes, same rows, same order,
+one eighth the elements. That moves the boundary out to 2,047 slots — and hands
+the kernel eight bytes per element instead of one, which turns out to matter
+more than the cliff did.
+
+| | raw gather | widened | |
+|---|---:|---:|---|
+| 238 slots | 8.37 tok/s | **9.15** | +9.3%, p=0.0028 |
+| 270 slots | 6.86 tok/s | **9.21** | +34.2%, p=0.0027 |
+| 357 slots | 7.67 tok/s | **10.71** | +39.6%, p=0.0022 |
+
+Non-fill time is now **55.1 / 55.3 / 55.4 ms** across the three — a 0.3 ms
+spread where there used to be a 26 ms step. The capacity curve is monotonic for
+the first time, and the best operating point moves from 238 to **357 slots at
+10.71 tok/s, +28% over the point this project has been shipping**.
+
+`ExpertCache._widen` falls back to the raw pool when a row does not divide
+evenly, so a toy shape in the tests degrades instead of raising, and
+`tests/runtime_check.py` holds the widened gather to byte-identical rows against
+the narrow one — including repeated and out-of-order indices.
+
+### 476 slots is a different failure, and worth keeping in the table
+
+| slots | tok/s | hit | GB/token | fill | free VRAM |
+|---:|---:|---:|---:|---:|---:|
+| 357 | 10.71 | 63.5% | 0.392 | 38.0 ms | 0.94 GB |
+| 476 | **1.21** | **97.3%** | **0.029** | **2.5 ms** | **0.00 GB** |
+
+Every intermediate metric at its best — highest hit rate in the project, 13x
+fewer bytes, a fill cost that has essentially vanished — and throughput down 9x.
+That is the driver paging the slot pool to host memory, the signature
+troubleshoot.md 1.10 was written for, and it is *not* a residue of the cliff. It
+is also the reason 357 ships rather than "as many slots as fit": at 0.94 GB free
+there is room for this benchmark's KV cache and not much else.
+
+```bash
+uv run python tools/gather_cliff.py   # the mechanism, 2 minutes, no model
+uv run python tools/slot_cliff.py     # end to end, before and after
 ```
 
 ## Stage 1e-3 — closed negative: the CPU and the link are the same wire
@@ -1107,6 +1214,7 @@ is a custom module and will need its own branch in `discover_moe()`.
   - **1e-1 — eviction policy** *(**closed negative**. Four candidates ranked offline on 147k decode lookups across 18 documents; the best beats LRU by 1.9 points, or +2.6% predicted — inside the harness's own noise. Nothing shipped. The useful finding is the conversion rate: Belady's 21.4-point gap is worth exactly 1.8x the cache, and capacity is purchasable where prophecy is not. See "Stage 1e" above.)*
   - **1e-2 — quantised experts** *(**built and measured; throughput real, accuracy short of the bar**. int8 rows with the scales packed on the end, dequant inside `cache.gather()`, bit-exact against the stock block. Decode **+17% at 238 slots, p=0.003** — but the +42% prediction assumed 357 slots and 357 measures +8%, so spending the savings on capacity is not what pays and the curve is not monotonic. Agreement replicates at **98.76% ± 0.15%**, below the 99% bar; the 99.13% that qualified the stage was one draw at a 0.31% standard error. See "Stage 1e-2" above.)*
   - **1e-2b — make the bar measurable** *(**done, and the verdict now stands at 3.3σ**. The 99% bar had been applied with an instrument that could not resolve it: agreement was scored on the grouped path, whose `index_add_` nondeterminism is a **0.411-point** floor against a 0.233-point gap, and on the built-in 24-prompt starter set rather than the 512-token corpus already in the repo — `DIVERGENCE_DOCS = 48` was silently truncated to 24, so n was 2,545, not the 5,300 its own comment claimed. Fixed both: loop path, real corpus, **24,576 positions**, with a floor control that reads exactly **100.000%**. int8 scores **98.767% ± 0.070%, failing by 0.233 points**. The point estimate moved by 0.007 — the old conclusion was right and unjustified. **fp32 scales closed negative** in three minutes with no GPU: they remove **0.00%** of the weight error, because fp16's mantissa is already three bits finer than the 256-level grid it scales. No lever remains. See "Stage 1e-2b" above.)*
+  - **1e-2c — the 26 ms/token** *(**explained, fixed, and the largest decode gain since pinning**. The int8 ladder's unexplained 18% hole was not about capacity at all: an int8 pool is one element per byte, so it crosses `INT32_MAX` **elements** at 256 slots, `index_select` falls to 64-bit index math, and gather bandwidth halves — 116 GB/s at 255 slots, 49 GB/s at 256, flat either side. A step, not a slope, which is why splitting token time into fill and non-fill found it in one reading: 66.0 ms flat, one jump, 92.6 ms flat. The fix is to select through an **int64 view of the same bytes** — same rows, same order, one eighth the elements — which moves the boundary to 2,047 slots and is faster below it too. **+9.3% at 238 slots, +34.2% at 270, +39.6% at 357** (all p<0.003), non-fill time flat at 55.1–55.4 ms, and the operating point moves to **357 slots at 10.71 tok/s, +28% over what was shipping**. 476 slots is excluded and printed: 97.3% hit rate, 0.029 GB/token, 1.21 tok/s — the driver paging the pool, which is 1.10 and not this. See "Stage 1e-2c" above.)*
   - **1e-3 — Q7's CPU path** *(**closed negative**, and qualified in two minutes with no runtime code. Q7's m\* = 10.8 does put every decode expert on the CPU's side, but near-parity means the win had to come from running both channels at once — and they are not two channels. CPU cores and the DMA engine both read expert weights out of host DRAM: overlap efficiency **η = 0.70 at best**, with the *link* absorbing the loss (40–52% of its solo rate, against the CPU's 78–94%). Best predicted gain **+7%** against a pre-committed +15% bar. int8 makes it worse — dequantising for a CPU GEMM runs 4.4x slower than reading fp32. See "Stage 1e-3" above.)*
   - **1e-4 — prefill streaming** *(**closed negative**, and the most instructive failure in the project: the mechanism worked perfectly and the premise was wrong. Fetching the next layer's whole expert set on the side stream takes prefill's hit rate 7.1% → **95.0%** and its blocking fill 78.1% → **3.0%** — the stall is gone — and prefill still drops **−25% (p=0.011)**, because a prefill layer routes to **41.4** of 64 experts, not "nearly all", so fetch-all moves 1.58x the bytes. Stage 1c's arithmetic, reproduced by its own author three stages later. Kept, off, bit-exact. See "Stage 1e-4" above.)*
 - **Stage 2** — Triton kernels: fused gather-GEMM, dequant, fused router. *Needs sm_80+.*
