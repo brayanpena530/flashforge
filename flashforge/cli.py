@@ -847,7 +847,9 @@ def _run_phase(model, input_ids, gen_tokens: int, stats=None, cache=None) -> dic
     return result
 
 
-def _corpus_input_ids(tokenizer, count: int, prompt_tokens: int) -> list:
+def _corpus_input_ids(
+    tokenizer, count: int, prompt_tokens: int, prompts_path: str | None = None
+) -> list:
     """`count` prompts from the Stage 0 corpus, interleaved across its domains.
 
     The benchmark prompt is one phrase repeated 64 times, which is right for
@@ -862,10 +864,20 @@ def _corpus_input_ids(tokenizer, count: int, prompt_tokens: int) -> list:
 
     from .prompts import load_prompts
 
+    from itertools import zip_longest
+
     by_domain: dict[str, list[str]] = {}
-    for item in load_prompts():
+    for item in load_prompts(prompts_path):
         by_domain.setdefault(item["domain"], []).append(item["text"])
-    interleaved = [text for group in zip(*by_domain.values()) for text in group]
+    # zip() silently discarded the tail of uneven domains. A user-supplied
+    # corpus need not have Stage 0's exactly balanced shape, so retain every
+    # document while still round-robining domains.
+    interleaved = [
+        text
+        for group in zip_longest(*by_domain.values())
+        for text in group
+        if text is not None
+    ]
     # Say so when the corpus cannot fill the request. `interleaved[:count]` is
     # happy to return fewer and silently did: Stage 1e-2 raised its document
     # budget from 12 to 48 *specifically* to quadruple n and make a 99% bar
@@ -876,7 +888,7 @@ def _corpus_input_ids(tokenizer, count: int, prompt_tokens: int) -> list:
         log.warning(
             "Asked for %d documents, corpus has %d. Every per-position "
             "statistic below is computed at the smaller n. For a real corpus: "
-            "python tools/make_corpus.py corpus.jsonl && --prompts corpus.jsonl",
+            "python tools/make_corpus.py corpus.jsonl && pass --prompts corpus.jsonl",
             count, len(interleaved),
         )
     return [
@@ -1025,6 +1037,43 @@ def _permutation_p(a: list[float], b: list[float], trials: int = 20_000) -> floa
     return (atleast + 1) / (trials + 1)
 
 
+def _paired_permutation_p(a: list[float], b: list[float]) -> float | None:
+    """Exact two-sided paired randomisation test on the mean difference.
+
+    One sample from each path is collected in every shuffled benchmark round.
+    Under the null, the sign of each within-round difference is exchangeable.
+    Enumerating every sign assignment gives an exact p-value for the usual
+    Stage 1 sample sizes instead of another Monte Carlo estimate. Larger runs
+    fall back to a deterministic 100k-draw approximation.
+    """
+    import random
+
+    if len(a) != len(b) or len(a) < 4:
+        return None
+    differences = [right - left for left, right in zip(a, b)]
+    observed = abs(sum(differences) / len(differences))
+    tolerance = 1e-12
+    if len(differences) <= 20:
+        assignments = 1 << len(differences)
+        atleast = 0
+        for mask in range(assignments):
+            statistic = abs(sum(
+                value if mask & (1 << i) else -value
+                for i, value in enumerate(differences)
+            ) / len(differences))
+            atleast += statistic >= observed - tolerance
+        return atleast / assignments
+
+    trials = 100_000
+    rng = random.Random(0xF1A5)
+    atleast = sum(
+        abs(sum(value if rng.getrandbits(1) else -value for value in differences)
+            / len(differences)) >= observed - tolerance
+        for _ in range(trials)
+    )
+    return (atleast + 1) / (trials + 1)
+
+
 def _median(values: list[float]) -> float:
     if not values:
         return 0.0
@@ -1089,6 +1138,18 @@ def serve_main(argv: list[str] | None = None) -> int:
              "only way to attribute a difference to the path",
     )
     parser.add_argument(
+        "--schedule", choices=["interleaved", "blocked"], default="interleaved",
+        help="timing order for multi-path comparisons. 'interleaved' shuffles "
+             "the paths within each repeat and enables an exact paired "
+             "randomisation test; 'blocked' preserves the legacy all-passes-per-"
+             "path order but does not report a p-value because time drift is "
+             "confounded with path",
+    )
+    parser.add_argument(
+        "--schedule-seed", type=int, default=61829,
+        help="seed for the reproducible per-repeat path order",
+    )
+    parser.add_argument(
         "--pcie-gbps", type=float, default=None,
         help="this machine's pinned host-to-device rate, from ff-bench's Q7 "
              "(hardware.json -> pcie_gbps). Given it, ff-serve reports the fill "
@@ -1129,6 +1190,11 @@ def serve_main(argv: list[str] | None = None) -> int:
         help="dump the trace over N prompts from the Stage 0 corpus, interleaved "
              "across its six domains, instead of the single repeated benchmark "
              "phrase. Only affects --dump-trace; the timed passes are untouched",
+    )
+    parser.add_argument(
+        "--prompts", default=None, metavar="PATH",
+        help="JSONL corpus used by --trace-prompts and --divergence-prompts "
+             "(default: the built-in Stage 0 prompts)",
     )
     parser.add_argument(
         "--divergence-prompts", type=int, default=0, metavar="N",
@@ -1191,6 +1257,11 @@ def serve_main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--gpu-memory", default="4.5GiB", help="accelerate's VRAM cap (--baseline)")
     parser.add_argument("--cache-dir", default=None)
+    parser.add_argument(
+        "--results-json", default=None, metavar="PATH",
+        help="write configuration, environment, raw samples, exact p-values, "
+             "and summary metrics as a machine-readable Stage 2 handoff",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -1218,10 +1289,18 @@ def serve_main(argv: list[str] | None = None) -> int:
     # coverage is fixed at allocation, so the only controlled comparison is one
     # that re-pins in place between timed regions on a single loaded model.
     kinds: list[tuple[str, bool, int | None]] = []
-    for name in {
+    requested_paths = {
         "both": ["loop", "grouped"],
         "all": ["loop", "grouped", "prefetch"],
-    }.get(args.path) or [n for n in args.path.split(",") if n.strip()]:
+    }.get(args.path) or [n.strip() for n in args.path.split(",") if n.strip()]
+    valid_paths = {"loop", "grouped", "prefetch", "stream"}
+    unknown_paths = sorted(set(requested_paths) - valid_paths)
+    if unknown_paths:
+        parser.error(
+            "unknown --path value(s): " + ", ".join(unknown_paths)
+            + "; choose loop, grouped, prefetch, stream, both, or all"
+        )
+    for name in requested_paths:
         # `stream` is Stage 1e-4: grouped, no speculation, but the next layer's
         # whole expert set fetched on the side stream during prefill. It runs
         # the grouped kernels, so it is paired against `grouped` — the thing it
@@ -1263,6 +1342,18 @@ def serve_main(argv: list[str] | None = None) -> int:
             return 1
         path_flags["q8sim"] = (True, None, pin_levels[-1])
         paths.append("q8sim")
+
+    if args.schedule == "interleaved" and args.pin_sweep and len(paths) > 1:
+        parser.error(
+            "--pin-sweep reallocates the host store between arms and needs its "
+            "own order-reversal control; use --schedule blocked for that "
+            "experiment (p-values will be omitted)"
+        )
+    if args.schedule == "interleaved" and args.fake_quant_int8 and len(paths) > 1:
+        parser.error(
+            "--fake-quant-int8 mutates weights irreversibly; use --schedule blocked "
+            "for that experiment (p-values will be omitted)"
+        )
 
     quant = QuantSpec(
         projections=tuple(p for p in args.quant_projections.split(",") if p.strip()),
@@ -1333,6 +1424,8 @@ def serve_main(argv: list[str] | None = None) -> int:
     )
 
     rows = []
+    comparisons = []
+    schedule_records = []
     report = None
     first_free_gb = None
     dumped_trace = False
@@ -1460,6 +1553,71 @@ def serve_main(argv: list[str] | None = None) -> int:
 
         stats = report.cache.stats
         applied_pin: float | None = None
+
+        def configure_path(path: str) -> None:
+            grouped, prefetch_k, _ = path_flags[path]
+            for block in report.blocks:
+                block.grouped = grouped
+                # The last block has no next_gate, so this is a no-op there.
+                block.prefetch = prefetch_k is not None or path.startswith("pf-")
+                block.prefetch_k = prefetch_k
+                block.stream_prefill = path.startswith("stream")
+
+        # Time one sample from every arm per round. Shuffling inside a round
+        # prevents temperature, background load, and clock drift from belonging
+        # to one path merely because it always ran first or last. The sample at
+        # index r for every path is therefore a matched observation from round r.
+        interleaved: dict[str, dict] = {}
+        failed_paths: set[str] = set()
+        if args.schedule == "interleaved" and len(paths) > 1:
+            import random
+
+            for path in paths:
+                configure_path(path)
+                try:
+                    for _ in range(args.warmup):
+                        _run_phase(model, input_ids, min(4, args.gen_tokens))
+                except RuntimeError as exc:
+                    failed_paths.add(path)
+                    print(f"  [{path:>7}] WARMUP FAILED: {str(exc).splitlines()[0]}")
+
+            rng = random.Random(args.schedule_seed + i)
+            for repeat in range(max(1, args.repeats)):
+                order = [path for path in paths if path not in failed_paths]
+                rng.shuffle(order)
+                schedule_records.append({
+                    "capacity": capacity,
+                    "quant": run_quant is not None,
+                    "round": repeat,
+                    "order": list(order),
+                })
+                for path in order:
+                    configure_path(path)
+                    try:
+                        stats.reset()
+                        timing = _run_phase(model, input_ids, args.gen_tokens, stats)
+                    except RuntimeError as exc:
+                        failed_paths.add(path)
+                        print(f"  [{path:>7}] FAILED: {str(exc).splitlines()[0]}")
+                        print(f"  [{path:>7}] dropping its partial samples")
+                        interleaved.pop(path, None)
+                        torch.cuda.empty_cache()
+                        continue
+                    sample = interleaved.setdefault(path, {
+                        "prefill_samples": [], "decode_samples": []
+                    })
+                    if timing["prefill_s"]:
+                        sample["prefill_samples"].append(
+                            timing["prefill_tokens"] / timing["prefill_s"]
+                        )
+                    if timing["decode_s"]:
+                        sample["decode_samples"].append(
+                            timing["decode_tokens"] / timing["decode_s"]
+                        )
+                    sample["timing"] = timing
+                    sample["prefetch_issued"] = stats.prefetch_issued
+                    sample["prefetch_used"] = stats.prefetch_used
+
         # Both paths share this model and this cache. Flipping the flag on the
         # already-installed blocks is what makes the comparison controlled: same
         # weights, same slot pool, same residency, one variable.
@@ -1496,35 +1654,46 @@ def serve_main(argv: list[str] | None = None) -> int:
                 print(f"  fake-quantised the store to {grain} int8: "
                       f"{error['rel_rms_error']:.3%} relative RMS weight error, "
                       f"worst channel {error['worst_channel_rel_error']:.3%}")
-            for block in report.blocks:
-                block.grouped = grouped
-                # The last block has no next_gate, so this is a no-op there.
-                block.prefetch = prefetch_k is not None or path.startswith("pf-")
-                block.prefetch_k = prefetch_k
-                block.stream_prefill = path.startswith("stream")
+            configure_path(path)
 
             # A path that cannot run must not discard the paths that already
             # did. A pin sweep found this the hard way: the highest coverage
             # level OOM'd in its warmup and took two completed conditions and
             # the whole summary table with it. Same lesson as writing the
             # manifest last — the expensive part is already done by here.
-            try:
-                for _ in range(args.warmup):
-                    _run_phase(model, input_ids, min(4, args.gen_tokens))
+            if args.schedule == "interleaved" and len(paths) > 1:
+                sample = interleaved.get(path)
+                if sample is None or len(sample["decode_samples"]) != max(1, args.repeats):
+                    print(f"  [{path:>7}] skipping incomplete interleaved arm")
+                    continue
+                prefill_samples = sample["prefill_samples"]
+                decode_samples = sample["decode_samples"]
+                timing = sample["timing"]
+                issued = sample["prefetch_issued"]
+                used = sample["prefetch_used"]
+            else:
+                try:
+                    for _ in range(args.warmup):
+                        _run_phase(model, input_ids, min(4, args.gen_tokens))
 
-                prefill_samples, decode_samples = [], []
-                for _ in range(max(1, args.repeats)):
-                    stats.reset()
-                    timing = _run_phase(model, input_ids, args.gen_tokens, stats)
-                    if timing["prefill_s"]:
-                        prefill_samples.append(timing["prefill_tokens"] / timing["prefill_s"])
-                    if timing["decode_s"]:
-                        decode_samples.append(timing["decode_tokens"] / timing["decode_s"])
-            except RuntimeError as exc:
-                print(f"  [{path:>7}] FAILED: {str(exc).splitlines()[0]}")
-                print(f"  [{path:>7}] skipping this path; rows already measured are kept")
-                torch.cuda.empty_cache()
-                continue
+                    prefill_samples, decode_samples = [], []
+                    for _ in range(max(1, args.repeats)):
+                        stats.reset()
+                        timing = _run_phase(model, input_ids, args.gen_tokens, stats)
+                        if timing["prefill_s"]:
+                            prefill_samples.append(
+                                timing["prefill_tokens"] / timing["prefill_s"]
+                            )
+                        if timing["decode_s"]:
+                            decode_samples.append(
+                                timing["decode_tokens"] / timing["decode_s"]
+                            )
+                    issued, used = stats.prefetch_issued, stats.prefetch_used
+                except RuntimeError as exc:
+                    print(f"  [{path:>7}] FAILED: {str(exc).splitlines()[0]}")
+                    print(f"  [{path:>7}] skipping this path; rows already measured are kept")
+                    torch.cuda.empty_cache()
+                    continue
 
             # Counters come from the final pass. They are deterministic given the
             # prompt — the same experts are routed to every time — so unlike the
@@ -1535,7 +1704,8 @@ def serve_main(argv: list[str] | None = None) -> int:
             # predictor's precision as the runtime actually experienced it,
             # which is the number that matters — Q3's 0.835 was recall, offline,
             # on a trace, and a speculative fetch is paid for by precision.
-            issued, used = stats.prefetch_issued, stats.prefetch_used
+            # In an interleaved run these were captured immediately after this
+            # path's final sample, before another arm reset the shared counters.
 
             # Stage 1c's bound, measured on its own pass. Recording two CUDA
             # events per layer is a perturbation, so it must not touch the
@@ -1566,7 +1736,9 @@ def serve_main(argv: list[str] | None = None) -> int:
                 # router's choices do not depend on cache state, so widening it
                 # cannot perturb anything that was measured above.
                 prompt_ids = (
-                    _corpus_input_ids(tokenizer, args.trace_prompts, args.prompt_tokens)
+                    _corpus_input_ids(
+                        tokenizer, args.trace_prompts, args.prompt_tokens, args.prompts
+                    )
                     if args.trace_prompts else []
                 ) or [input_ids]
 
@@ -1620,7 +1792,7 @@ def serve_main(argv: list[str] | None = None) -> int:
 
                 with torch.no_grad():
                     for ids in _corpus_input_ids(
-                        tokenizer, args.divergence_prompts, args.prompt_tokens
+                        tokenizer, args.divergence_prompts, args.prompt_tokens, args.prompts
                     ):
                         out = model(ids, use_cache=False)
                         corpus_logits.append(out.logits[0].detach().to("cpu", torch.float32))
@@ -1646,6 +1818,12 @@ def serve_main(argv: list[str] | None = None) -> int:
                 "decode_hit_rate": _rate(d_hits, d_misses),
                 "decode_gb_per_token": d_bytes / 1e9 / max(1, timing["decode_tokens"]),
                 "vram_gb": report.resident_bytes / (1 << 30),
+                "vram_free_gb": vram_free / (1 << 30),
+                "pinned_store_gb": report.store.pinned_bytes / (1 << 30),
+                "pinned_store_fraction": (
+                    report.store.pinned_bytes / report.store.total_bytes
+                    if report.store.total_bytes else 0.0
+                ),
                 "tokens": timing["tokens"],
                 "prefetch_issued": issued,
                 "prefetch_used": used,
@@ -1745,15 +1923,12 @@ def serve_main(argv: list[str] | None = None) -> int:
             print("        help; only moving fewer bytes can — pinning the rest of the "
                   "store, a better eviction policy, CPU-side experts, or quantisation.")
 
-    # Same rule as the capacity sweep: a path difference narrower than the
-    # machine's own run-to-run spread is not a result.
+    # Pair each change with the path it actually extends. Prefetch and streaming
+    # both modify grouped execution, so comparing either to loop mixes two
+    # changes and cannot answer whether the feature itself helped.
     if len(paths) > 1:
-        # Everything is scored against the first path requested, which is `loop`
-        # whenever it was asked for. Comparing prefetch against grouped instead
-        # would hide whichever of the two changes cancelled the other.
-        base_path = paths[0]
-        print(f"\n{'slots':>7} {'path':>9} {'phase':>8} {base_path + ' t/s':>12} "
-              f"{'this t/s':>10} {'change':>9}  verdict")
+        print(f"\n{'slots':>7} {'base':>9} {'path':>9} {'phase':>8} "
+              f"{'base t/s':>10} {'this t/s':>10} {'change':>9}  verdict")
         for capacity, run_quant in runs:
             # Matched on quantisation as well as capacity: the same capacity can
             # appear twice, once per dtype, and pairing across the two would
@@ -1762,12 +1937,17 @@ def serve_main(argv: list[str] | None = None) -> int:
                 r["path"]: r for r in rows
                 if r["capacity"] == capacity and r["quant"] == (run_quant is not None)
             }
-            base = by_path.get(base_path)
-            if base is None:
-                continue
-            for path in paths[1:]:
+            for path in paths:
                 other = by_path.get(path)
                 if other is None:
+                    continue
+                stem, separator, pin_suffix = path.partition("/pin")
+                preferred = "grouped" if (
+                    stem.startswith("pf-") or stem in ("stream", "q8sim")
+                ) else "loop"
+                base_path = preferred + (separator + pin_suffix if separator else "")
+                base = by_path.get(base_path)
+                if base is None or base_path == path:
                     continue
                 for phase, key, samples in [
                     ("prefill", "prefill_tok_s", "prefill_samples"),
@@ -1776,14 +1956,35 @@ def serve_main(argv: list[str] | None = None) -> int:
                     if not base[key]:
                         continue
                     change = other[key] / base[key] - 1.0
-                    p = _permutation_p(base[samples], other[samples])
-                    if p is None:
+                    p = (
+                        _paired_permutation_p(base[samples], other[samples])
+                        if args.schedule == "interleaved" else None
+                    )
+                    comparisons.append({
+                        "capacity": capacity,
+                        "quant": run_quant is not None,
+                        "base": base_path,
+                        "path": path,
+                        "phase": phase,
+                        "base_median_tok_s": base[key],
+                        "path_median_tok_s": other[key],
+                        "relative_change": change,
+                        "p_value": p,
+                        "test": (
+                            "exact_paired_randomisation_mean_difference"
+                            if p is not None else None
+                        ),
+                    })
+                    if args.schedule == "blocked":
+                        verdict = "p-value omitted: paths ran in time-confounded blocks"
+                    elif p is None:
                         verdict = "too few passes to test — raise --repeats"
                     elif p < 0.05:
-                        verdict = f"real (p={p:.3f}, {len(base[samples])} passes each)"
+                        verdict = f"real (exact paired p={p:.4f}, {len(base[samples])} rounds)"
                     else:
-                        verdict = f"not distinguishable from noise (p={p:.2f})"
-                    print(f"{capacity:>7} {path:>9} {phase:>8} {base[key]:>12.2f} "
+                        verdict = f"not distinguishable from noise (exact paired p={p:.4f})"
+                    print(f"{capacity:>7} {base_path:>9} {path:>9} {phase:>8} "
+                          f"{base[key]:>10.2f} "
                           f"{other[key]:>10.2f} {change:>+8.0%}  {verdict}")
 
                 # A tolerance in fp32 on a toy block says nothing about fp16 on
@@ -1865,12 +2066,25 @@ def serve_main(argv: list[str] | None = None) -> int:
         if base is None or other is None:
             continue
         change = other["decode_tok_s"] / base["decode_tok_s"] - 1.0
-        p = _permutation_p(base["decode_samples"], other["decode_samples"])
-        verdict = (
-            "too few passes to test — raise --repeats" if p is None
-            else f"real (p={p:.3f}, {len(base['decode_samples'])} passes each)"
-            if p < 0.05 else f"not distinguishable from noise (p={p:.2f})"
-        )
+        # The two capacities require reinstalling the cache and reloading the
+        # model, so their samples cannot be interleaved. A p-value here would
+        # assign all between-run drift to quantisation. Preserve the effect size
+        # and raw samples, but do not manufacture inferential certainty.
+        p = None
+        verdict = "p-value omitted: dtype/capacity arms require sequential installs"
+        comparisons.append({
+            "capacity": [base["capacity"], other["capacity"]],
+            "quant": "fp16_vs_int8",
+            "base": path,
+            "path": path,
+            "phase": "decode",
+            "base_median_tok_s": base["decode_tok_s"],
+            "path_median_tok_s": other["decode_tok_s"],
+            "relative_change": change,
+            "p_value": None,
+            "test": None,
+            "note": "sequential model/cache installs; effect size is descriptive",
+        })
         print(f"\n[serve] int8 ({path}): {base['capacity']} fp16 slots at "
               f"{base['decode_tok_s']:.2f} tok/s -> {other['capacity']} int8 slots "
               f"at {other['decode_tok_s']:.2f} tok/s, {change:+.0%}. {verdict}")
@@ -1902,19 +2116,37 @@ def serve_main(argv: list[str] | None = None) -> int:
             # figure in the table above, which is averaged over compute too.
             # This one is comparable to Q7's PCIe microbenchmark, and that is
             # the comparison that says when to stop optimising transfers.
-            fill_gbs = row["decode_gb_per_token"] / fill_s if fill_s else 0.0
-            versus = f"{fill_gbs / args.pcie_gbps:.0%}" if args.pcie_gbps else "n/a"
+            # A prefetch row's byte counter includes demand and speculative
+            # transfers while fill_s measures demand stalls only. Dividing one
+            # by the other produced impossible figures such as 339% of PCIe.
+            # Do not report that ratio unless the row has no decode speculation.
+            comparable_fill = not row["decode_spec_ms_per_token"]
+            fill_gbs = (
+                row["decode_gb_per_token"] / fill_s
+                if fill_s and comparable_fill else None
+            )
+            versus = (
+                f"{fill_gbs / args.pcie_gbps:.0%}"
+                if args.pcie_gbps and fill_gbs is not None else "n/a"
+            )
             # Removing a fraction s of a token speeds it by s/(1-s), not s.
             ceiling = share / (1 - share) if share < 1 else float("inf")
+            fill_display = f"{fill_gbs:.2f}" if fill_gbs is not None else "n/a"
+            ceiling_label = "transfers" if fill_gbs is not None else "demand transfers"
             print(f"{row['capacity']:>7} {row['path']:>14} "
                   f"{row['decode_fill_ms_per_token']:>12.1f} {share:>13.1%} "
-                  f"{fill_gbs:>10.2f} {versus:>8}  +{ceiling:.0%} if transfers were free")
+                  f"{fill_display:>10} {versus:>8}  +{ceiling:.0%} if "
+                  f"{ceiling_label} were free")
 
         if args.pcie_gbps:
-            best_fill = max(
+            comparable = [
+                r for r in timed
+                if r["decode_fill_ms_per_token"] and not r["decode_spec_ms_per_token"]
+            ]
+            best_fill = max((
                 r["decode_gb_per_token"] / (r["decode_fill_ms_per_token"] / 1e3)
-                for r in timed if r["decode_fill_ms_per_token"]
-            )
+                for r in comparable
+            ), default=0.0)
             if best_fill >= 0.9 * args.pcie_gbps:
                 print(f"\n[serve] the fill path is at {best_fill / args.pcie_gbps:.0%} of this "
                       f"machine's measured pinned PCIe rate ({args.pcie_gbps:.1f} GB/s).")
@@ -1939,6 +2171,85 @@ def serve_main(argv: list[str] | None = None) -> int:
           "touches the union of its tokens' experts,")
     print("        which at these lengths is every expert in the layer. Only the "
           "decode column is comparable to Q5's 54.5%.")
+
+    if args.results_json:
+        import datetime
+        import platform
+        import subprocess
+
+        try:
+            commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+            ).stdout.strip()
+            worktree_dirty = bool(subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip())
+        except (OSError, subprocess.CalledProcessError):
+            commit = None
+            worktree_dirty = None
+
+        device = torch.cuda.get_device_properties(torch.cuda.current_device())
+        serialisable_rows = [
+            {key: value for key, value in row.items() if key != "corpus_logits"}
+            for row in rows
+        ]
+        artifact = {
+            "schema_version": 1,
+            "artifact": "flashforge-stage1-handoff",
+            "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "git_commit": commit,
+            "git_worktree_dirty": worktree_dirty,
+            "configuration": vars(args),
+            "environment": {
+                "python": platform.python_version(),
+                "platform": platform.platform(),
+                "torch": torch.__version__,
+                "cuda_runtime": torch.version.cuda,
+                "device": device.name,
+                "compute_capability": f"sm{device.major}{device.minor}",
+                "device_memory_gb": device.total_memory / (1 << 30),
+            },
+            "measurement_design": {
+                "schedule": args.schedule,
+                "seed": args.schedule_seed,
+                "round_orders": schedule_records,
+                "path_test": (
+                    "exact paired sign-randomisation on within-round mean differences"
+                    if args.schedule == "interleaved" else None
+                ),
+                "blocked_p_values": "omitted",
+            },
+            "stage2_handoff": {
+                "hardware_target": "NVIDIA Turing sm75",
+                "shipping_baseline": "PyTorch grouped expert path using torch.bmm",
+                "implementation_strategy": [
+                    "profile and compile pure PyTorch tensor regions",
+                    "reuse workspaces and remove Python/host synchronisation",
+                    "benchmark native batched operations before custom kernels",
+                ],
+                "deferred": [
+                    "custom Triton kernels",
+                    "backends requiring sm80 or newer",
+                ],
+                "stage1_decisions": [
+                    "ship grouped execution",
+                    "keep decode prefetch off",
+                    "keep prefill streaming off",
+                    "do not ship int8 experts because accuracy missed the 99% bar",
+                ],
+                "statistical_caveat": (
+                    "Only comparisons represented by interleaved matched rounds "
+                    "receive p-values; historical blocked-order p-values are not canonical."
+                ),
+            },
+            "comparisons": comparisons,
+            "rows": serialisable_rows,
+        }
+        out_path = Path(args.results_json)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+        print(f"\n[serve] wrote Stage 2 handoff artifact -> {out_path}")
     return 0
 
 

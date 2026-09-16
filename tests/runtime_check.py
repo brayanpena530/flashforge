@@ -27,7 +27,7 @@ from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from flashforge.cli import _force_utf8_stdout  # noqa: E402
+from flashforge.cli import _force_utf8_stdout, _paired_permutation_p  # noqa: E402
 from flashforge.runtime.cache import ExpertCache  # noqa: E402
 from flashforge.runtime.patch import install_expert_cache  # noqa: E402
 from flashforge.runtime.store import ExpertStore, QuantSpec  # noqa: E402
@@ -745,6 +745,14 @@ check("release drops the widened view too",
       widen_cache._gather_pool.numel() == 0,
       "it aliases the pool's storage, so leaving it behind pins every byte")
 del widen_model, widen_report, widen_cache
+
+print("\nThe interleaved comparison test")
+check("paired randomisation p-value is exact",
+      _paired_permutation_p([1.0] * 4, [2.0] * 4) == 0.125,
+      "four same-direction pairs have 2/16 equally likely sign assignments")
+check("paired randomisation recognises the null",
+      _paired_permutation_p([1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]) == 1.0,
+      "identical matched samples have p=1")
 
 print("\nThe loop path is bit-reproducible, and the grouped path is not")
 # This is the property that makes `tools/int8_accuracy.py` able to resolve a

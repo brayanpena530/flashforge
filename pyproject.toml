@@ -5,10 +5,9 @@ description = "MoE expert-caching and prefetch research: routing traces, localit
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    # Pinned to the 2.6 line on purpose: torch 2.6 pairs with Triton 3.2, which is
-    # the last Triton release that officially supports Turing (sm_75 / RTX 2060).
-    # Stage 0 does not use Triton, but staying on 2.6 keeps Stage 2 reachable
-    # without a reinstall. Lift this pin when the GPU moves to sm_80+.
+    # Pinned to the 2.6 line on purpose: this is the validated RTX 2060 / sm_75
+    # stack. Stage 2 is PyTorch-first (bmm, compile experiments, buffer reuse),
+    # so a newer Triton or an sm_80+ GPU is not a prerequisite.
     "torch>=2.6,<2.7",
     "transformers>=4.46,<4.57",
     "accelerate>=1.0",

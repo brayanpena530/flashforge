@@ -329,7 +329,7 @@ two-sided permutation test on the difference of medians:
 | path | decode t/s | GB/token | change | verdict |
 |------|-----------:|---------:|-------:|---------|
 | grouped | **6.86** | 0.846 | — | — |
-| `pf-all` (all top_k) | 5.92 | 1.045 | −14% | **real, p=0.010** |
+| `pf-all` (all top_k) | 5.92 | 1.045 | −14% | **legacy blocked-order p=0.010; superseded by the closeout rerun** |
 | `pf-k4` (top 4 only) | 6.36 | 0.872 | −7% | not distinguishable, p=0.09 |
 
 An earlier five-pass run showed the opposite — `pf-k4` peaking at 6.50 against
@@ -397,7 +397,7 @@ ff-serve --capacity 256 --path grouped --pin-sweep 10.5,9,6,0 --baseline --repea
 | 75%    | 6.51       | 0.844    | 88.4        | 9.64      | 93% |
 | 88%    | **6.92**   | 0.846    | 91.1        | **10.16** | **98%** |
 
-**+38% decode, p=0.003, from a flag.** Bytes per token are constant to three
+**+38% decode from a flag.** Bytes per token are constant to three
 decimals and the hit rate never moves off 47.5% — the cache does identical
 work, and only the speed those bytes cross at changed. That is exactly what a
 bandwidth-bound system predicts, and it is a larger lever than Stage 1b's
@@ -621,11 +621,16 @@ two questions had been conflated.
 **The corpus.** `int8_ab.py` set `DIVERGENCE_DOCS = 48` with a comment
 explaining that 48 documents put n near 5,300 and the standard error near 0.15%,
 "which is the resolution the decision actually needs." It never got 48.
-`_corpus_input_ids` reads `load_prompts()` with no path — the **built-in
-24-prompt starter set**, whose own docstring says it is "a starting set" and
-that publishable numbers need a real corpus. `interleaved[:48]` of a 24-item
-list is 24 items, silently, and those prompts median 104 tokens against a
-128-token window. n was **2,545**, and the README said "48 documents".
+At the time, `_corpus_input_ids` read `load_prompts()` with no path — the
+**built-in 24-prompt starter set**, whose own docstring says it is "a starting
+set" and that publishable numbers need a real corpus. `interleaved[:48]` of a
+24-item list was 24 items, silently, and those prompts median 104 tokens against
+a 128-token window. n was **2,545**, and the README said "48 documents".
+
+`ff-serve --prompts corpus.jsonl` now feeds that file to both
+`--trace-prompts` and `--divergence-prompts`, keeps the tails of uneven domain
+groups, and warns with the actual corpus size if the requested count cannot be
+filled.
 
 The corpus the comment describes was already in the repo, unused by this
 measurement: `tools/make_corpus.py` writes 48 documents of 529–1,704 tokens.
@@ -918,7 +923,7 @@ ff-serve --capacity 238 --path grouped,stream --prompt-tokens 128 --repeats 7 --
 | grouped | **119.8** | 97.3–121.0 | 7.1% | 7.75 | 78.1% |
 | stream | **90.4** | 89.8–90.8 | **95.0%** | **12.21** | **3.0%** |
 
-**−25%, p=0.011.** And read the other three columns before concluding the idea
+**−25% (legacy blocked-order p=0.011).** And read the other three columns before concluding the idea
 was incoherent, because the mechanism did everything it was built to do: the
 prefill hit rate goes 7.1% → 95.0% and blocking fill goes 78.1% → **3.0%**. The
 transfer stall is gone. It was replaced by 58% more bytes.
@@ -1110,6 +1115,29 @@ time the emulation. A production CPU path would use a quantised kernel and beat
 it, so the fitted β is an **upper bound** — which makes any "CPU execution is
 worth it" conclusion drawn from it conservative.
 
+## Stage 1 closeout rerun
+
+The original throughput p-values used blocked timing: all repeats for one path,
+then all repeats for the next. That makes path labels inseparable from time
+drift. The canonical closeout run instead used nine matched rounds at 238 fp16
+slots, shuffled the path order inside every round, and enumerated all `2^9`
+sign assignments for an exact paired randomisation test.
+
+| comparison | phase | change | exact paired p | decision |
+|---|---|---:|---:|---|
+| loop → grouped | decode | **+34%** | **0.00390625** | ship grouped |
+| grouped → full prefetch | decode | **−12%** | **0.00390625** | keep off |
+| grouped → full prefetch | prefill | +1% | 0.20703125 | no finding |
+| grouped → prefill stream | prefill | **−28%** | **0.00390625** | keep off |
+| grouped → prefill stream | decode | +0% | 0.80859375 | unchanged as intended |
+
+The raw samples, exact round order, environment, configuration, summaries, and
+p-values are tracked in
+[`results/stage1_handoff.json`](results/stage1_handoff.json). Blocked pin sweeps
+and sequential fp16/int8 installs no longer receive p-values from `ff-serve`;
+their effect sizes remain descriptive evidence. This does not rescue int8,
+which independently missed the 99% accuracy gate.
+
 ## Setup
 
 ```bash
@@ -1118,9 +1146,9 @@ uv sync
 
 `torch` comes from the PyTorch cu124 index (configured in `pyproject.toml`) —
 the default PyPI wheels for Windows are CPU-only. The torch pin is `>=2.6,<2.7`
-**on purpose**: torch 2.6 pairs with Triton 3.2, the last Triton release that
-officially supports Turing (sm_75 / RTX 2060). Triton dropped Turing in 3.3.
-Lift the pin once the GPU is sm_80+.
+**on purpose**: it is the validated Turing (sm_75 / RTX 2060) stack. Stage 2 is
+PyTorch-first, so it does not depend on moving to sm_80+ or adopting a newer
+Triton release.
 
 ### Put the model cache on a roomy drive first
 
@@ -1176,6 +1204,9 @@ Useful flags:
 | `--baseline` | serve | also time accelerate's `device_map="auto"` offload, same prompt and harness |
 | `--repeats N` | serve | timed passes per capacity, reported as median (min–max). Default 3 |
 | `--pin-gb N` | serve | host RAM to page-lock for async DMA. Pinned pages cannot be swapped |
+| `--schedule interleaved` | serve | shuffle paths within each repeat; enables exact paired p-values (the default) |
+| `--prompts file.jsonl` | serve | real corpus for trace and divergence checks |
+| `--results-json path` | serve | persist configuration, environment, raw samples, comparisons, and p-values |
 
 The built-in prompt set is a starting point sized for a few thousand tokens.
 For numbers you intend to trust, point `--prompts` at a real corpus — a couple
@@ -1259,21 +1290,49 @@ Router discovery is structural, not model-specific: it looks for
 `num_experts`. That covers OLMoE and Qwen3-MoE unchanged. DeepSeek's `MoEGate`
 is a custom module and will need its own branch in `discover_moe()`.
 
+### Stage 2 implementation direction (sm_75)
+
+The current grouped path is already the reusable PyTorch kernel path: it packs
+routed experts and calls `torch.bmm` three times per layer. Stage 2 keeps that
+as the shipping baseline and tests, in order:
+
+1. `torch.compile` around pure tensor regions that do not contain cache
+   mutation, `.tolist()`, or host synchronisation;
+2. workspace reuse and removal of repeated allocation, sorting, and Python
+   dispatch;
+3. native batched operations and compiled gather/dequant compositions, each
+   retained only when an interleaved benchmark shows a gain.
+
+[AirLLM](https://github.com/lyogavin/airllm) is useful prior art for checkpoint
+streaming and hook-driven offload,
+but it does not provide a fused sm_75 expert compute kernel to transplant; this
+runtime's contiguous store and slot cache are already the more specialised
+mechanism. Transformers' newer
+[MoE ExpertsInterface](https://github.com/huggingface/transformers/blob/main/docs/source/en/experts_interface.md)
+is worth revisiting during a future stack upgrade: its `batched_mm` backend
+follows the same `torch.bmm` direction, while `grouped_mm` requires a newer
+PyTorch and the advertised specialised backends target newer GPU architectures.
+Custom Triton remains a later option, not a Stage 2 prerequisite.
+
 ## Roadmap
 
 - **Stage 0** — instrumentation and routing analysis *(complete; see "Measured results")*
 - **Stage 1** — expert cache in pure PyTorch, experts in host RAM, LRU eviction. *(done: 4.41 tok/s, 12.1x over a measured offload baseline. The Stage 1b run re-measured the same loop path at 4.69 against a 0.40 baseline, 11.8x — two runs, each internally consistent; do not cross them.)*
 - **Stage 1b** — grouped expert GEMM, promoted from Stage 2 because 95% of decode was per-expert dispatch rather than transfer. *(done: 5.98 tok/s, +27% on decode, 15.0x over the baseline measured in the same run. Prefill unchanged within noise.)*
-- **Stage 1c** — async prefetch on a side stream, one layer ahead with `stale_router` (Q3). *(built, measured, and **closed negative**. The "worth at most ~5%" this line used to carry came from a profile of an invalid configuration; the real fill budget at 256 slots is 50–71% of decode. The prefetcher works — blocking fill 116 → 36 ms/token, decode hit rate 47.5% → 82.4% — and is still 14% slower, p=0.010, because the link is saturated and it adds 23% more bytes. Off by default. The finding is that **transfer reordering cannot help here at all**; see "Stage 1c" above.)*
-- **Stage 1d — pinning** *(done, and the largest single gain in the project: **+38% decode, p=0.003**, from a flag that already existed and defaulted to off. 19.5x the measured baseline. The fill path now runs at 98% of this card's pinned PCIe rate, so transfer optimisation is **finished** — see "Stage 1d" above.)*
+- **Stage 1c** — async prefetch on a side stream, one layer ahead with `stale_router` (Q3). *(built, measured, and **closed negative**. The closeout rerun measures full prefetch at **−12% decode, exact paired p=0.00390625**. It works — blocking fill falls and hit rate rises — but saturates the same link with extra speculative bytes. Off by default.)*
+- **Stage 1d — pinning** *(done, and the largest single gain in the project: **+38% decode**, replicated in ascending and descending order, from a flag that already existed and defaulted to off. The historical blocked-order p-value is retired. 19.5x the measured baseline. The fill path reaches about 98% of this card's pinned PCIe rate, so transfer optimisation is **finished**.)*
 - **Stage 1e — move fewer bytes.** Transfer is still 60% of a decode token, so eliminating it would be +150%, and every way of moving the same bytes *faster* is now exhausted.
   - **1e-1 — eviction policy** *(**closed negative**. Four candidates ranked offline on 147k decode lookups across 18 documents; the best beats LRU by 1.9 points, or +2.6% predicted — inside the harness's own noise. Nothing shipped. The useful finding is the conversion rate: Belady's 21.4-point gap is worth exactly 1.8x the cache, and capacity is purchasable where prophecy is not. See "Stage 1e" above.)*
-  - **1e-2 — quantised experts** *(**built and measured; throughput real, accuracy short of the bar**. int8 rows with the scales packed on the end, dequant inside `cache.gather()`, bit-exact against the stock block. Decode **+47% at 357 slots, p=0.003**, at the *same 2.79 GB pool* the fp16 control uses — and prefill +48%. The first reading of this said +17% at 238 with a non-monotonic curve and a wrong +42% prediction; all three were the gather cliff of 1e-2c, and the prediction was right. Agreement replicates at **98.76% ± 0.15%**, below the 99% bar; the 99.13% that qualified the stage was one draw at a 0.31% standard error. See "Stage 1e-2" above.)*
+  - **1e-2 — quantised experts** *(**built and measured; throughput promising, accuracy short of the bar**. int8 rows with the scales packed on the end, dequant inside `cache.gather()`, bit-exact against the stock block holding the same quantised weights. Decode measured **+47% at 357 slots** at the same 2.79 GB pool, but fp16/int8 require sequential installs, so the old p-value is retired. Agreement replicates at **98.76% ± 0.15%**, below the 99% bar, and therefore int8 does not ship.)*
   - **1e-2b — make the bar measurable** *(**done, and the verdict now stands at 3.3σ**. The 99% bar had been applied with an instrument that could not resolve it: agreement was scored on the grouped path, whose `index_add_` nondeterminism is a **0.411-point** floor against a 0.233-point gap, and on the built-in 24-prompt starter set rather than the 512-token corpus already in the repo — `DIVERGENCE_DOCS = 48` was silently truncated to 24, so n was 2,545, not the 5,300 its own comment claimed. Fixed both: loop path, real corpus, **24,576 positions**, with a floor control that reads exactly **100.000%**. int8 scores **98.767% ± 0.070%, failing by 0.233 points**. The point estimate moved by 0.007 — the old conclusion was right and unjustified. **fp32 scales closed negative** in three minutes with no GPU: they remove **0.00%** of the weight error, because fp16's mantissa is already three bits finer than the 256-level grid it scales. No lever remains. See "Stage 1e-2b" above.)*
   - **1e-2c — the 26 ms/token** *(**explained, fixed, and the largest decode gain since pinning**. The int8 ladder's unexplained 18% hole was not about capacity at all: an int8 pool is one element per byte, so it crosses `INT32_MAX` **elements** at 256 slots, `index_select` falls to 64-bit index math, and gather bandwidth halves — 116 GB/s at 255 slots, 49 GB/s at 256, flat either side. A step, not a slope, which is why splitting token time into fill and non-fill found it in one reading: 66.0 ms flat, one jump, 92.6 ms flat. The fix is to select through an **int64 view of the same bytes** — same rows, same order, one eighth the elements — which moves the boundary to 2,047 slots and is faster below it too. **+9.3% at 238 slots, +34.2% at 270, +39.6% at 357** (all p<0.003), non-fill time flat at 55.1–55.4 ms, and the operating point moves to **357 slots**. Re-run end to end in one process, int8 at 357 slots now beats the fp16 control by **+47% decode and +48% prefill at identical VRAM** (2.79 GB either way), on a curve that is monotonic in capacity for the first time — so the "+17%, and spending the savings on slots is not what pays" this stage shipped with was the cliff talking, and 1e-2's retracted +42% prediction was right all along. 476 slots is excluded and printed: 97.3% hit rate, 0.029 GB/token, 1.21 tok/s — the driver paging the pool, which is 1.10 and not this. See "Stage 1e-2c" above.)*
   - **1e-3 — Q7's CPU path** *(**closed negative**, and qualified in two minutes with no runtime code. Q7's m\* = 10.8 does put every decode expert on the CPU's side, but near-parity means the win had to come from running both channels at once — and they are not two channels. CPU cores and the DMA engine both read expert weights out of host DRAM: overlap efficiency **η = 0.70 at best**, with the *link* absorbing the loss (40–52% of its solo rate, against the CPU's 78–94%). Best predicted gain **+7%** against a pre-committed +15% bar. int8 makes it worse — dequantising for a CPU GEMM runs 4.4x slower than reading fp32. See "Stage 1e-3" above.)*
-  - **1e-4 — prefill streaming** *(**closed negative**, and the most instructive failure in the project: the mechanism worked perfectly and the premise was wrong. Fetching the next layer's whole expert set on the side stream takes prefill's hit rate 7.1% → **95.0%** and its blocking fill 78.1% → **3.0%** — the stall is gone — and prefill still drops **−25% (p=0.011)**, because a prefill layer routes to **41.4** of 64 experts, not "nearly all", so fetch-all moves 1.58x the bytes. Stage 1c's arithmetic, reproduced by its own author three stages later. Kept, off, bit-exact. See "Stage 1e-4" above.)*
-- **Stage 2** — Triton kernels: fused gather-GEMM, dequant, fused router. *Needs sm_80+.*
+  - **1e-4 — prefill streaming** *(**closed negative**. The closeout rerun measures **−28% prefill, exact paired p=0.00390625**, while decode is unchanged (p=0.80859375). Fetching the next layer's whole expert set raises prefill hit rate to ~95% and removes the stall, but moves about 1.58x the bytes. Kept, off, bit-exact.)*
+- **Stage 2** — PyTorch-first optimisation on the existing sm_75 hardware:
+  compile the stable tensor regions, reuse workspaces, reduce host sync and
+  allocation, and benchmark native batched gather/dequant compositions against
+  the current `torch.bmm` baseline. Custom Triton is deferred until these
+  measurements leave a kernel-sized gap.
 - **Stage 3** — scale to V4-Flash, where the routed pool may not fit in RAM either and experts stream disk→RAM→GPU. *Needs RAM and NVMe headroom.* Q8 is the go/no-go: if `t_disk` needs more lookahead than Q3 shows prediction surviving, the disk tier has to be driven by a longer-horizon signal rather than per-layer routing prediction.
 
 ### Prior art worth reading before Stage 1
