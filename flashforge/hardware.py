@@ -332,15 +332,9 @@ def break_even_tokens(fit: LinearCost, gpu_path_ms: float) -> float:
 # Q8 — storage read curve
 # ==========================================================================
 
-def total_ram_bytes() -> int | None:
-    """Physical RAM, or None where we cannot determine it without a dependency.
-
-    Used only to warn when the scratch file is small enough to sit entirely in
-    the page cache. Getting this wrong is the single easiest way to produce a
-    confident, wrong Q8 — a cached read reports DRAM bandwidth, which on a
-    laptop lands squarely inside the plausible range for a good NVMe drive.
-    """
-    try:  # Windows
+def _windows_memory_status():
+    """GlobalMemoryStatusEx, or None off Windows / on failure."""
+    try:
         import ctypes
 
         class _MemStatus(ctypes.Structure):
@@ -359,12 +353,54 @@ def total_ram_bytes() -> int | None:
         status = _MemStatus()
         status.dwLength = ctypes.sizeof(_MemStatus)
         if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
-            return int(status.ullTotalPhys)
+            return status
     except (AttributeError, OSError, ValueError):
         pass
+    return None
+
+
+def total_ram_bytes() -> int | None:
+    """Physical RAM, or None where we cannot determine it without a dependency.
+
+    Used to warn when the scratch file is small enough to sit entirely in the
+    page cache. Getting this wrong is the single easiest way to produce a
+    confident, wrong Q8 — a cached read reports DRAM bandwidth, which on a
+    laptop lands squarely inside the plausible range for a good NVMe drive.
+    """
+    status = _windows_memory_status()
+    if status is not None:
+        return int(status.ullTotalPhys)
 
     try:  # Linux / macOS
         return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+def available_ram_bytes() -> int | None:
+    """Free physical RAM right now, or None if it cannot be determined.
+
+    Stage 1 reports this between capacity sweeps. The expert store is 12 GB on
+    a machine with ~15 GB free, so a leaked store from a previous iteration
+    does not raise — it quietly pushes the next iteration into swap, and the
+    throughput figure comes out low for a reason that has nothing to do with
+    the cache policy being measured. Printing the number makes that visible in
+    the log instead of inviting a wrong conclusion.
+    """
+    status = _windows_memory_status()
+    if status is not None:
+        return int(status.ullAvailPhys)
+
+    try:  # Linux
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+
+    try:  # macOS and other POSIX: free pages only, so an underestimate
+        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES"))
     except (AttributeError, ValueError, OSError):
         return None
 

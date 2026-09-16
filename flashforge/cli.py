@@ -750,5 +750,1380 @@ def bench_main(argv: list[str] | None = None) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# ff-serve
+# --------------------------------------------------------------------------
+
+def _cuda_sync() -> None:
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _run_phase(model, input_ids, gen_tokens: int, stats=None, cache=None) -> dict:
+    """Time prefill and decode, keeping their cache statistics apart.
+
+    Blending the two produces a hit rate that means nothing. Prefill touches
+    the union of experts over every token in the batch — past a few dozen
+    tokens that is every expert in the layer, so the misses are compulsory and
+    no cache size changes them. Decode touches exactly top_k per layer, which
+    is the regime Q5's capacity sweep actually modelled. Only the decode number
+    is comparable to Stage 0's 54.5%.
+    """
+    import time
+
+    import torch
+
+    def snapshot():
+        if stats is None:
+            return (0, 0, 0)
+        return (stats.hits, stats.misses, stats.bytes_fetched)
+
+    def drain():
+        # Synchronizes, so it only ever runs immediately after a timed region
+        # has already been synced and closed out.
+        return cache.drain_fill_ms() if cache is not None else (0.0, 0.0)
+
+    def log_len():
+        log = getattr(cache, "access_log", None) if cache is not None else None
+        return len(log) if log is not None else 0
+
+    with torch.no_grad():
+        before = snapshot()
+        drain()
+        _cuda_sync()
+        start = time.perf_counter()
+        out = model(input_ids, use_cache=True)
+        _cuda_sync()
+        prefill_s = time.perf_counter() - start
+        after_prefill = snapshot()
+
+        result = {
+            "prefill_s": prefill_s,
+            "prefill_tokens": int(input_ids.shape[1]),
+            "prefill_counts": tuple(a - b for a, b in zip(after_prefill, before)),
+            "prefill_fill_ms": drain()[0],
+            "decode_s": 0.0,
+            "decode_tokens": 0,
+            "decode_counts": (0, 0, 0),
+            "decode_fill_ms": 0.0,
+            "decode_spec_ms": 0.0,
+            # Where decode starts inside cache.access_log, so a dumped trace can
+            # be sliced to the phase it describes. Prefill touches nearly every
+            # expert in every layer, so leaving it in would rank eviction
+            # policies on compulsory misses no policy can avoid.
+            "decode_log_start": log_len(),
+            "tokens": [],
+        }
+        if gen_tokens <= 0:
+            return result
+
+        past = out.past_key_values
+        next_id = out.logits[:, -1:].argmax(-1)
+
+        # Decoding is greedy, so the token sequence is a deterministic function
+        # of the weights. Two execution paths that agree numerically produce the
+        # same ids; the first id they differ on is where the grouped path's lost
+        # bit-exactness became visible output rather than a rounding difference.
+        # The ids stay on the device inside the loop. Calling .item() per token
+        # would force a synchronize every step and make this harness measure
+        # itself instead of the model.
+        tokens = [next_id]
+        _cuda_sync()
+        start = time.perf_counter()
+        for _ in range(gen_tokens):
+            out = model(next_id, past_key_values=past, use_cache=True)
+            past = out.past_key_values
+            next_id = out.logits[:, -1:].argmax(-1)
+            tokens.append(next_id)
+        _cuda_sync()
+        result["decode_s"] = time.perf_counter() - start
+        result["decode_tokens"] = gen_tokens
+        result["decode_counts"] = tuple(a - b for a, b in zip(snapshot(), after_prefill))
+        result["decode_fill_ms"], result["decode_spec_ms"] = drain()
+        result["tokens"] = [int(t.flatten()[0]) for t in tokens]
+
+    return result
+
+
+def _corpus_input_ids(tokenizer, count: int, prompt_tokens: int) -> list:
+    """`count` prompts from the Stage 0 corpus, interleaved across its domains.
+
+    The benchmark prompt is one phrase repeated 64 times, which is right for
+    timing — it fixes the sequence length — and narrow for anything fitted or
+    validated against the model's *output*. A repeated phrase has a highly
+    predictable continuation and therefore wide logit margins, so it is the
+    easiest possible test for a numerical change to survive. Round-robin the
+    domains so a small budget is a sample of the corpus rather than its first
+    topic; see troubleshoot.md 1.8.
+    """
+    import torch  # noqa: F401  (tokenizer returns torch tensors)
+
+    from .prompts import load_prompts
+
+    by_domain: dict[str, list[str]] = {}
+    for item in load_prompts():
+        by_domain.setdefault(item["domain"], []).append(item["text"])
+    interleaved = [text for group in zip(*by_domain.values()) for text in group]
+    # Say so when the corpus cannot fill the request. `interleaved[:count]` is
+    # happy to return fewer and silently did: Stage 1e-2 raised its document
+    # budget from 12 to 48 *specifically* to quadruple n and make a 99% bar
+    # readable, got 24 because the built-in set has 24, and then reported "48
+    # documents" in the README against a standard error twice what it thought
+    # it had. A slice is not a request; it is a ceiling that agrees with you.
+    if count > len(interleaved):
+        log.warning(
+            "Asked for %d documents, corpus has %d. Every per-position "
+            "statistic below is computed at the smaller n. For a real corpus: "
+            "python tools/make_corpus.py corpus.jsonl && --prompts corpus.jsonl",
+            count, len(interleaved),
+        )
+    return [
+        tokenizer(text, return_tensors="pt").input_ids[:, :prompt_tokens].to("cuda")
+        for text in interleaved[:count]
+    ]
+
+
+def _rate(hits: int, misses: int) -> float:
+    total = hits + misses
+    return hits / total if total else 0.0
+
+
+_BASELINE_MARKER = "[baseline-decode-tok-s]"
+
+
+def _measure_baseline_subprocess(args) -> float | None:
+    """Run the accelerate-offload baseline in a child process, and read it back.
+
+    A child rather than a function call, because the two configurations cannot
+    coexist. accelerate's offload keeps the weights it has moved to CPU alive
+    behind its hooks, and `del model` plus `empty_cache()` does not reliably
+    return them — measured here as a segfault when the 13.8 GB CPU load that
+    follows ran into what the baseline had not released. Process exit is the
+    only teardown that is actually guaranteed.
+
+    This is still a like-for-like comparison: same prompt, same harness, same
+    `_run_phase`, same repeat count. What made the *old* baseline incomparable
+    was the tracing hooks and a different prompt length, not the process
+    boundary.
+    """
+    import subprocess
+
+    forwarded = [
+        "--baseline-only",
+        "--model", args.model or "",
+        "--prompt-tokens", str(args.prompt_tokens),
+        "--gen-tokens", str(args.gen_tokens),
+        "--repeats", str(args.repeats),
+        "--dtype", args.dtype,
+        "--gpu-memory", args.gpu_memory,
+    ]
+    if not args.model:
+        forwarded = forwarded[:1] + forwarded[3:]
+    if args.cache_dir:
+        forwarded += ["--cache-dir", args.cache_dir]
+
+    command = [
+        sys.executable, "-c",
+        "import sys; from flashforge.cli import serve_main; sys.exit(serve_main())",
+        *forwarded,
+    ]
+    log.info("Measuring the baseline in a subprocess...")
+    completed = subprocess.run(command, capture_output=True, text=True)
+    sys.stdout.write(completed.stdout)
+    if completed.returncode != 0:
+        log.warning("Baseline subprocess failed (%d); continuing without it.\n%s",
+                    completed.returncode, completed.stderr[-2000:])
+        return None
+
+    for line in completed.stdout.splitlines():
+        if line.startswith(_BASELINE_MARKER):
+            return float(line.split()[-1])
+    log.warning("Baseline subprocess produced no result line; continuing without it.")
+    return None
+
+
+def _teacher_forced(base_logits: list, other_logits: list) -> str:
+    """Score one path against another on next-token prediction. "" if unscorable.
+
+    An approximation cannot pass a bit-exactness test, so asking it to is a test
+    nothing can fail informatively. This is the bar for a path that is *meant*
+    to change the numbers: does it predict the same next token, position by
+    position, on real text?
+
+    Teacher-forced on purpose. The first version of this compared greedy
+    generations and was the wrong instrument — divergence compounds, so it
+    measures how early anything changed rather than how much, and it costs one
+    forward per token instead of one per document. Agreement and KL are
+    pre-committed thresholds (99%, 0.01 nats) so the verdict is not chosen after
+    seeing the number; the bar itself was checked against a control that already
+    ships, loop-vs-grouped, which scored 99.42%.
+    """
+    if not base_logits or len(base_logits) != len(other_logits):
+        return ""
+
+    agreed = positions = 0
+    kl_total = 0.0
+    worst_doc = 1.0
+    for mine, theirs in zip(base_logits, other_logits):
+        match = (mine.argmax(-1) == theirs.argmax(-1)).sum().item()
+        agreed += match
+        positions += mine.shape[0]
+        worst_doc = min(worst_doc, match / mine.shape[0])
+        # Logits may be stored fp16 to keep 48 documents in host RAM; the
+        # softmax and the KL are computed in fp32 regardless, because an fp16
+        # log_softmax over a 50k vocabulary loses more than the quantity being
+        # measured.
+        p = mine.float().log_softmax(-1)
+        q = theirs.float().log_softmax(-1)
+        kl_total += float((p.exp() * (p - q)).sum())
+
+    agreement = agreed / positions
+    kl = kl_total / positions
+    ok = agreement >= 0.99 and kl < 0.01
+    # The sampling error travels with the number. A bar applied to a statistic
+    # whose resolution is unstated is a coin flip dressed as a decision — the
+    # first pass of this measurement read 98.72% against a 99% bar at an SE of
+    # 0.31%, which is not a failure, it is an unreadable instrument.
+    stderr = (agreement * (1 - agreement) / positions) ** 0.5
+    return (
+        f"teacher-forced top-1 agreement {agreement:.2%} +/- {stderr:.2%} over "
+        f"{positions:,} positions in {len(base_logits)} documents, worst "
+        f"document {worst_doc:.2%}, mean KL {kl:.5f} nats — "
+        f"{'PASSES' if ok else 'FAILS'} the >=99% / <0.01 bar"
+        + (" (inside one SE of it)" if abs(agreement - 0.99) < stderr else "")
+    )
+
+
+def _permutation_p(a: list[float], b: list[float], trials: int = 20_000) -> float | None:
+    """Two-sided permutation test on the difference of medians.
+
+    This replaces "is the change bigger than the min-max spread?", which was the
+    verdict rule through Stage 1b and is wrong in a way that matters: min-max
+    *grows* with sample count, so collecting more data made the old rule harder
+    to satisfy. It punished exactly the response a noisy result calls for.
+
+    A permutation test asks the right question — could this difference of
+    medians have come from relabelling the same pool of passes? — and it
+    tightens as passes accumulate. It assumes only that passes are exchangeable
+    under the null, which is why `ff-serve` interleaves paths on one loaded
+    model rather than timing them in separate runs.
+    """
+    import random
+
+    if len(a) < 4 or len(b) < 4:
+        return None  # not enough passes for the test to say anything
+    observed = abs(_median(b) - _median(a))
+    pool = list(a) + list(b)
+    split = len(a)
+    rng = random.Random(0xF1A5)
+    atleast = sum(
+        abs(_median(shuffled[split:]) - _median(shuffled[:split])) >= observed - 1e-12
+        for shuffled in (rng.sample(pool, len(pool)) for _ in range(trials))
+    )
+    return (atleast + 1) / (trials + 1)
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return 0.5 * (ordered[mid - 1] + ordered[mid])
+
+
+def serve_main(argv: list[str] | None = None) -> int:
+    """Measure the Stage 1 offload runtime on a real model.
+
+    Reports prefill and decode separately because they stress the cache in
+    completely different ways, and averaging them hides both. A decode step
+    touches exactly top_k experts per layer, so the working set is tiny and the
+    cache has a real chance. A prefill batch touches the *union* over all its
+    tokens, which past a few dozen tokens is essentially every expert in the
+    layer — no cache smaller than the model can help, and the hit rate is
+    reporting the layer sweep, not locality.
+    """
+    import torch
+
+    from . import hardware
+    from .runtime import QuantSpec, install_expert_cache
+
+    parser = argparse.ArgumentParser(
+        prog="ff-serve", description="Benchmark the offloaded MoE runtime."
+    )
+    parser.add_argument("--model", default=None, help="model id (default: the Stage 0 dev model)")
+    parser.add_argument(
+        "--capacity", default="256",
+        help="expert slots to cache, comma-separated to sweep (e.g. 128,256,512)",
+    )
+    parser.add_argument("--prompt-tokens", type=int, default=128)
+    parser.add_argument("--gen-tokens", type=int, default=32)
+    parser.add_argument("--warmup", type=int, default=1, help="untimed passes before measuring")
+    parser.add_argument(
+        "--repeats", type=int, default=3,
+        help="timed passes per capacity. Reported as median (min-max): a single "
+             "pass on a desktop varies by tens of percent, which is wider than "
+             "the effect a capacity sweep is trying to resolve",
+    )
+    parser.add_argument(
+        "--pin-gb", type=float, default=0.0,
+        help="host RAM to page-lock for async DMA. Pinned pages cannot be swapped, "
+             "so this is a hard claim on physical memory — see runtime/store.py. "
+             "It defaults to 0 because it is a claim on the machine, not because "
+             "0 is a good value: measured on a bandwidth-bound decode, going from "
+             "0%% to 88%% coverage is +45%% (p=0.011) with no other change",
+    )
+    parser.add_argument(
+        "--path", default="both",
+        help="expert execution path, or several comma-separated. 'loop' is the "
+             "bit-exact reference, one GEMM "
+             "per expert; 'grouped' is Stage 1b's batched bmm; 'prefetch' is "
+             "grouped plus Stage 1c's side-stream speculative fill; 'stream' is "
+             "Stage 1e-4's prefill streaming, which fetches the next layer's "
+             "whole expert set during prefill and leaves decode alone. 'both' is "
+             "loop+grouped, 'all' adds prefetch. Several paths are timed back to "
+             "back on the same loaded model and the same warm cache, which is the "
+             "only way to attribute a difference to the path",
+    )
+    parser.add_argument(
+        "--pcie-gbps", type=float, default=None,
+        help="this machine's pinned host-to-device rate, from ff-bench's Q7 "
+             "(hardware.json -> pcie_gbps). Given it, ff-serve reports the fill "
+             "path as a fraction of it, which is the signal that transfer "
+             "optimisation is finished and only byte reduction is left",
+    )
+    parser.add_argument(
+        "--pin-sweep", default=None,
+        help="comma-separated --pin-gb values to compare, re-pinned in place on "
+             "the same loaded model. This is the honest way to measure pinning: "
+             "coverage is fixed at allocation time, so comparing a pinned run "
+             "against a pageable one across two invocations compares two "
+             "machines, not two configurations",
+    )
+    parser.add_argument(
+        "--prefetch-k", default="0",
+        help="how many predicted experts to speculatively fetch per layer, "
+             "comma-separated to sweep. 0 means all top_k, which is what the "
+             "first prefetcher did and what made it move 24%% more bytes for a "
+             "78%% precision return. Lower values keep only the router's most "
+             "confident predictions. Each value is timed as its own path",
+    )
+    parser.add_argument(
+        "--no-fill-timing", dest="fill_timing", action="store_false",
+        help="skip the extra instrumented pass that measures how much of a token "
+             "is PCIe fill. That pass is what bounds prefetching: it is the only "
+             "thing a perfect prefetcher could recover",
+    )
+    parser.add_argument(
+        "--dump-trace", default=None, metavar="PATH",
+        help="write the cache's own (layer, expert) access log to a .npz on one "
+             "extra untimed pass, for offline eviction-policy work (ff-evict). "
+             "Only the first measured path dumps: the log is a property of the "
+             "router, and every execution path produces the same one",
+    )
+    parser.add_argument(
+        "--trace-prompts", type=int, default=0, metavar="N",
+        help="dump the trace over N prompts from the Stage 0 corpus, interleaved "
+             "across its six domains, instead of the single repeated benchmark "
+             "phrase. Only affects --dump-trace; the timed passes are untouched",
+    )
+    parser.add_argument(
+        "--divergence-prompts", type=int, default=0, metavar="N",
+        help="also compare next-token predictions teacher-forced across N corpus "
+             "documents, reported as top-1 agreement and KL. Untimed, so it "
+             "cannot perturb the throughput columns. This is the bar for a path "
+             "that approximates; greedy identity is the bar for one that claims "
+             "to be exact, and the two are printed separately",
+    )
+    parser.add_argument(
+        "--quant-group", type=int, default=0, metavar="N",
+        help="weights per shared int8 scale, along the input dimension. 0 is one "
+             "scale per output channel (0.13%% storage overhead, measured at "
+             "98.32%% agreement); 128 is the standard finer grid (1.6%%)",
+    )
+    parser.add_argument(
+        "--quant-projections", default="gate_proj,up_proj",
+        help="which projections to quantise. The default exempts down_proj: it "
+             "costs capacity (8.39 MB per expert instead of 6.29, so 357 slots "
+             "instead of 476) and buys back the accuracy that decides the stage "
+             "— the default measures 98.767%% top-1 agreement (+/-0.070%%, "
+             "n=24,576), which misses the pre-committed 99%% bar by 0.233 "
+             "points. All three scored 98.32%% on a coarser instrument. Run "
+             "tools/int8_accuracy.py",
+    )
+    parser.add_argument(
+        "--int8", action="store_true",
+        help="quantise the expert store for real: int8 rows with the scales "
+             "packed on the end, so a miss moves fewer bytes and --capacity "
+             "buys more slots for the same VRAM. Raise --capacity to spend it; "
+             "the pool is sized in experts, not bytes",
+    )
+    parser.add_argument(
+        "--int8-capacity", default=None, metavar="N[,N]",
+        help="append quantised runs at these capacities after the fp16 ones, in "
+             "the same invocation. This is how int8 is actually scored: the two "
+             "arms have to share one loaded machine, and the extra slots are "
+             "the point, so they cannot share a capacity either. 357 is the "
+             "measured best on a 6 GB card (Stage 1e-2c); below 256 you are on "
+             "the wrong side of the curve and above ~400 the driver starts "
+             "paging the pool, which reads as every metric improving while "
+             "throughput collapses",
+    )
+    parser.add_argument(
+        "--fake-quant-int8", action="store_true",
+        help="add a final 'q8sim' path that round-trips the expert store through "
+             "per-channel int8 without changing its size. Isolates Stage 1e-2's "
+             "numerics risk from its bytes argument: throughput should be "
+             "unchanged, and the number to read is the greedy-divergence line",
+    )
+    parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16"])
+    parser.add_argument(
+        "--baseline", action="store_true",
+        help="also time accelerate's device_map='auto' offload on the same prompt "
+             "and the same harness, as a like-for-like comparison",
+    )
+    parser.add_argument(
+        "--baseline-only", action="store_true",
+        help=argparse.SUPPRESS,  # internal: the subprocess --baseline spawns
+    )
+    parser.add_argument("--gpu-memory", default="4.5GiB", help="accelerate's VRAM cap (--baseline)")
+    parser.add_argument("--cache-dir", default=None)
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args(argv)
+
+    _force_utf8_stdout()
+    _setup_logging(args.verbose)
+
+    if not torch.cuda.is_available():
+        print("ff-serve needs a CUDA device; the whole point is the PCIe crossing.")
+        return 1
+
+    from .models import DEFAULT_MODEL, load_model
+
+    model_id = args.model or DEFAULT_MODEL
+    capacities = [int(c) for c in args.capacity.split(",") if c.strip()]
+    # name -> (grouped, prefetch_k). Ordered so the first entry is always the
+    # comparison base, and so `loop` stays first when it is present: it is the
+    # bit-exact oracle and every other path is a claim measured against it.
+    #
+    # `prefetch` expands into one path per --prefetch-k value, because the
+    # question that variable answers — does the speculation's bandwidth cost
+    # outweigh its overlap? — is only answerable if every budget is timed on the
+    # same loaded model and the same warm cache. Across invocations the spread
+    # is wider than the effect.
+    # `--pin-sweep` multiplies through the same way, for the same reason: pin
+    # coverage is fixed at allocation, so the only controlled comparison is one
+    # that re-pins in place between timed regions on a single loaded model.
+    kinds: list[tuple[str, bool, int | None]] = []
+    for name in {
+        "both": ["loop", "grouped"],
+        "all": ["loop", "grouped", "prefetch"],
+    }.get(args.path) or [n for n in args.path.split(",") if n.strip()]:
+        # `stream` is Stage 1e-4: grouped, no speculation, but the next layer's
+        # whole expert set fetched on the side stream during prefill. It runs
+        # the grouped kernels, so it is paired against `grouped` — the thing it
+        # changes is the prefill column, which prefetch never touched.
+        if name != "prefetch":
+            kinds.append((name, name in ("grouped", "stream"), None))
+            continue
+        for value in (int(v) for v in args.prefetch_k.split(",") if v.strip()):
+            kinds.append((f"pf-k{value}" if value else "pf-all", True, value or None))
+
+    pin_levels: list[float | None] = (
+        [float(v) for v in args.pin_sweep.split(",") if v.strip()]
+        if args.pin_sweep else [None]
+    )
+
+    # label -> (grouped, prefetch_k, pin_gb). Ordered so the first entry is
+    # always the comparison base, and so `loop` stays first when it is present:
+    # it is the bit-exact oracle and every other path is a claim against it.
+    path_flags: dict[str, tuple[bool, int | None, float | None]] = {}
+    paths: list[str] = []
+    for pin_gb in pin_levels:
+        for name, grouped, prefetch_k in kinds:
+            label = name if pin_gb is None else f"{name}/pin{pin_gb:g}"
+            path_flags[label] = (grouped, prefetch_k, pin_gb)
+            paths.append(label)
+
+    # Always last, and only once: fake-quantising the store is irreversible, so
+    # every unquantised path has to have been measured before it runs. It is
+    # appended here rather than being a `kind` so that no combination of flags
+    # can put it in the middle of a sweep.
+    if args.fake_quant_int8:
+        if args.int8:
+            print(
+                "--int8 and --fake-quant-int8 are the same experiment run two "
+                "ways. The fake one exists to answer the numerics question "
+                "before the real one exists; once --int8 works, it is the "
+                "measurement. Pick one."
+            )
+            return 1
+        path_flags["q8sim"] = (True, None, pin_levels[-1])
+        paths.append("q8sim")
+
+    quant = QuantSpec(
+        projections=tuple(p for p in args.quant_projections.split(",") if p.strip()),
+        group_size=args.quant_group,
+    )
+
+    # (capacity, spec|None). `--int8-capacity` appends quantised runs *after* the
+    # fp16 ones rather than replacing them, because the whole claim of Stage 1e-2
+    # is a comparison, and troubleshoot.md 1.8 is the record of what comparing
+    # across two invocations of this harness costs: free RAM fell 12.4 -> 5.8 GB
+    # over one sweep and the same capacity measured 2.77 against 5.53 tok/s. One
+    # invocation, one machine state, both arms.
+    runs: list[tuple[int, QuantSpec | None]] = [
+        (capacity, quant if args.int8 else None) for capacity in capacities
+    ]
+    runs += [
+        (int(value), quant)
+        for value in (args.int8_capacity or "").split(",")
+        if value.strip()
+    ]
+
+    import gc
+
+    from transformers import AutoTokenizer
+
+    # The tokenizer is loaded on its own so the two model configurations below
+    # never need to be alive at the same time. Each is ~13.8 GB; this machine
+    # has 15 GB free.
+    tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir=args.cache_dir)
+    prompt = "The history of computing is" * 64
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids[:, : args.prompt_tokens]
+    input_ids = input_ids.to("cuda")
+
+    if args.baseline_only:
+        # Same prompt, same harness, no tracing hooks. The Stage 0 figure it is
+        # tempting to reuse (2.25 s/token) came from a *tracing* run that also
+        # wrote router logits and hidden states for 16 layers to disk on every
+        # token, at a different prompt length. A speedup quoted against that is
+        # partly measuring the hooks.
+        log.info("Baseline: loading %s with device_map='auto'...", model_id)
+        baseline_model, _ = load_model(
+            model_id, dtype=args.dtype, device_map="auto",
+            gpu_memory=args.gpu_memory, cache_dir=args.cache_dir,
+        )
+        _run_phase(baseline_model, input_ids, min(2, args.gen_tokens))
+        samples = []
+        for _ in range(max(1, args.repeats)):
+            timing = _run_phase(baseline_model, input_ids, args.gen_tokens)
+            if timing["decode_s"]:
+                samples.append(timing["decode_tokens"] / timing["decode_s"])
+        print(f"\n=== baseline (accelerate device_map='auto', {args.gpu_memory} VRAM cap)")
+        print(f"  prefill {timing['prefill_tokens'] / timing['prefill_s']:8.1f} tok/s")
+        print(f"  decode  {_median(samples):8.2f} tok/s "
+              f"({min(samples):.2f}-{max(samples):.2f} over {len(samples)} passes)")
+        print(f"{_BASELINE_MARKER} {_median(samples):.6f}")
+        return 0
+
+    baseline_tps = None
+    if args.baseline:
+        baseline_tps = _measure_baseline_subprocess(args)
+
+    # device_map=None loads everything to CPU. That is deliberate: with
+    # device_map="auto" accelerate would scatter experts across devices and
+    # meta tensors and then fight the runtime for control of placement.
+    log.info("Loading %s to CPU (%s)...", model_id, args.dtype)
+    model, _ = load_model(
+        model_id, dtype=args.dtype, device_map=None, cache_dir=args.cache_dir
+    )
+
+    rows = []
+    report = None
+    first_free_gb = None
+    dumped_trace = False
+    for i, (capacity, run_quant) in enumerate(runs):
+        # Each capacity needs a fresh model: install_expert_cache moves the
+        # experts out, so the previous iteration left a hollow shell behind.
+        #
+        # Dropping `report` first is not tidiness. It owns the previous store
+        # (12 GB of host RAM) and the previous slot pool (3 GB of VRAM), and
+        # loading the next 13.8 GB checkpoint while both are still live would
+        # exhaust host memory on any machine that can only just hold one copy.
+        if i > 0:
+            # Released by hand, not left to the collector. `del` was enough
+            # until the int8 sweep, where 2.5 GB of the previous pool survived
+            # into the next iteration and the second arm OOM'd inside
+            # `model.to(device)` — reported as a *pinned-memory* failure first,
+            # because `cudaHostAlloc` needs a working CUDA context and says
+            # "out of memory" when the device has none left.
+            if report is not None:
+                report.cache.release()
+            del model, report
+            report = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            # Pinned host memory has its *own* caching allocator, and
+            # `empty_cache()` does not touch it. Freeing a pinned store returns
+            # the pages to that cache, not to the operating system, so the next
+            # capacity in the sweep starts with the previous one's page-locked
+            # GB already spent: arm 1 pinned 6.75 GB, arm 2 then hit the system
+            # ceiling after 3.00 GB and silently ran at half the pin coverage.
+            # That is not a crash, it is a confound — the arm with less pinning
+            # measures slower, and pinning is the lever Stage 1d showed was
+            # worth 45%.
+            if hasattr(torch._C, "_host_emptyCache"):
+                torch._C._host_emptyCache()
+            held = torch.cuda.memory_allocated() / (1 << 30)
+            reserved = torch.cuda.memory_reserved() / (1 << 30)
+            # Printed every time, not only when it looks wrong. The failure this
+            # catches is cumulative and silent until the allocation that cannot
+            # fit, and by then the log says nothing about where the GB went.
+            # Host RAM belongs on this line as much as VRAM does. Pinning is
+            # allocated from it, and a pin budget that silently cannot be met
+            # is a confound rather than a crash: the arm with less page-locked
+            # memory measures slower, and Stage 1d priced that at 45%.
+            print(f"\n  released the previous capacity: {held:.2f} GB still "
+                  f"allocated, {reserved:.2f} GB reserved, "
+                  f"{hardware.available_ram_bytes() / (1 << 30):.1f} GB host RAM free")
+            model, _ = load_model(
+                model_id, dtype=args.dtype, device_map=None, cache_dir=args.cache_dir
+            )
+
+        report = install_expert_cache(
+            model, capacity=capacity, device="cuda", pin_gb=args.pin_gb, quant=run_quant
+        )
+        grain = f"group-{args.quant_group}" if args.quant_group else "per-channel"
+        print(f"\n=== capacity {capacity}"
+              + (f" int8 ({'+'.join(run_quant.projections)}, {grain})" if run_quant else ""))
+        print(report.describe())
+
+        # The VRAM twin of the host-RAM check below, and it was added because
+        # the 384-slot row of the Stage 1 sweep was a resource bug that read as
+        # a cache result: 5.39 GB resident on a 6 GB card, hit rate 92.7%,
+        # decode 0.83 tok/s against 5.53 at 256 slots. Hit rate up, throughput
+        # down 6.7x. On Windows an over-committed allocation does not fail — WDDM
+        # spills it to host memory and every slot read silently crosses PCIe
+        # again. The profile that concluded "transfers are nearly free" was
+        # taken in that regime.
+        #
+        # empty_cache() first, and it is not optional. mem_get_info() reports
+        # what the *driver* has free, and PyTorch's caching allocator counts as
+        # used — so without this the check reads 0.00 GB free at every capacity,
+        # including 128 slots with 3.6 GB genuinely spare, and warns on rows
+        # that are fine. An instrument that fires on everything says nothing.
+        torch.cuda.empty_cache()
+        vram_free, vram_total = torch.cuda.mem_get_info()
+        print(f"  VRAM free after install: {vram_free / (1 << 30):.2f} GB "
+              f"of {vram_total / (1 << 30):.2f} GB")
+        # 0.25 GB, not 0.5: 256 slots runs healthily at ~0.5 GB free and tripping
+        # there would flag the configuration the runtime actually ships. The
+        # collapse at 384 slots happened at 0.00 GB.
+        if vram_free < 0.25 * (1 << 30):
+            print("  WARNING: under 0.5 GB of VRAM headroom. Activations and the "
+                  "gather buffer still have to fit; past this point the driver "
+                  "pages the slot pool to host memory and these timings measure "
+                  "that, not the cache. Treat this row as invalid, not as a result.")
+
+        # A default that is also the worst configuration deserves to say so.
+        # Every measurement this project published before Stage 1d ran fully
+        # pageable, and nothing pointed at it: the store reported "0.00 GB
+        # pinned" in a line nobody was reading as a performance number.
+        if not args.pin_gb and not args.pin_sweep:
+            store_gb = report.store.total_bytes / (1 << 30)
+            print(f"  NOTE: nothing is pinned. On a bandwidth-bound decode this is "
+                  f"the slowest configuration — measured at +45% from 0% to 88% "
+                  f"coverage.")
+            print(f"        Try --pin-gb {store_gb * 0.875:.0f} (the store is "
+                  f"{store_gb:.1f} GB). Pinned pages cannot be swapped, and the "
+                  "ceiling is lower")
+            print("        than free RAM suggests — ExpertStore degrades to "
+                  "pageable rather than failing.")
+
+        free = hardware.available_ram_bytes()
+        if free is not None:
+            free_gb = free / (1 << 30)
+            print(f"  host RAM free: {free_gb:.1f} GB")
+            # Not a threshold — a drift. Even with the explicit `del` above,
+            # free host RAM fell 12.4 -> 7.5 -> 5.8 GB across a 128/256/320
+            # sweep, and 256 slots measured 2.77 tok/s there against 5.53 in a
+            # run of its own. The capacity was the same; the machine was not.
+            # Row one is the only row in a sweep that is measured on a clean
+            # box, so say which rows are downstream of that.
+            if i > 0 and first_free_gb is not None and free_gb < first_free_gb - 1.0:
+                print(f"  WARNING: {first_free_gb - free_gb:.1f} GB less free RAM than "
+                      f"the first capacity in this sweep had. Rows are no longer "
+                      f"comparable to each other — compare capacities across separate "
+                      f"invocations, and trust row one.")
+            if i == 0:
+                first_free_gb = free_gb
+            # Swapping shows up as a throughput collapse with an unchanged or
+            # better hit rate, which reads exactly like a cache-policy finding.
+            # It is not one, so say so here rather than letting the table imply it.
+            if free_gb < 2.0:
+                print("  WARNING: under 2 GB free — these timings are measuring swap, "
+                      "not the cache. Compare capacities across separate runs instead.")
+
+        stats = report.cache.stats
+        applied_pin: float | None = None
+        # Both paths share this model and this cache. Flipping the flag on the
+        # already-installed blocks is what makes the comparison controlled: same
+        # weights, same slot pool, same residency, one variable.
+        for path in paths:
+            grouped, prefetch_k, pin_gb = path_flags[path]
+            if pin_gb is not None and pin_gb != applied_pin:
+                pinned_layers = report.store.repin(pin_gb)
+                applied_pin = pin_gb
+                print(f"  re-pinned for {path}: {pinned_layers} of "
+                      f"{len(report.store.layers)} layers, "
+                      f"{report.store.pinned_bytes / (1 << 30):.2f} GB "
+                      f"({report.store.pinned_bytes / report.store.total_bytes:.0%} "
+                      "of the store)")
+                # Repinning does not move the cache, but it does replace the host
+                # pages every future fill reads from. Clear so each pin level
+                # starts from the same cold cache instead of inheriting the
+                # previous level's residency along with its warm-up.
+                report.cache.clear()
+            if path == "q8sim":
+                # Same bytes, same slot count, same bandwidth — only the values
+                # change. So this path's *throughput* should match the grouped
+                # path it follows, and if it does not, the difference is
+                # measurement noise rather than quantisation. The column that
+                # matters here is the greedy divergence one below.
+                projections = tuple(
+                    p for p in args.quant_projections.split(",") if p.strip()
+                )
+                error = report.store.fake_quantize_int8(
+                    group_size=args.quant_group, projections=projections
+                )
+                report.cache.clear()
+                grain = f"group-{args.quant_group}" if args.quant_group else "per-channel"
+                grain += f", {'+'.join(projections)}"
+                print(f"  fake-quantised the store to {grain} int8: "
+                      f"{error['rel_rms_error']:.3%} relative RMS weight error, "
+                      f"worst channel {error['worst_channel_rel_error']:.3%}")
+            for block in report.blocks:
+                block.grouped = grouped
+                # The last block has no next_gate, so this is a no-op there.
+                block.prefetch = prefetch_k is not None or path.startswith("pf-")
+                block.prefetch_k = prefetch_k
+                block.stream_prefill = path.startswith("stream")
+
+            # A path that cannot run must not discard the paths that already
+            # did. A pin sweep found this the hard way: the highest coverage
+            # level OOM'd in its warmup and took two completed conditions and
+            # the whole summary table with it. Same lesson as writing the
+            # manifest last — the expensive part is already done by here.
+            try:
+                for _ in range(args.warmup):
+                    _run_phase(model, input_ids, min(4, args.gen_tokens))
+
+                prefill_samples, decode_samples = [], []
+                for _ in range(max(1, args.repeats)):
+                    stats.reset()
+                    timing = _run_phase(model, input_ids, args.gen_tokens, stats)
+                    if timing["prefill_s"]:
+                        prefill_samples.append(timing["prefill_tokens"] / timing["prefill_s"])
+                    if timing["decode_s"]:
+                        decode_samples.append(timing["decode_tokens"] / timing["decode_s"])
+            except RuntimeError as exc:
+                print(f"  [{path:>7}] FAILED: {str(exc).splitlines()[0]}")
+                print(f"  [{path:>7}] skipping this path; rows already measured are kept")
+                torch.cuda.empty_cache()
+                continue
+
+            # Counters come from the final pass. They are deterministic given the
+            # prompt — the same experts are routed to every time — so unlike the
+            # timings they need no aggregation.
+            p_hits, p_misses, p_bytes = timing["prefill_counts"]
+            d_hits, d_misses, d_bytes = timing["decode_counts"]
+            # Read before the probe pass below resets the counters. This is the
+            # predictor's precision as the runtime actually experienced it,
+            # which is the number that matters — Q3's 0.835 was recall, offline,
+            # on a trace, and a speculative fetch is paid for by precision.
+            issued, used = stats.prefetch_issued, stats.prefetch_used
+
+            # Stage 1c's bound, measured on its own pass. Recording two CUDA
+            # events per layer is a perturbation, so it must not touch the
+            # throughput column above — the whole point of the number is to be
+            # compared against that column, and an instrument that changes what
+            # it measures would make the comparison circular.
+            #
+            # Fills are issued on the compute stream, so their duration is time
+            # the expert GEMMs are stalled. A prefetcher that predicted
+            # perfectly and had infinite spare bandwidth would recover exactly
+            # this and no more. It is a ceiling, not a forecast.
+            probe = None
+            if args.fill_timing:
+                report.cache.time_fills = True
+                stats.reset()
+                probe = _run_phase(model, input_ids, args.gen_tokens, stats, report.cache)
+                report.cache.time_fills = False
+
+            if args.dump_trace and not dumped_trace:
+                dumped_trace = True
+                # The benchmark prompt is one phrase repeated 64 times, which is
+                # the right call for a *timing* harness — it makes the sequence
+                # length exact and the work reproducible — and the wrong trace to
+                # tune a cache policy on. Q5 measured the policy ranking
+                # reversing between a 5-document prefix and a 48-document corpus;
+                # a single repeated phrase is narrower than either. So the dump
+                # pass can replay the real corpus instead. It is untimed, and the
+                # router's choices do not depend on cache state, so widening it
+                # cannot perturb anything that was measured above.
+                prompt_ids = (
+                    _corpus_input_ids(tokenizer, args.trace_prompts, args.prompt_tokens)
+                    if args.trace_prompts else []
+                ) or [input_ids]
+
+                prefill_keys: list[int] = []
+                decode_keys: list[int] = []
+                dump = None
+                for ids in prompt_ids:
+                    report.cache.access_log = []
+                    dump = _run_phase(model, ids, args.gen_tokens, stats, report.cache)
+                    split = dump["decode_log_start"]
+                    if not prefill_keys:
+                        prefill_keys = report.cache.access_log[:split]
+                    decode_keys.extend(report.cache.access_log[split:])
+                report.cache.access_log = None
+
+                keys = np.asarray(prefill_keys + decode_keys, dtype=np.int32)
+                start = len(prefill_keys)
+                dump = dict(dump, decode_tokens=dump["decode_tokens"] * len(prompt_ids))
+                out_path = Path(args.dump_trace)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(
+                    out_path,
+                    keys=keys,
+                    decode_start=start,
+                    num_experts=report.cache.store.num_experts,
+                    num_layers=len(report.cache.store.layers),
+                    decode_tokens=dump["decode_tokens"],
+                    capacity=capacity,
+                    prompts=len(prompt_ids),
+                )
+                print(f"  [{path:>7}] trace   {len(keys) - start:,} decode lookups "
+                      f"({(len(keys) - start) / max(1, dump['decode_tokens']):.0f}/token) "
+                      f"over {len(prompt_ids)} prompt(s) -> {out_path}")
+
+            # Greedy ids over a spread of real documents, untimed. One prompt is
+            # one sample of the model's sensitivity to a numerical change, and
+            # the benchmark prompt is the least sensitive sample available — its
+            # continuation is predictable, so its logit margins are wide. A
+            # change that survives it has not been tested; a change that survives
+            # six domains has.
+            # Teacher-forced, not generated. Greedy divergence compounds: one
+            # flipped argmax at position 3 makes every later token differ, so
+            # generation measures "how early did anything change" and calls it
+            # "how much changed". Feeding both models the same real document and
+            # comparing the argmax at every position independently is the
+            # question an approximation should actually be asked, and it costs
+            # one forward pass per document instead of 96.
+            corpus_logits: list = []
+            if args.divergence_prompts:
+                import torch
+
+                with torch.no_grad():
+                    for ids in _corpus_input_ids(
+                        tokenizer, args.divergence_prompts, args.prompt_tokens
+                    ):
+                        out = model(ids, use_cache=False)
+                        corpus_logits.append(out.logits[0].detach().to("cpu", torch.float32))
+                        del out
+
+            rows.append({
+                "capacity": capacity,
+                "quant": run_quant is not None,
+                "path": path,
+                "corpus_logits": corpus_logits,
+                "prefill_tok_s": _median(prefill_samples),
+                # Prefill gets a spread too. It is one short timed region per
+                # pass, so it is the noisiest number here and the most likely
+                # to be read as a trend; a median with no spread beside it is
+                # how the first Stage 1b run appeared to show a 36% prefill
+                # regression that the next run reversed.
+                "prefill_lo": min(prefill_samples) if prefill_samples else 0.0,
+                "prefill_hi": max(prefill_samples) if prefill_samples else 0.0,
+                "decode_tok_s": _median(decode_samples),
+                "decode_lo": min(decode_samples) if decode_samples else 0.0,
+                "decode_hi": max(decode_samples) if decode_samples else 0.0,
+                "prefill_hit_rate": _rate(p_hits, p_misses),
+                "decode_hit_rate": _rate(d_hits, d_misses),
+                "decode_gb_per_token": d_bytes / 1e9 / max(1, timing["decode_tokens"]),
+                "vram_gb": report.resident_bytes / (1 << 30),
+                "tokens": timing["tokens"],
+                "prefetch_issued": issued,
+                "prefetch_used": used,
+                # Kept so the verdict can run a permutation test rather than
+                # compare a change against a min-max range.
+                "prefill_samples": list(prefill_samples),
+                "decode_samples": list(decode_samples),
+                # Shares are computed against the probe pass's *own* wall clock,
+                # not the median above. Mixing a numerator from one pass with a
+                # denominator from another is how this project has produced
+                # three wrong tables; see troubleshoot.md 1.3.
+                "decode_fill_share": (
+                    probe["decode_fill_ms"] / (probe["decode_s"] * 1e3)
+                    if probe and probe["decode_s"] else None
+                ),
+                "decode_fill_ms_per_token": (
+                    probe["decode_fill_ms"] / max(1, probe["decode_tokens"])
+                    if probe else None
+                ),
+                "prefill_fill_share": (
+                    probe["prefill_fill_ms"] / (probe["prefill_s"] * 1e3)
+                    if probe and probe["prefill_s"] else None
+                ),
+                # Side-stream ms, kept apart from the demand number above. On
+                # the non-prefetch paths this is zero by construction.
+                "decode_spec_ms_per_token": (
+                    probe["decode_spec_ms"] / max(1, probe["decode_tokens"])
+                    if probe else None
+                ),
+            })
+            print(f"  [{path:>7}] prefill {_median(prefill_samples):8.1f} tok/s  "
+                  f"({min(prefill_samples):.1f}-{max(prefill_samples):.1f})  "
+                  f"hit {_rate(p_hits, p_misses):5.1%}  {p_bytes / 1e9:5.2f} GB")
+            print(f"  [{path:>7}] decode  {_median(decode_samples):8.2f} tok/s  "
+                  f"({min(decode_samples):.2f}-{max(decode_samples):.2f} over "
+                  f"{len(decode_samples)} passes)  hit {_rate(d_hits, d_misses):5.1%}  "
+                  f"{d_bytes / 1e9:5.2f} GB")
+            if issued:
+                print(f"  [{path:>7}] predict {used:>6,} of {issued:,} speculative fetches "
+                      f"were wanted = {used / issued:.1%} precision")
+            if probe:
+                row = rows[-1]
+                print(f"  [{path:>7}] fill    {row['decode_fill_ms_per_token']:8.1f} ms/token "
+                      f"blocking = {row['decode_fill_share']:.1%} of decode "
+                      f"(prefill {row['prefill_fill_share']:.1%}) "
+                      "<- the prefetch ceiling")
+                if row["decode_spec_ms_per_token"]:
+                    print(f"  [{path:>7}] spec    "
+                          f"{row['decode_spec_ms_per_token']:8.1f} ms/token on the side "
+                          "stream, which only helps if it overlapped")
+
+    print("\n" + "=" * 112)
+    print(f"{'slots':>7} {'path':>8} {'VRAM GB':>8} {'prefill t/s':>12} {'spread':>13} "
+          f"{'decode t/s':>11} {'spread':>13} {'dec hit':>8} {'GB/tok':>7} {'GB/s':>6}")
+    for row in rows:
+        # tok/s x GB/token. If this column is flatter than either of the two
+        # columns it is the product of, the link is saturated and the system is
+        # bandwidth-bound: throughput is bandwidth / bytes-per-token, and the
+        # only lever left is bytes. Stage 1c's prefetcher was rejected on this
+        # column — it held at ~5.8 GB/s across paths whose throughput differed
+        # by 14%, which is what "reordering transfers cannot help" looks like.
+        # The slots column carries the dtype, because "357" and "238" otherwise
+        # look like two points on a capacity sweep rather than two different
+        # machines' worth of expert.
+        slots = f"{row['capacity']}{'q8' if row['quant'] else ''}"
+        print(f"{slots:>7} {row['path']:>8} {row['vram_gb']:>8.2f} "
+              f"{row['prefill_tok_s']:>12.1f} "
+              f"{row['prefill_lo']:.1f}-{row['prefill_hi']:<8.1f} "
+              f"{row['decode_tok_s']:>11.2f} "
+              f"{row['decode_lo']:.2f}-{row['decode_hi']:<8.2f} "
+              f"{row['decode_hit_rate']:>7.1%} {row['decode_gb_per_token']:>7.3f} "
+              f"{row['decode_tok_s'] * row['decode_gb_per_token']:>6.2f}")
+
+    # The test above compares paths pairwise. This asks a different question of
+    # the same rows: is the machine's delivered bandwidth the thing holding
+    # every path down?
+    sustained = [r["decode_tok_s"] * r["decode_gb_per_token"] for r in rows if r["decode_tok_s"]]
+    if len(sustained) > 2:
+        def _relspread(values):
+            return (max(values) - min(values)) / (sum(values) / len(values))
+
+        gbs = _relspread(sustained)
+        tps = _relspread([r["decode_tok_s"] for r in rows if r["decode_tok_s"]])
+        # The conclusion below only follows if delivered bandwidth is roughly
+        # *constant* across these rows — that is what makes bytes the only
+        # remaining lever. A pin sweep varies bandwidth on purpose, and the
+        # first version of this check fired on one, reporting "the link is the
+        # constraint at ~5.2 GB/s" off a 31%-vs-31% comparison that showed
+        # nothing of the kind. Requiring bandwidth to be at least twice as
+        # stable as throughput is what "roughly constant" has to mean here.
+        if gbs < 0.5 * tps:
+            print(f"\n[serve] sustained bandwidth varies {gbs:.0%} across these paths while "
+                  f"throughput varies {tps:.0%}.")
+            print(f"        The link is the constraint at ~{sum(sustained) / len(sustained):.1f} "
+                  "GB/s, so decode speed is bandwidth / bytes-per-token. Reordering "
+                  "transfers cannot")
+            print("        help; only moving fewer bytes can — pinning the rest of the "
+                  "store, a better eviction policy, CPU-side experts, or quantisation.")
+
+    # Same rule as the capacity sweep: a path difference narrower than the
+    # machine's own run-to-run spread is not a result.
+    if len(paths) > 1:
+        # Everything is scored against the first path requested, which is `loop`
+        # whenever it was asked for. Comparing prefetch against grouped instead
+        # would hide whichever of the two changes cancelled the other.
+        base_path = paths[0]
+        print(f"\n{'slots':>7} {'path':>9} {'phase':>8} {base_path + ' t/s':>12} "
+              f"{'this t/s':>10} {'change':>9}  verdict")
+        for capacity, run_quant in runs:
+            # Matched on quantisation as well as capacity: the same capacity can
+            # appear twice, once per dtype, and pairing across the two would
+            # compare a path change against a dtype change.
+            by_path = {
+                r["path"]: r for r in rows
+                if r["capacity"] == capacity and r["quant"] == (run_quant is not None)
+            }
+            base = by_path.get(base_path)
+            if base is None:
+                continue
+            for path in paths[1:]:
+                other = by_path.get(path)
+                if other is None:
+                    continue
+                for phase, key, samples in [
+                    ("prefill", "prefill_tok_s", "prefill_samples"),
+                    ("decode", "decode_tok_s", "decode_samples"),
+                ]:
+                    if not base[key]:
+                        continue
+                    change = other[key] / base[key] - 1.0
+                    p = _permutation_p(base[samples], other[samples])
+                    if p is None:
+                        verdict = "too few passes to test — raise --repeats"
+                    elif p < 0.05:
+                        verdict = f"real (p={p:.3f}, {len(base[samples])} passes each)"
+                    else:
+                        verdict = f"not distinguishable from noise (p={p:.2f})"
+                    print(f"{capacity:>7} {path:>9} {phase:>8} {base[key]:>12.2f} "
+                          f"{other[key]:>10.2f} {change:>+8.0%}  {verdict}")
+
+                # A tolerance in fp32 on a toy block says nothing about fp16 on
+                # a 7B model, where a rounding difference can flip an argmax and
+                # the two paths then walk away from each other. This is the only
+                # check that speaks to whether a path is the same *model*.
+                #
+                # For prefetch it is doing a second job. Prefetch is supposed to
+                # be bit-exact — it changes when weights arrive, never which
+                # ones — so any divergence at all is a cross-stream race, not a
+                # rounding difference, and the number to look at is which token.
+                base_ids, other_ids = base["tokens"], other["tokens"]
+                if base_ids and other_ids:
+                    shared = min(len(base_ids), len(other_ids))
+                    diverged = next(
+                        (i for i in range(shared) if base_ids[i] != other_ids[i]), None
+                    )
+                    if diverged is None:
+                        print(f"          {path}: greedy output identical for all "
+                              f"{shared} tokens")
+                    elif path.startswith("pf-"):
+                        print(f"          {path}: DIVERGES at token {diverged} of {shared}. "
+                              "Prefetch does not change which experts run, so this is a "
+                              "read/write race between the side stream and the compute "
+                              "stream, not rounding. Do not ship it.")
+                    else:
+                        print(f"          {path}: greedy output diverges at token "
+                              f"{diverged} of {shared} — not bit-exact, and at fp16 that "
+                              "is visible in the text, not just the activations")
+
+                # An approximation cannot pass a bit-exactness test, so asking it
+                # to is a test nothing can fail informatively. This is the bar
+                # for a path that is *meant* to change the numbers: does it
+                # predict the same next token, position by position, on real
+                # text? Agreement and KL are pre-committed thresholds — 99% and
+                # 0.01 nats — so the verdict is not chosen after seeing it.
+                scored = _teacher_forced(base["corpus_logits"], other["corpus_logits"])
+                if scored:
+                    print(f"          {path}: {scored}")
+
+    # A capacity sweep is only informative if the differences it shows are
+    # larger than the machine's own run-to-run variation. On this box they were
+    # not, which is itself the answer: transfer volume is not what sets decode
+    # speed here. Say it rather than leaving a 10% gap looking like a trend.
+    for path in paths:
+        # Same dtype as well as same path: an int8 row at 357 slots against an
+        # fp16 row at 238 is not a point on a capacity sweep, and averaging the
+        # two into one "spread across capacities" would hide the stage's result
+        # inside the noise estimate meant to qualify it.
+        same_path = [
+            r for r in rows
+            if r["path"] == path and r["decode_tok_s"] and not r["quant"]
+        ]
+        if len(same_path) < 2:
+            continue
+        widest = max((r["decode_hi"] - r["decode_lo"]) / r["decode_tok_s"] for r in same_path)
+        peak = max(r["decode_tok_s"] for r in same_path)
+        relative = (peak - min(r["decode_tok_s"] for r in same_path)) / peak
+        if relative <= widest:
+            print(f"\n[serve] {path}: the spread across capacities ({relative:.0%}) is no "
+                  f"wider than the spread within one ({widest:.0%}).")
+            print("        Capacity is not resolvably changing decode speed on this "
+                  "machine — which is the finding, not a failed measurement.")
+
+    # Stage 1e-2's verdict. Quantisation is not a path and not a capacity, so
+    # neither table above scores it: it moves both at once, deliberately. The
+    # comparison that matters is the best fp16 row against the best int8 row on
+    # the same path, which is what a user would actually choose between.
+    for path in paths:
+        arms = {
+            quantised: max(
+                (r for r in rows
+                 if r["path"] == path and r["decode_tok_s"] and r["quant"] == quantised),
+                key=lambda r: r["decode_tok_s"], default=None,
+            )
+            for quantised in (False, True)
+        }
+        base, other = arms[False], arms[True]
+        if base is None or other is None:
+            continue
+        change = other["decode_tok_s"] / base["decode_tok_s"] - 1.0
+        p = _permutation_p(base["decode_samples"], other["decode_samples"])
+        verdict = (
+            "too few passes to test — raise --repeats" if p is None
+            else f"real (p={p:.3f}, {len(base['decode_samples'])} passes each)"
+            if p < 0.05 else f"not distinguishable from noise (p={p:.2f})"
+        )
+        print(f"\n[serve] int8 ({path}): {base['capacity']} fp16 slots at "
+              f"{base['decode_tok_s']:.2f} tok/s -> {other['capacity']} int8 slots "
+              f"at {other['decode_tok_s']:.2f} tok/s, {change:+.0%}. {verdict}")
+        print(f"        bytes per token {base['decode_gb_per_token']:.3f} -> "
+              f"{other['decode_gb_per_token']:.3f} GB, decode hit rate "
+              f"{base['decode_hit_rate']:.1%} -> {other['decode_hit_rate']:.1%}, "
+              f"VRAM {base['vram_gb']:.2f} -> {other['vram_gb']:.2f} GB.")
+        # Throughput and accuracy printed together, because separating them is
+        # how a stage ships a faster different model. The fp16 arm is the
+        # reference here, which is the right reference: it is the thing int8 is
+        # claiming to replace.
+        scored = _teacher_forced(base["corpus_logits"], other["corpus_logits"])
+        print(f"        {scored}" if scored else
+              "        accuracy not measured — pass --divergence-prompts N. A "
+              "throughput win that fails the bar is a different model, not a win.")
+
+    # Stage 1c's go/no-go. A prefetcher can only ever remove fill time from the
+    # critical path, so if that share is smaller than the run-to-run spread the
+    # harness cannot demonstrate the improvement even if the improvement is real.
+    # Saying so here is cheaper than building the prefetcher and then finding out.
+    timed = [r for r in rows if r.get("decode_fill_share") is not None]
+    if timed:
+        print(f"\n{'slots':>7} {'path':>14} {'fill ms/tok':>12} {'fill % decode':>14} "
+              f"{'fill GB/s':>10} {'vs PCIe':>8}  no-transfer ceiling")
+        for row in timed:
+            share = row["decode_fill_share"]
+            fill_s = row["decode_fill_ms_per_token"] / 1e3
+            # Bandwidth *while transferring*, as distinct from the sustained
+            # figure in the table above, which is averaged over compute too.
+            # This one is comparable to Q7's PCIe microbenchmark, and that is
+            # the comparison that says when to stop optimising transfers.
+            fill_gbs = row["decode_gb_per_token"] / fill_s if fill_s else 0.0
+            versus = f"{fill_gbs / args.pcie_gbps:.0%}" if args.pcie_gbps else "n/a"
+            # Removing a fraction s of a token speeds it by s/(1-s), not s.
+            ceiling = share / (1 - share) if share < 1 else float("inf")
+            print(f"{row['capacity']:>7} {row['path']:>14} "
+                  f"{row['decode_fill_ms_per_token']:>12.1f} {share:>13.1%} "
+                  f"{fill_gbs:>10.2f} {versus:>8}  +{ceiling:.0%} if transfers were free")
+
+        if args.pcie_gbps:
+            best_fill = max(
+                r["decode_gb_per_token"] / (r["decode_fill_ms_per_token"] / 1e3)
+                for r in timed if r["decode_fill_ms_per_token"]
+            )
+            if best_fill >= 0.9 * args.pcie_gbps:
+                print(f"\n[serve] the fill path is at {best_fill / args.pcie_gbps:.0%} of this "
+                      f"machine's measured pinned PCIe rate ({args.pcie_gbps:.1f} GB/s).")
+                print("        Transfers are running at hardware speed — there is nothing "
+                      "left to win by moving")
+                print("        the same bytes faster. Everything from here has to move "
+                      "*fewer* bytes: a better")
+                print("        eviction policy, experts computed on the CPU, or quantised "
+                      "weights.")
+
+    best = max(rows, key=lambda r: r["decode_tok_s"])
+    print(f"\n[serve] best decode {best['decode_tok_s']:.2f} tok/s at {best['capacity']} slots "
+          f"on the {best['path']} path "
+          f"({best['vram_gb']:.2f} GB resident, {best['decode_hit_rate']:.1%} hit rate)")
+    if baseline_tps:
+        print(f"        {best['decode_tok_s'] / baseline_tps:.1f}x the accelerate-offload "
+              f"baseline's {baseline_tps:.2f} tok/s, same prompt and same harness")
+    else:
+        print("        no baseline measured — pass --baseline for a like-for-like "
+              "comparison rather than quoting a figure from another run")
+    print("        Prefill's hit rate is low by construction, not by failure: a batch "
+          "touches the union of its tokens' experts,")
+    print("        which at these lengths is every expert in the layer. Only the "
+          "decode column is comparable to Q5's 54.5%.")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# ff-evict
+# --------------------------------------------------------------------------
+
+# Stage 1d's operating point, and the arithmetic that turns a simulated hit
+# rate into a throughput prediction. Measured at 256 slots, 88% of the store
+# pinned, grouped path, nine passes:
+#
+#     decode 6.92 tok/s  =  144.5 ms/token
+#     of which fill       =   91.1 ms/token  at 0.846 GB/token
+#                         =>  10.16 GB/s, 98% of this card's pinned PCIe rate
+#     everything else     =   53.4 ms/token
+#
+# The link is saturated (Stage 1c), so fill time is bytes / bandwidth with no
+# overlap term, and a policy that changes only the miss count moves only the
+# first line. This is a *prediction*, not a result: it assumes the new policy's
+# own bookkeeping is free, which for anything with a heap it is not.
+_MEASURED_TOK_S = 6.92
+_MEASURED_GB_PER_TOKEN = 0.846
+_MEASURED_FILL_MS = 91.1
+
+
+def _predict_tok_s(gb_per_token: float, *, fill_gbps: float, fixed_ms: float) -> float:
+    token_ms = fixed_ms + gb_per_token / fill_gbps * 1e3
+    return 1e3 / token_ms if token_ms > 0 else 0.0
+
+
+def evict_main(argv: list[str] | None = None) -> int:
+    """Rank eviction policies offline against a dumped runtime access log.
+
+    This exists so Stage 1e spends GPU time once instead of once per candidate.
+    Every policy here is a pure function of the key stream, so the ranking can
+    be produced on a laptop in seconds, and only the winner has to be built.
+    """
+    _force_utf8_stdout()
+
+    from . import cachesim
+
+    parser = argparse.ArgumentParser(
+        prog="ff-evict",
+        description="Rank cache eviction policies on a trace from ff-serve --dump-trace.",
+    )
+    parser.add_argument("trace", help="path to the .npz written by ff-serve --dump-trace")
+    parser.add_argument(
+        "--capacity", default=None,
+        help="slot counts to sweep, comma-separated (default: the trace's own)",
+    )
+    parser.add_argument(
+        "--phase", default="decode", choices=["decode", "prefill", "all"],
+        help="which part of the log to replay. Decode is the one that matters: "
+             "prefill's misses are compulsory, so every policy scores the same "
+             "there and including it dilutes the ranking toward zero",
+    )
+    parser.add_argument(
+        "--policies", default=",".join(cachesim.POLICIES + cachesim.CANDIDATES),
+        help="comma-separated policy names",
+    )
+    parser.add_argument(
+        "--slru-protected", default="0.6",
+        help="protected-segment fractions to sweep for slru, comma-separated",
+    )
+    parser.add_argument(
+        "--hybrid-pinned", default="0.5",
+        help="frequency-pinned fractions to sweep for hybrid, comma-separated",
+    )
+    parser.add_argument(
+        "--mib-per-expert", type=float, default=12.58,
+        help="bytes moved per miss (default: OLMoE fp16, measured in Q7)",
+    )
+    parser.add_argument(
+        "--fill-gbps", type=float, default=None,
+        help="fill bandwidth for the throughput prediction (default: derived "
+             "from the Stage 1d measurement)",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args(argv)
+    _setup_logging(args.verbose)
+
+    blob = np.load(args.trace)
+    keys = blob["keys"]
+    num_experts = int(blob["num_experts"])
+    decode_start = int(blob["decode_start"])
+    decode_tokens = int(blob["decode_tokens"])
+
+    if args.phase == "decode":
+        keys, tokens = keys[decode_start:], decode_tokens
+    elif args.phase == "prefill":
+        keys, tokens = keys[:decode_start], 1
+    else:
+        keys, tokens = keys, decode_tokens + 1
+    if keys.size == 0:
+        print(f"[evict] the {args.phase} slice of {args.trace} is empty")
+        return 1
+
+    per_token = keys.size / max(1, tokens)
+    capacities = (
+        [int(c) for c in args.capacity.split(",")]
+        if args.capacity else [int(blob["capacity"])]
+    )
+
+    # Expand the parameterised policies into one labelled run per value, so a
+    # fraction that happens to be bad cannot hide inside an averaged row.
+    requested = [p.strip() for p in args.policies.split(",") if p.strip()]
+    policies: list[str] = []
+    params: dict[str, dict[str, float]] = {}
+    sweeps = {
+        "slru": ("protected", args.slru_protected),
+        "hybrid": ("pinned", args.hybrid_pinned),
+    }
+    for name in requested:
+        if name in sweeps:
+            knob, values = sweeps[name]
+            for value in values.split(","):
+                label = f"{name}:{knob[0]}{value.strip()}"
+                policies.append(label)
+                params[label] = {knob: float(value)}
+        else:
+            policies.append(name)
+
+    bytes_per_expert = args.mib_per_expert * 1e6
+    fill_gbps = args.fill_gbps or (_MEASURED_GB_PER_TOKEN / (_MEASURED_FILL_MS / 1e3))
+    fixed_ms = 1e3 / _MEASURED_TOK_S - _MEASURED_FILL_MS
+
+    print(f"[evict] {keys.size:,} {args.phase} lookups, {per_token:.0f} per token, "
+          f"{np.unique(keys).size:,} distinct of {num_experts * int(blob['num_layers']):,} "
+          f"experts")
+    print(f"[evict] predicting throughput at {fill_gbps:.2f} GB/s fill and "
+          f"{fixed_ms:.1f} ms/token of non-transfer work\n")
+
+    frame = cachesim.sweep(
+        keys, capacities, policies=tuple(policies),
+        bytes_per_expert=bytes_per_expert, accesses_per_token=per_token,
+        stride=num_experts, params=params,
+    )
+    frame["gb_per_token"] = frame["fetch_bytes_per_token"] / 1e9
+    frame["pred_tok_s"] = [
+        _predict_tok_s(gb, fill_gbps=fill_gbps, fixed_ms=fixed_ms)
+        for gb in frame["gb_per_token"]
+    ]
+
+    for capacity in capacities:
+        at = frame[frame["capacity"] == capacity].sort_values("hit_rate", ascending=False)
+        lru = at[at["policy"] == "lru"]
+        base_hit = float(lru["hit_rate"].iloc[0]) if len(lru) else None
+        base_tps = float(lru["pred_tok_s"].iloc[0]) if len(lru) else None
+
+        print(f"{capacity} slots")
+        print(f"  {'policy':>14} {'hit rate':>9} {'vs lru':>8} {'GB/token':>9} "
+              f"{'pred t/s':>9} {'vs lru':>8}")
+        for _, row in at.iterrows():
+            delta = (f"{(row['hit_rate'] - base_hit) * 100:+5.1f} pt"
+                     if base_hit is not None else "")
+            gain = (f"{(row['pred_tok_s'] / base_tps - 1) * 100:+6.1f}%"
+                    if base_tps else "")
+            print(f"  {row['policy']:>14} {row['hit_rate']:>8.1%} {delta:>8} "
+                  f"{row['gb_per_token']:>9.3f} {row['pred_tok_s']:>9.2f} {gain:>8}")
+        print()
+
+    # The two rows that bound the exercise. Belady is the ceiling on any policy
+    # that fetches on demand; `static` and `hybrid` may sit above it because
+    # they preload and skip compulsory misses, which is a different game.
+    online = frame[
+        (frame["capacity"] == capacities[0])
+        & (~frame["policy"].str.startswith(("belady", "static", "hybrid")))
+    ]
+    if len(online):
+        best = online.loc[online["hit_rate"].idxmax()]
+        at = frame[frame["capacity"] == capacities[0]].set_index("policy")
+        if "belady" in at.index and "lru" in at.index:
+            gap = at.loc["belady", "hit_rate"] - at.loc["lru", "hit_rate"]
+            closed = (best["hit_rate"] - at.loc["lru", "hit_rate"]) / gap if gap else 0.0
+            print(f"[evict] best online policy is {best['policy']} at "
+                  f"{best['hit_rate']:.1%}, which closes {closed:.0%} of the "
+                  f"{gap * 100:.1f}-point gap to Belady")
+        print("[evict] this is a simulation. It charges nothing for the policy's own "
+              "bookkeeping,")
+        print("        and the runtime is bandwidth-bound, so a policy that costs "
+              "CPU time on the")
+        print("        critical path can win here and lose in ff-serve. Build the "
+              "winner, then measure it.")
+    return 0
+
+
 if __name__ == "__main__":
     sys.exit(collect_main())
