@@ -174,7 +174,7 @@ read 5.97 on five passes and 6.86 on nine, with a 5.77–6.90 spread:
 | path | precision | GB/token | dec hit | blocking fill | decode tok/s | verdict |
 |---|---|---|---|---|---|---|
 | grouped (no prefetch) | — | 0.846 | 47.5% | 116.1 ms | **6.86** | — |
-| `pf-all` (k=8) | 78.7% | 1.045 | 82.4% | 36.0 ms | 5.92 | **−14%, real (p=0.010)** |
+| `pf-all` (k=8) | 78.7% | 1.045 | 82.4% | 36.0 ms | 5.92 | **−14%; legacy blocked-order p=0.010** |
 | `pf-k4` | 92.8% | 0.872 | 69.8% | 69.6 ms | 6.36 | −7%, not distinguishable (p=0.09) |
 
 Prefetch never beat no-prefetch at any budget. Fetching all `top_k` is a
@@ -258,7 +258,7 @@ pinned    decode t/s   fill GB/s   % of this card's pinned PCIe rate (10.4)
   88%        6.92       10.16      ████████████████████ 98%
 ```
 
-**+38% decode, p=0.003, from a flag.** Bytes per token constant at 0.845, hit
+**+38% decode from a flag.** Bytes per token constant at 0.845, hit
 rate constant at 47.5% — the cache does identical work, only the speed changed.
 Bigger than the grouped GEMM (+27%) and bigger than everything Stage 1c built
 (0%).
@@ -322,26 +322,44 @@ single largest gain came from a flag that was already there.
 
 **Shipping defaults:** grouped **on** (measured bit-identical output at fp16 on
 the real model). Prefetch **off** — not "unproven" but *measured worse*: −14% at
-full budget, p=0.010. `--pin-gb` still defaults to 0 because page-locking is a
+full budget. `--pin-gb` still defaults to 0 because page-locking is a
 hard claim on the user's RAM, but `ff-serve` now says out loud that 0 is the
 slowest setting and suggests a value.
 
-**Test suite:** 36 checks, CPU-only, no model download. The loop path is held to
+**Runtime suite:** 69 checks, CPU-only, no model download. The loop path is held to
 a difference of **exactly 0.0** against the stock block; everything else is
 measured against it.
 
-**Open, and now narrow.** The fill path runs at 98% of the card's pinned PCIe
-rate, so *every* way of moving the same bytes faster is exhausted. Transfer is
-still **60% of a decode token**, which means eliminating it entirely would be
-+150% — a large budget, reachable only by moving fewer bytes:
+## Stage 1 closeout for Stage 2
 
-1. **Eviction policy** — Q5 measured 23.4 points of Belady headroom over LRU at
-   this capacity. Fewer misses is directly fewer bytes.
-2. **Q7's CPU path** — break-even is 10.8 routed tokens and decode has exactly
-   1, so every decode expert is on the wrong side of it. An expert computed in
-   place is a transfer that never happens.
-3. **Quantised experts** — halves bytes per miss outright, and the cache holds
-   twice as many for the same VRAM.
+The legacy p-values above came from timing every pass of one path before moving
+to the next. That order can turn temperature or background-load drift into a
+path effect, so those p-values are historical rather than canonical. The
+closeout rerun at 238 fp16 slots used nine matched rounds, shuffled path order
+inside every round, and an exact paired sign-randomisation test:
 
-Prefetch is closed, not parked: it works, and it cannot help here. Pinning is
-closed because it is finished.
+| comparison | phase | change | exact paired p | decision |
+|---|---|---:|---:|---|
+| loop → grouped | decode | **+34%** | **0.00390625** | ship grouped |
+| grouped → full prefetch | decode | **−12%** | **0.00390625** | keep off |
+| grouped → full prefetch | prefill | +1% | 0.20703125 | no finding |
+| grouped → prefill stream | prefill | **−28%** | **0.00390625** | keep off |
+| grouped → prefill stream | decode | +0% | 0.80859375 | no change, as intended |
+
+All nine decode differences favored grouped over loop, all nine favored grouped
+over full prefetch, and all nine prefill differences favored grouped over
+streaming. Greedy output was identical for all 65 checked tokens on every path.
+The raw samples, environment, configuration, actual round order, and p-values
+are in [`results/stage1_handoff.json`](results/stage1_handoff.json).
+
+Pinning's +38% direction was separately replicated in ascending and descending
+order, but its old blocked-order p=0.003 is not retained as inferential evidence.
+Likewise, fp16-vs-int8 requires sequential cache/model installs; the harness now
+records the effect size and raw samples but deliberately omits a p-value. Int8
+still fails its independent accuracy gate (98.767% against 99%), so neither
+caveat changes the shipping choice.
+
+Stage 2 starts from the grouped `torch.bmm` path on the RTX 2060 (sm_75).
+PyTorch compilation, workspace reuse, fewer host synchronisations, and native
+batched compositions come first. Custom Triton and sm_80+-only backends are
+deferred.
