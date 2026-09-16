@@ -305,9 +305,22 @@ same rows, same order, one eighth the elements — which moves the boundary to
       270     6.86         9.21    +34.2%   p=0.0027
       357     7.67        10.71    +39.6%   p=0.0022
 
-Non-fill time is now 55.1-55.4 ms across all three, the curve is monotonic, and
-the operating point is **357 slots at 10.71 tok/s**. See troubleshoot.md 4.13;
-the rule is that a step means a threshold and a slope means a resource.
+Non-fill time is now 55.1-55.4 ms across all three and the curve is monotonic.
+Re-running the whole ladder in one process against the fp16 control:
+
+    arm     slots   pool GB   prefill   decode
+    fp16      238      2.79     127.3     7.25
+    int8      238      1.86     171.6     9.13   +26%
+    int8      300      2.34     179.3    10.08   +39%
+    int8      357      2.79     188.6    10.67   +47%
+
+Every arm p<=0.003 over nine passes. Read the first and last rows together: the
+**same 2.79 GB of VRAM**, 50% more slots in it, +47% decode and +48% prefill.
+
+That also un-retracts something. Stage 1e-2 predicted +42% from 357 int8 slots,
+measured +8%, and concluded the prediction was wrong. The prediction was right
+and conservative; the instrument was wrong. See troubleshoot.md 4.13 — a step
+means a threshold, a slope means a resource.
 
 476 slots is a *different* failure and is kept in the table for it: 97.3% hit
 rate, 0.029 GB/token, 2.5 ms fill — every intermediate metric the best in the

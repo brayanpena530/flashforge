@@ -66,7 +66,9 @@ class QuantSpec:
     scale exists to place. The shortfall is int8 rounding itself.
 
     The default is kept because it is still the best of the variants measured
-    and the throughput win is real (+17%), but it is a *default*, not a
+    and the throughput win is large — **+47% decode and +48% prefill against the
+    fp16 control at identical VRAM**, once Stage 1e-2c took the gather cliff out
+    of the capacity curve — but it is a *default*, not a
     clearance. See the runtime package docstring before shipping it.
     """
 

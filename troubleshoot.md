@@ -735,6 +735,22 @@ a model that is quietly wrong. The check that earns its place asserts
 byte-identical rows against the slow path, with repeated and out-of-order
 indices, because both occur.
 
+**Corollary, and the expensive one.** A measurement that contradicts a
+prediction can be the broken thing. Stage 1e-2 predicted +42% from 357 int8
+slots, measured +8%, and retracted the prediction — writing "spending the
+savings on slots is not what pays" into the README, the roadmap, and two
+docstrings. With the cliff removed it measures **+47%**. The model was right and
+conservative; the instrument was wrong, and the instrument won because
+measurements are supposed to win.
+
+What should have raised the alarm was already printed: *every intermediate
+metric improved while the outcome got worse*. Hit rate up, bytes per token down,
+fill time down, throughput down. That pattern is not a surprising result, it is
+a **missing term** — something is being paid for that nothing in the table
+counts. Twice in this stage it appeared and was read as a curiosity: here, and
+at 476 slots where the driver pages the pool. When the components all improve
+and the total does not, do not update the theory. Go find the term.
+
 **Corollary:** an optimisation aimed at one dtype may be helping the control
 too. Widening is not an int8 feature — an fp16 pool divides into int64 just as
 well — so the fp16 baseline had to be re-measured widened before any int8-vs-fp16
@@ -762,3 +778,5 @@ comparison that ran through it, in both arms.
     path in your own code removes that floor entirely?
 11. Did you get the `n` you asked for? Print it; a slice returns fewer without
     saying so.
+12. Did every component metric improve while the total got worse? That is a
+    missing term, not a surprising result. Find it before you write the table.

@@ -1166,7 +1166,11 @@ def serve_main(argv: list[str] | None = None) -> int:
         help="append quantised runs at these capacities after the fp16 ones, in "
              "the same invocation. This is how int8 is actually scored: the two "
              "arms have to share one loaded machine, and the extra slots are "
-             "the point, so they cannot share a capacity either",
+             "the point, so they cannot share a capacity either. 357 is the "
+             "measured best on a 6 GB card (Stage 1e-2c); below 256 you are on "
+             "the wrong side of the curve and above ~400 the driver starts "
+             "paging the pool, which reads as every metric improving while "
+             "throughput collapses",
     )
     parser.add_argument(
         "--fake-quant-int8", action="store_true",

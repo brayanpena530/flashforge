@@ -577,19 +577,19 @@ holding a 12 GB store.
 
 Every arm is p≤0.027 over nine passes, and 238 was run twice (8.32, 8.29).
 
-**Spending the savings on slots is not what pays.** The predicted +42% assumed
-357 slots; the measured peak is **+17% at 238 slots**, where the pool is
-*smaller* than the fp16 one it replaces. The curve is not monotonic and the
-usual explanations do not survive the 238-vs-270 pair: identical bytes per token
-(0.566 vs 0.557), identical fill time (54.2 vs 53.4 ms), 18% different
-throughput. 26 ms/token goes somewhere that is neither transfer nor cache
-behaviour.
+At the time this read as **"spending the savings on slots is not what pays"** —
+the predicted +42% assumed 357 slots, the measured peak was +17% at 238, and the
+curve was not monotonic. The 238-vs-270 pair refused every explanation:
+identical bytes per token (0.566 vs 0.557), identical fill time (54.2 vs 53.4
+ms), 18% different throughput, with 26 ms/token unaccounted for.
 
-**That was an open question for four commits, and it is now closed: the pool
-crossed `INT32_MAX` elements and `index_select` fell off its vectorised path.**
-Fixing it makes the curve monotonic, moves the operating point to 357 slots, and
-is worth +28% on its own — so the table above is the *before*. See "Stage
-1e-2c" below.
+**Every word of that conclusion was an artifact, and the table above is now the
+*before*.** The pool was crossing `INT32_MAX` elements at 256 slots and
+`index_select` was falling off its vectorised path — so the ladder was measuring
+a kernel boundary and attributing it to capacity. With that fixed the curve is
+monotonic, the peak moves to 357 slots, and the original +42% prediction turns
+out to have been **right, and low**: the measurement was wrong, not the model.
+See "Stage 1e-2c" below.
 
 **The accuracy claim did not replicate**, reading **98.76% ± 0.15%** against the
 99% bar. That verdict happened to be right and could not have been known to be.
@@ -674,8 +674,9 @@ grid it defines.** The scale is not where the error is. The error is int8
 rounding itself, which is the one thing an int8 path cannot give back.
 
 So the bar is missed for a reason with no remaining lever, and `--int8` stays
-opt-in on its throughput case alone: **+17% decode, 98.767% agreement, and you
-decide whether that trade is yours to make.**
+opt-in on its throughput case alone — which got considerably stronger one
+section later: **+47% decode and +48% prefill at equal VRAM, against 98.767%
+agreement. You decide whether that trade is yours to make.**
 
 ```bash
 uv run python tools/scale_precision.py
@@ -686,7 +687,8 @@ uv run python tools/scale_precision.py
 Stage 1e-2 left one thing unexplained, and recorded it honestly as an open
 question: 238 and 270 int8 slots move the same bytes per token (0.566 vs 0.557),
 block on fill for the same time (54.2 vs 53.4 ms), have the same hit rate — and
-differ by 18% in throughput. It sat directly under the shipped `+17%` headline.
+differ by 18% in throughput. It sat directly under the shipped `+17%` headline,
+and it turned out to be holding that headline down by a factor of three.
 
 **The first step was to stop assuming it was about capacity.** The ladder runs
 seven arms in one process in ascending order, so capacity and sweep position
@@ -763,6 +765,60 @@ evenly, so a toy shape in the tests degrades instead of raising, and
 `tests/runtime_check.py` holds the widened gather to byte-identical rows against
 the narrow one — including repeated and out-of-order indices.
 
+### The ladder re-run, one process, one model load
+
+The paired numbers above come from a tool that toggles the gather within a
+capacity. This is the shipping comparison — `tools/int8_ab.py` unchanged,
+quantising in place between arms so the fp16 control and every int8 arm share
+one loaded machine:
+
+| arm | slots | pool GB | free GB | prefill t/s | decode t/s | hit | GB/token | fill ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| fp16 | 238 | **2.79** | 0.95 | 127.3 | 7.25 | 47.2% | 0.850 | 90.0 |
+| int8 | 200 | 1.56 | 2.35 | 168.6 | 8.37 *(+16%)* | 36.6% | 0.681 | 64.6 |
+| int8 | 238 | 1.86 | 2.05 | 171.6 | 9.13 *(+26%)* | 47.3% | 0.566 | 54.4 |
+| int8 | 270 | 2.11 | 1.80 | 175.2 | 9.21 *(+27%)* | 48.1% | 0.557 | 53.4 |
+| int8 | 300 | 2.34 | 1.57 | 179.3 | 10.08 *(+39%)* | 57.4% | 0.458 | 44.0 |
+| int8 | 330 | 2.58 | 1.33 | 184.6 | 10.50 *(+45%)* | 61.1% | 0.417 | 40.3 |
+| **int8** | **357** | **2.79** | 0.91 | **188.6** | **10.67** *(+47%)* | 63.5% | 0.392 | 38.4 |
+
+Every arm p≤0.003 over nine passes. **Monotonic in capacity**, which it has never
+been before.
+
+The first and last rows are the ones to read together: **the same 2.79 GB of
+VRAM**, 50% more slots in it, **+47% decode and +48% prefill**. That is the
+comparison Stage 1e-2 was designed to make and could not, because the cliff
+landed between the two ends of it.
+
+It also settles an old retraction. Stage 1e-2 predicted +42% from 357 int8
+slots, measured +8% there, and concluded the prediction was wrong. The
+prediction was right — and conservative. What was wrong was the instrument, for
+the second time in this stage, and in the same direction both times: the
+measurement was believed over the model because measurements are supposed to win.
+
+### The control: widening is not an int8 feature, but the baseline barely moves
+
+An fp16 pool divides into int64 just as well, so the fp16 *baseline* the int8
+win is quoted against had to be re-measured widened before any ratio could be
+repeated. If the control had moved, every int8-vs-fp16 number in this README was
+measured against a slower fp16 than the one that now ships.
+
+| fp16, 238 slots | tok/s | fill | non-fill |
+|---|---:|---:|---:|
+| raw gather | 7.20 | 90.3 ms | 48.5 ms |
+| widened | 7.28 | 89.8 ms | 47.6 ms |
+
+**+1.1% at p=0.0553 — not distinguishable.** Two reasons, and both were
+predicted rather than discovered: an fp16 pool holds 1.50 billion elements at
+238 slots, comfortably inside `INT32_MAX`, so there is no cliff to fall off;
+and fp16 decode is 65% blocked on fill against int8's 45%, so the gather is a
+smaller share of a token to begin with. The cliff is a *quantised*-pool problem
+because quantisation is what makes elements and bytes the same thing.
+
+Worth noting what this says about the two paths. fp16 non-fill is 48.5 ms
+against raw int8's 65.4 ms — int8 pays about 17 ms per token to dequantise
+inside `gather`. Widening gives 10 of that back.
+
 ### 476 slots is a different failure, and worth keeping in the table
 
 | slots | tok/s | hit | GB/token | fill | free VRAM |
@@ -835,7 +891,7 @@ cost models is what was never checked.
 
 **Stage 1e-2 made this worse, not better.** int8 weights have to be dequantised
 before a CPU GEMM that has no int8 kernel, and that pass runs at 1.41 GB/s —
-**4.4× slower** than reading fp32 directly. The store format that bought +17% on
+**4.4× slower** than reading fp32 directly. The store format that bought +47% on
 the link costs the CPU path more than the CPU path was ever worth. The two
 optimisations are not merely independent, they are opposed.
 
@@ -1212,9 +1268,9 @@ is a custom module and will need its own branch in `discover_moe()`.
 - **Stage 1d — pinning** *(done, and the largest single gain in the project: **+38% decode, p=0.003**, from a flag that already existed and defaulted to off. 19.5x the measured baseline. The fill path now runs at 98% of this card's pinned PCIe rate, so transfer optimisation is **finished** — see "Stage 1d" above.)*
 - **Stage 1e — move fewer bytes.** Transfer is still 60% of a decode token, so eliminating it would be +150%, and every way of moving the same bytes *faster* is now exhausted.
   - **1e-1 — eviction policy** *(**closed negative**. Four candidates ranked offline on 147k decode lookups across 18 documents; the best beats LRU by 1.9 points, or +2.6% predicted — inside the harness's own noise. Nothing shipped. The useful finding is the conversion rate: Belady's 21.4-point gap is worth exactly 1.8x the cache, and capacity is purchasable where prophecy is not. See "Stage 1e" above.)*
-  - **1e-2 — quantised experts** *(**built and measured; throughput real, accuracy short of the bar**. int8 rows with the scales packed on the end, dequant inside `cache.gather()`, bit-exact against the stock block. Decode **+17% at 238 slots, p=0.003** — but the +42% prediction assumed 357 slots and 357 measures +8%, so spending the savings on capacity is not what pays and the curve is not monotonic. Agreement replicates at **98.76% ± 0.15%**, below the 99% bar; the 99.13% that qualified the stage was one draw at a 0.31% standard error. See "Stage 1e-2" above.)*
+  - **1e-2 — quantised experts** *(**built and measured; throughput real, accuracy short of the bar**. int8 rows with the scales packed on the end, dequant inside `cache.gather()`, bit-exact against the stock block. Decode **+47% at 357 slots, p=0.003**, at the *same 2.79 GB pool* the fp16 control uses — and prefill +48%. The first reading of this said +17% at 238 with a non-monotonic curve and a wrong +42% prediction; all three were the gather cliff of 1e-2c, and the prediction was right. Agreement replicates at **98.76% ± 0.15%**, below the 99% bar; the 99.13% that qualified the stage was one draw at a 0.31% standard error. See "Stage 1e-2" above.)*
   - **1e-2b — make the bar measurable** *(**done, and the verdict now stands at 3.3σ**. The 99% bar had been applied with an instrument that could not resolve it: agreement was scored on the grouped path, whose `index_add_` nondeterminism is a **0.411-point** floor against a 0.233-point gap, and on the built-in 24-prompt starter set rather than the 512-token corpus already in the repo — `DIVERGENCE_DOCS = 48` was silently truncated to 24, so n was 2,545, not the 5,300 its own comment claimed. Fixed both: loop path, real corpus, **24,576 positions**, with a floor control that reads exactly **100.000%**. int8 scores **98.767% ± 0.070%, failing by 0.233 points**. The point estimate moved by 0.007 — the old conclusion was right and unjustified. **fp32 scales closed negative** in three minutes with no GPU: they remove **0.00%** of the weight error, because fp16's mantissa is already three bits finer than the 256-level grid it scales. No lever remains. See "Stage 1e-2b" above.)*
-  - **1e-2c — the 26 ms/token** *(**explained, fixed, and the largest decode gain since pinning**. The int8 ladder's unexplained 18% hole was not about capacity at all: an int8 pool is one element per byte, so it crosses `INT32_MAX` **elements** at 256 slots, `index_select` falls to 64-bit index math, and gather bandwidth halves — 116 GB/s at 255 slots, 49 GB/s at 256, flat either side. A step, not a slope, which is why splitting token time into fill and non-fill found it in one reading: 66.0 ms flat, one jump, 92.6 ms flat. The fix is to select through an **int64 view of the same bytes** — same rows, same order, one eighth the elements — which moves the boundary to 2,047 slots and is faster below it too. **+9.3% at 238 slots, +34.2% at 270, +39.6% at 357** (all p<0.003), non-fill time flat at 55.1–55.4 ms, and the operating point moves to **357 slots at 10.71 tok/s, +28% over what was shipping**. 476 slots is excluded and printed: 97.3% hit rate, 0.029 GB/token, 1.21 tok/s — the driver paging the pool, which is 1.10 and not this. See "Stage 1e-2c" above.)*
+  - **1e-2c — the 26 ms/token** *(**explained, fixed, and the largest decode gain since pinning**. The int8 ladder's unexplained 18% hole was not about capacity at all: an int8 pool is one element per byte, so it crosses `INT32_MAX` **elements** at 256 slots, `index_select` falls to 64-bit index math, and gather bandwidth halves — 116 GB/s at 255 slots, 49 GB/s at 256, flat either side. A step, not a slope, which is why splitting token time into fill and non-fill found it in one reading: 66.0 ms flat, one jump, 92.6 ms flat. The fix is to select through an **int64 view of the same bytes** — same rows, same order, one eighth the elements — which moves the boundary to 2,047 slots and is faster below it too. **+9.3% at 238 slots, +34.2% at 270, +39.6% at 357** (all p<0.003), non-fill time flat at 55.1–55.4 ms, and the operating point moves to **357 slots**. Re-run end to end in one process, int8 at 357 slots now beats the fp16 control by **+47% decode and +48% prefill at identical VRAM** (2.79 GB either way), on a curve that is monotonic in capacity for the first time — so the "+17%, and spending the savings on slots is not what pays" this stage shipped with was the cliff talking, and 1e-2's retracted +42% prediction was right all along. 476 slots is excluded and printed: 97.3% hit rate, 0.029 GB/token, 1.21 tok/s — the driver paging the pool, which is 1.10 and not this. See "Stage 1e-2c" above.)*
   - **1e-3 — Q7's CPU path** *(**closed negative**, and qualified in two minutes with no runtime code. Q7's m\* = 10.8 does put every decode expert on the CPU's side, but near-parity means the win had to come from running both channels at once — and they are not two channels. CPU cores and the DMA engine both read expert weights out of host DRAM: overlap efficiency **η = 0.70 at best**, with the *link* absorbing the loss (40–52% of its solo rate, against the CPU's 78–94%). Best predicted gain **+7%** against a pre-committed +15% bar. int8 makes it worse — dequantising for a CPU GEMM runs 4.4x slower than reading fp32. See "Stage 1e-3" above.)*
   - **1e-4 — prefill streaming** *(**closed negative**, and the most instructive failure in the project: the mechanism worked perfectly and the premise was wrong. Fetching the next layer's whole expert set on the side stream takes prefill's hit rate 7.1% → **95.0%** and its blocking fill 78.1% → **3.0%** — the stall is gone — and prefill still drops **−25% (p=0.011)**, because a prefill layer routes to **41.4** of 64 experts, not "nearly all", so fetch-all moves 1.58x the bytes. Stage 1c's arithmetic, reproduced by its own author three stages later. Kept, off, bit-exact. See "Stage 1e-4" above.)*
 - **Stage 2** — Triton kernels: fused gather-GEMM, dequant, fused router. *Needs sm_80+.*
