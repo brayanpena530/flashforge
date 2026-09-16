@@ -1068,7 +1068,9 @@ def serve_main(argv: list[str] | None = None) -> int:
         help="expert execution path, or several comma-separated. 'loop' is the "
              "bit-exact reference, one GEMM "
              "per expert; 'grouped' is Stage 1b's batched bmm; 'prefetch' is "
-             "grouped plus Stage 1c's side-stream speculative fill. 'both' is "
+             "grouped plus Stage 1c's side-stream speculative fill; 'stream' is "
+             "Stage 1e-4's prefill streaming, which fetches the next layer's "
+             "whole expert set during prefill and leaves decode alone. 'both' is "
              "loop+grouped, 'all' adds prefetch. Several paths are timed back to "
              "back on the same loaded model and the same warm cache, which is the "
              "only way to attribute a difference to the path",
@@ -1201,8 +1203,12 @@ def serve_main(argv: list[str] | None = None) -> int:
         "both": ["loop", "grouped"],
         "all": ["loop", "grouped", "prefetch"],
     }.get(args.path) or [n for n in args.path.split(",") if n.strip()]:
+        # `stream` is Stage 1e-4: grouped, no speculation, but the next layer's
+        # whole expert set fetched on the side stream during prefill. It runs
+        # the grouped kernels, so it is paired against `grouped` — the thing it
+        # changes is the prefill column, which prefetch never touched.
         if name != "prefetch":
-            kinds.append((name, name == "grouped", None))
+            kinds.append((name, name in ("grouped", "stream"), None))
             continue
         for value in (int(v) for v in args.prefetch_k.split(",") if v.strip()):
             kinds.append((f"pf-k{value}" if value else "pf-all", True, value or None))
@@ -1476,6 +1482,7 @@ def serve_main(argv: list[str] | None = None) -> int:
                 # The last block has no next_gate, so this is a no-op there.
                 block.prefetch = prefetch_k is not None or path.startswith("pf-")
                 block.prefetch_k = prefetch_k
+                block.stream_prefill = path.startswith("stream")
 
             # A path that cannot run must not discard the paths that already
             # did. A pin sweep found this the hard way: the highest coverage

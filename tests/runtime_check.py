@@ -642,6 +642,51 @@ check("a truncated prefetch still produces the full answer", delta == 0.0,
       f"max abs difference {delta:.3e} — prefetch_k changes what is speculated, "
       "never what is computed")
 
+print("\nPrefill streaming (Stage 1e-4)")
+
+# The whole claim of 1e-4 is that it is a *scheduling* change: it moves when a
+# weight arrives, never which weight runs. Unlike int8, that is checkable
+# exactly, so it is checked exactly rather than argued for in a docstring.
+stream = copy.deepcopy(model)
+stream_report = install_expert_cache(
+    stream, capacity=L * E, device="cpu", stream_prefill=True
+)
+stream_ref = copy.deepcopy(model)
+install_expert_cache(stream_ref, capacity=L * E, device="cpu")
+
+# More tokens than experts, which is what `_is_prefill` keys on.
+prefill_in = torch.randn(1, 4 * E, H)
+stream_report.cache.stats.reset()
+with torch.no_grad():
+    delta = (stream(prefill_in) - stream_ref(prefill_in)).abs().max().item()
+check("streamed prefill is bit-exact against the demand path", delta == 0.0,
+      f"max abs difference {delta:.3e} — a prefetch moves a weight, never picks one")
+
+issued = stream_report.cache.stats.prefetch_issued
+check("streaming actually fetched ahead during prefill", issued > 0,
+      f"{issued} speculative fills issued across {len(stream_report.blocks) - 1} "
+      "streaming layers; zero would mean the path was wired but never taken")
+
+# Decode must be untouched. 1e-4 is a prefill change, and the prefetcher it
+# borrows lost on decode by 14% (Stage 1c) — so a flag that leaked into decode
+# would be a known regression wearing this stage's name.
+before_issued = stream_report.cache.stats.prefetch_issued
+with torch.no_grad():
+    stream(torch.randn(1, 1, H))
+check("streaming is inert on a decode-shaped batch",
+      stream_report.cache.stats.prefetch_issued == before_issued,
+      "one token routes to top_k, not to the layer — there is nothing to stream")
+
+# Two layers of experts do not fit at a capacity of E + 1, so `prefetch` has to
+# clamp the fetch to the room it has. The output must still be right.
+cramped = copy.deepcopy(model)
+install_expert_cache(cramped, capacity=E + 1, device="cpu", stream_prefill=True)
+with torch.no_grad():
+    delta = (cramped(prefill_in) - stream_ref(prefill_in)).abs().max().item()
+check("streaming degrades rather than fails below two layers of capacity",
+      delta == 0.0,
+      f"max abs difference {delta:.3e} — the fetch truncates, the demand path covers it")
+
 print("\nRouting is untouched")
 patched = copy.deepcopy(model)
 install_expert_cache(patched, capacity=L * E, device="cpu")

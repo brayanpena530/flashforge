@@ -80,6 +80,30 @@ class CachedMoEBlock(nn.Module):
         # for a 78% precision return. Fetching fewer spends the speculation
         # budget on the confident end of the prediction only.
         self.prefetch_k: int | None = None
+        # Stage 1e-4, and it MEASURED NEGATIVE: prefill 119.8 -> 90.4 tok/s,
+        # -25% at p=0.011. Kept, off, because the mechanism works exactly as
+        # designed and only the economics fail — the same shape as `prefetch`.
+        #
+        # The idea was that prefill needs no predictor: fetch the next layer's
+        # whole expert set, since a large batch routes to nearly all of them
+        # anyway. The mechanism delivered completely. Prefill hit rate goes
+        # 7.1% -> 95.0% and blocking fill goes 78.1% -> 3.0% of prefill wall
+        # clock. Essentially all of the transfer stall is gone.
+        #
+        # The premise was wrong. A 128-token prefill layer routes to 41.4 of
+        # 64 experts, not "nearly all" — so fetching all 64 is a 65% precision
+        # prediction and moves 1.58x the bytes (7.75 -> 12.21 GB). Prefill is
+        # transfer-bound at 78%, so bytes set the time: 12.21 GB at the
+        # measured 9.29 GB/s is 1314 ms against a 1068 ms baseline, and the
+        # run came back at 1415. The overlap it bought was real and could only
+        # ever have been worth the 22% that is compute.
+        #
+        # This is Stage 1c's arithmetic exactly — speculation loses on a
+        # saturated link because extra bytes cost more than hidden latency
+        # saves — and the only variant with a positive ceiling is pipelining
+        # *within* a layer, where the routing is already known and precision is
+        # 100%. That caps at the 22% compute share. See README, Stage 1e-4.
+        self.stream_prefill = False
         # A prefill batch routes to every expert in the layer, and gathering all
         # 64 of OLMoE's costs 805 MB of transient VRAM — on a 6 GB card holding a
         # 3.9 GB slot pool, that is the difference between running and OOM. The
@@ -125,11 +149,18 @@ class CachedMoEBlock(nn.Module):
         counts_all = torch.bincount(selected_experts.reshape(-1), minlength=self.num_experts)
 
         predicted: list[int] | None = None
-        if self.prefetch and self.next_gate is not None and not self._is_prefill(hidden_states):
+        prefill = self._is_prefill(hidden_states)
+        if self.prefetch and self.next_gate is not None and not prefill:
             fused = torch.cat([counts_all, self._predict_next(hidden_states)]).tolist()
             predicted = [e for e in range(self.num_experts) if fused[self.num_experts + e]]
         else:
             fused = counts_all.tolist()
+            if self.stream_prefill and prefill and self.next_layer_idx is not None:
+                # No predictor, no matmul, and — the part that matters — no
+                # second device->host sync. Stage 1c's prefetcher cost 68
+                # ms/token by adding syncs to hide a stall; this adds none,
+                # because `range` needs nothing off the device.
+                predicted = list(range(self.num_experts))
 
         routed = [e for e in range(self.num_experts) if fused[e]]
         group_sizes = [fused[e] for e in routed]
@@ -259,9 +290,14 @@ class CachedMoEBlock(nn.Module):
     def _is_prefill(self, hidden_states: torch.Tensor) -> bool:
         """More tokens than experts, so the batch routes to essentially all of them.
 
-        Prefetching that is pure loss: there is nothing left to predict, and the
-        speculative fetch would be a second whole-layer transfer stacked on top
-        of the demand one it cannot avoid.
+        *Speculative* prefetching here is pure loss: there is nothing left to
+        predict, and a guessed fetch would be a second whole-layer transfer
+        stacked on top of the demand one it cannot avoid.
+
+        Stage 1e-4 turns that around. The same fact that makes prediction
+        pointless — the next layer will want nearly all 64 — makes an
+        unconditional fetch of all 64 correct, which is not speculation but
+        scheduling. See `stream_prefill`.
         """
         return hidden_states.shape[0] > self.num_experts
 

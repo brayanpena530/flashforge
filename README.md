@@ -669,6 +669,70 @@ enough to feed both (η is a property of *this* box, and a server with more
 memory channels would score differently), or an int8 CPU kernel that reads the
 quantised weights without expanding them. Neither is reachable here.
 
+## Stage 1e-4 — closed negative: the mechanism worked, the premise was wrong
+
+Prefill blocks on transfer for **76.9%** of its wall clock, and unlike decode it
+needs no predictor to fix that: a large batch routes to nearly every expert in
+the layer, so "fetch the whole next layer on the side stream" is a prediction
+that is right by construction. It reuses Stage 1c's machinery with the predictor
+deleted, adds no device→host sync, and cannot change the model's output —
+`tests/runtime_check.py` holds it to a difference of exactly zero.
+
+```bash
+ff-serve --capacity 238 --path grouped,stream --prompt-tokens 128 --repeats 7 --pin-gb 7
+```
+
+| path | prefill t/s | spread | pf hit | prefill GB | blocking fill |
+|---|---:|---|---:|---:|---:|
+| grouped | **119.8** | 97.3–121.0 | 7.1% | 7.75 | 78.1% |
+| stream | **90.4** | 89.8–90.8 | **95.0%** | **12.21** | **3.0%** |
+
+**−25%, p=0.011.** And read the other three columns before concluding the idea
+was incoherent, because the mechanism did everything it was built to do: the
+prefill hit rate goes 7.1% → 95.0% and blocking fill goes 78.1% → **3.0%**. The
+transfer stall is gone. It was replaced by 58% more bytes.
+
+### The premise was checkable and was not checked
+
+The design assumed a prefill layer routes to "essentially all 64" experts.
+It routes to **41.4**. That number was sitting in the output the whole time —
+7.75 GB of demand traffic ÷ 12.58 MB per expert ÷ 16 layers ÷ the 92.9% miss
+rate — and it was inferred from the hit rate instead, which quietly assumes the
+denominator the inference was supposed to produce.
+
+So fetching all 64 is a **65% precision** prediction, not the ~93% claimed. The
+rest is arithmetic that this project has already published once:
+
+```
+demand:  834 ms transfer + 234 ms compute        = 1068 ms   (119.8 tok/s)
+stream:  12.21 GB / 9.29 GB/s, compute hidden    = 1314 ms   predicted
+                                                   1415 ms   measured
+```
+
+Prefill is transfer-bound, so bytes set the clock, and perfect overlap of a
+234 ms compute phase can never pay for 246 ms of extra transfer. **This is
+Stage 1c's finding, reproduced by its author three stages later** — with the
+`prefetch` docstring open, which states the rule in as many words: the link is
+saturated, so throughput is bandwidth ÷ bytes, and overlap cannot buy bytes.
+
+### What would have a positive ceiling, and why it is still not worth building
+
+Every version of this that adds bytes loses. The only variant that adds none is
+pipelining **within** a layer — the routing for layer *L* is already known when
+its fill is issued, so chunk it, and run the first chunk's GEMMs while the
+second chunk copies. Precision is 100% by construction.
+
+Its ceiling is exactly the compute share it can hide: **22% of prefill**. At the
+harness's shape (128-token prompt, 64 generated tokens) prefill is 11% of
+end-to-end, so 22% of it is **+2.4% overall** — below this harness's ±8% decode
+spread and below prefill's own ±10%. It is filed, not built.
+
+The honest framing for any prefill work on this model: prefill transfer bytes
+are **constant in prompt length** past a few dozen tokens, because you touch
+every expert either way, while compute scales linearly. Prefill optimisation
+therefore pays at long prompts and short generations, and this benchmark is the
+opposite shape.
+
 ## Stage 0 — instrumentation
 
 Answers eight questions, each of which gates a later design decision. Q1–Q6
@@ -975,7 +1039,7 @@ is a custom module and will need its own branch in `discover_moe()`.
   - **1e-1 — eviction policy** *(**closed negative**. Four candidates ranked offline on 147k decode lookups across 18 documents; the best beats LRU by 1.9 points, or +2.6% predicted — inside the harness's own noise. Nothing shipped. The useful finding is the conversion rate: Belady's 21.4-point gap is worth exactly 1.8x the cache, and capacity is purchasable where prophecy is not. See "Stage 1e" above.)*
   - **1e-2 — quantised experts** *(**built and measured; throughput real, accuracy short of the bar**. int8 rows with the scales packed on the end, dequant inside `cache.gather()`, bit-exact against the stock block. Decode **+17% at 238 slots, p=0.003** — but the +42% prediction assumed 357 slots and 357 measures +8%, so spending the savings on capacity is not what pays and the curve is not monotonic. Agreement replicates at **98.76% ± 0.15%**, below the 99% bar; the 99.13% that qualified the stage was one draw at a 0.31% standard error. The grouped path's own nondeterminism is 0.28 points, a quarter of the gap. Open: fp32 scales, the one untried lever that could recover the bar. See "Stage 1e-2" above.)*
   - **1e-3 — Q7's CPU path** *(**closed negative**, and qualified in two minutes with no runtime code. Q7's m\* = 10.8 does put every decode expert on the CPU's side, but near-parity means the win had to come from running both channels at once — and they are not two channels. CPU cores and the DMA engine both read expert weights out of host DRAM: overlap efficiency **η = 0.70 at best**, with the *link* absorbing the loss (40–52% of its solo rate, against the CPU's 78–94%). Best predicted gain **+7%** against a pre-committed +15% bar. int8 makes it worse — dequantising for a CPU GEMM runs 4.4x slower than reading fp32. See "Stage 1e-3" above.)*
-  - **1e-4 — prefill streaming** *(prefill moves 7.59 GB per prompt at a 9% hit rate — 59% of the whole model — because it touches every expert in every layer anyway. The LRU cache is pure overhead there; a fixed layer-order stream would do the same work without the eviction thrash.)*
+  - **1e-4 — prefill streaming** *(**closed negative**, and the most instructive failure in the project: the mechanism worked perfectly and the premise was wrong. Fetching the next layer's whole expert set on the side stream takes prefill's hit rate 7.1% → **95.0%** and its blocking fill 78.1% → **3.0%** — the stall is gone — and prefill still drops **−25% (p=0.011)**, because a prefill layer routes to **41.4** of 64 experts, not "nearly all", so fetch-all moves 1.58x the bytes. Stage 1c's arithmetic, reproduced by its own author three stages later. Kept, off, bit-exact. See "Stage 1e-4" above.)*
 - **Stage 2** — Triton kernels: fused gather-GEMM, dequant, fused router. *Needs sm_80+.*
 - **Stage 3** — scale to V4-Flash, where the routed pool may not fit in RAM either and experts stream disk→RAM→GPU. *Needs RAM and NVMe headroom.* Q8 is the go/no-go: if `t_disk` needs more lookahead than Q3 shows prediction surviving, the disk tier has to be driven by a longer-horizon signal rather than per-layer routing prediction.
 

@@ -63,6 +63,7 @@ def install_expert_cache(
     pin_gb: float = 0.0,
     grouped: bool = True,
     prefetch: bool = False,
+    stream_prefill: bool = False,
     quant: QuantSpec | None = None,
 ) -> PatchReport:
     """Move experts to host RAM, front them with a GPU cache, return the wiring.
@@ -87,6 +88,30 @@ def install_expert_cache(
     and the decode hit rate goes 47.5% -> 82.4%. But the link is saturated at
     ~5.8 GB/s, so decode speed is bandwidth / bytes-per-token, and speculation
     at 78.7% precision adds 23% more bytes. Overlap cannot pay for them.
+
+    `stream_prefill` selects Stage 1e-4. It is the same side-stream machinery
+    as `prefetch` with the predictor removed, because during prefill there is
+    nothing to predict: a batch past a few dozen tokens routes to nearly every
+    expert in the next layer, so fetching all of them is right by construction.
+
+    It defaults **off because it was measured and lost**: prefill 119.8 -> 90.4
+    tok/s, **-25% at p=0.011**. It was predicted to win on the grounds that
+    `prefetch`'s arithmetic did not apply here — speculation lost because it
+    added 23% more bytes to a saturated link, and this was supposed to add ~7%.
+    It adds **58%**, because a 128-token prefill layer routes to 41.4 of 64
+    experts rather than the "nearly all" the design assumed. Prefill is
+    transfer-bound at 78%, so bytes set the clock and the overlap cannot pay.
+
+    The mechanism is not what failed, and the counters say so loudly: prefill
+    hit rate 7.1% -> **95.0%**, blocking fill 78.1% -> **3.0%** of prefill wall
+    clock. It removed nearly all of the stall it was built to remove.
+
+    It cannot change the model's output — a prefetch only moves where a weight
+    already is, never which weight runs — so unlike `quant` there is no
+    numerics risk here, and `tests/runtime_check.py` holds it to a bit-exact
+    difference of zero. It needs room for two layers of experts at once
+    (`capacity >= 2 * num_experts`); below that `prefetch` truncates the fetch
+    to whatever is free and the overlap degrades smoothly rather than failing.
 
     `quant` selects Stage 1e-2's int8 experts. It is applied to the store before
     the cache is built, because the cache sizes its pool from the store's row
@@ -157,6 +182,7 @@ def install_expert_cache(
         block.next_gate = following.gate
         block.next_layer_idx = following.layer_idx
         block.prefetch = prefetch
+        block.stream_prefill = stream_prefill
 
     model.to(device)
     gc.collect()

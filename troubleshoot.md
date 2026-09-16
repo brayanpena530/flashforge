@@ -599,6 +599,42 @@ independent; they are competing for the same machine.
 
 ---
 
+### 4.11 Deriving a quantity from a rate whose denominator is the quantity
+
+Stage 1e-4 fetched the next layer's whole expert set during prefill, on the
+grounds that a prefill layer routes to "essentially all 64" experts so the fetch
+would waste ~7% of its bytes. It wastes **58%**: a 128-token layer routes to
+**41.4** of 64.
+
+The bad number came from the prefill hit rate. 7.1% hit means 92.9% of *lookups*
+miss, and 92.9% of 1,024 is 951, so ~59.5 experts per layer. Every step is
+correct except the 1,024, which assumed all 64 experts are looked up in every
+layer — the exact proposition the calculation was supposed to establish. The
+right denominator was never in doubt and never needed inferring: the run prints
+**7.75 GB** of prefill traffic, and 7.75 GB ÷ 12.58 MB ÷ 16 ÷ 0.929 is 41.4.
+
+A rate is a ratio, and a ratio cannot tell you either of its terms. When a hit
+rate, a precision, or a percentage is used to recover a count, write down what
+the denominator is and check that it came from a measurement rather than from
+the hypothesis. Here a measured absolute — bytes moved — was sitting one column
+away in the same output.
+
+**Rule:** prefer the measured absolute to the inferred one, always. If the only
+route to a number is through a rate, state the denominator out loud; that is
+usually enough to notice you assumed it.
+
+**Corollary, and the more embarrassing half.** The arithmetic that sank this is
+Stage 1c's, published in this repo, quoted in the `prefetch` docstring that was
+open while 1e-4 was written: *the link is saturated, so throughput is bandwidth
+÷ bytes-per-token, and overlap cannot buy bytes.* Having the rule written down
+did not help, because the premise smuggled in the exemption — "this adds only
+7% more bytes" made it look like a case the rule did not cover. A general rule
+gets defeated by a wrong input, not by being forgotten, so the check that has
+teeth is on the input: **the number that exempts you from a known rule is the
+one to measure first.**
+
+---
+
 ## Checklist before publishing a number
 
 1. Was the baseline measured in this run, by the same harness, same prompt?
