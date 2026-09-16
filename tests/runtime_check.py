@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from flashforge.cli import _force_utf8_stdout  # noqa: E402
 from flashforge.runtime.cache import ExpertCache  # noqa: E402
 from flashforge.runtime.patch import install_expert_cache  # noqa: E402
-from flashforge.runtime.store import ExpertStore  # noqa: E402
+from flashforge.runtime.store import ExpertStore, QuantSpec  # noqa: E402
 
 _force_utf8_stdout()
 torch.manual_seed(0)
@@ -404,6 +404,123 @@ check("a finer group size lowers the weight error",
       f"{stats_q['rel_rms_error']:.4%} — necessary, and on the real model not "
       "sufficient: it improved KL and left top-1 agreement unchanged")
 del partial, grouped_store
+
+print("\nReal int8 experts (Stage 1e-2)")
+
+# `fake_quantize_int8` above proves the arithmetic. This section proves the
+# *layout*: a row is now a mixed-dtype byte buffer with the scales on the end,
+# and every consumer has to agree on where each piece starts. Disagreeing does
+# not raise — all three projections have the same element count here — it
+# returns a model that runs and is wrong, which is the failure this file exists
+# to catch.
+SPEC = QuantSpec(projections=("gate_proj", "up_proj"), group_size=0)
+
+fp16_store = ExpertStore.from_model(
+    copy.deepcopy(model), list(range(L)), detach_from_model=False
+)
+int8_store = ExpertStore.from_model(
+    copy.deepcopy(model), list(range(L)), detach_from_model=False
+)
+int8_store.quantize_int8(SPEC)
+
+# The point of the whole stage: fewer bytes per expert, hence more slots for the
+# same VRAM. Two of three projections at a quarter width (this stack is fp32)
+# plus per-channel scales.
+check("a quantised row is smaller and is bytes",
+      int8_store.shape.row_dtype == torch.int8
+      and int8_store.shape.nbytes < fp16_store.shape.nbytes,
+      f"{int8_store.shape.nbytes:,} bytes against {fp16_store.shape.nbytes:,} "
+      f"({int8_store.shape.nbytes / fp16_store.shape.nbytes:.0%}), "
+      f"{int8_store.shape.numel:,} weights either way")
+
+check("the exempt projection survives bit-identical",
+      torch.equal(int8_store.matrix(1, 5, "down_proj"), fp16_store.matrix(1, 5, "down_proj")),
+      "down_proj is repacked to a new byte offset, not requantised — if the "
+      "offset were wrong this is where it would show as noise rather than zero")
+
+# The scales are stored at fp16 (here fp32) after being computed in fp32, so the
+# check is against what the *runtime* reads back, not the quantiser's working
+# copy. Anything above int8's own step size means the layout is misaligned.
+rel = [
+    ((int8_store.matrix(l, e, "gate_proj") - fp16_store.matrix(l, e, "gate_proj")).norm()
+     / fp16_store.matrix(l, e, "gate_proj").norm()).item()
+    for l in range(L) for e in (0, 5, 15)
+]
+check("a quantised projection reads back on the int8 grid",
+      max(rel) < 0.05,
+      f"worst relative error {max(rel):.4%} over {len(rel)} experts — a layout "
+      "mistake here would read a neighbour's bytes and land near 100%")
+
+int8_cache = ExpertCache(int8_store, capacity=8, device="cpu")
+int8_slots = int8_cache.acquire(1, [5, 9])
+slot = int8_slots[5]
+gathered = int8_cache.gather(torch.tensor([int8_slots[5], int8_slots[9]]))
+check("the cache dequantises to exactly what the store holds",
+      all(
+          torch.equal(getattr(int8_cache, name)(slot), int8_store.matrix(1, 5, name))
+          for name in ("gate_proj", "up_proj", "down_proj")
+      ),
+      "per-slot accessors return dequantised copies rather than views, and the "
+      "copies match the host reference byte for byte")
+check("gather and the per-slot accessors agree",
+      all(
+          torch.equal(batched[0], getattr(int8_cache, name)(slot))
+          and batched.dtype == int8_store.shape.dtype
+          for batched, name in zip(gathered, ("gate_proj", "up_proj", "down_proj"))
+      ),
+      f"gate {tuple(gathered[0].shape)}, down {tuple(gathered[2].shape)} in "
+      f"{gathered[0].dtype} — two code paths, one layout")
+
+# PARITY, which is the load-bearing one. An oracle whose weights *are* the
+# dequantised values, run through the stock block, must equal the cached block
+# reading int8 exactly. Not within a tolerance: exactly. Any difference is the
+# runtime's, because the quantisation error is already in both sides.
+oracle = copy.deepcopy(model)
+with torch.no_grad():
+    for layer in range(L):
+        for expert in range(E):
+            module = oracle.layers[layer].mlp.experts[expert]
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                getattr(module, name).weight.copy_(int8_store.matrix(layer, expert, name))
+    oracle_out = oracle(hidden_in)
+
+int8_patched = copy.deepcopy(model)
+int8_report = install_expert_cache(
+    int8_patched, capacity=L * E, device="cpu", grouped=False, quant=SPEC
+)
+with torch.no_grad():
+    delta = (int8_patched(hidden_in) - oracle_out).abs().max().item()
+check("an int8 block matches a stock block holding the same weights", delta == 0.0,
+      f"max abs difference {delta:.3e} — the loop path stays the bit-exact oracle "
+      "even though its weights now arrive as bytes plus a scale")
+
+# Quantisation rebuilds every row at a new width. A cache allocated against the
+# old geometry would still accept the copy_ and serve half an expert spliced to
+# half a neighbour: correct-looking, silently wrong, no exception. So the cache
+# refuses rather than trusts.
+stale_store = ExpertStore.from_model(
+    copy.deepcopy(model), list(range(L)), detach_from_model=False
+)
+stale_cache = ExpertCache(stale_store, capacity=8, device="cpu")
+stale_store.quantize_int8(SPEC)
+try:
+    stale_cache.acquire(0, [1])
+    refused_stale = False
+except RuntimeError as exc:
+    refused_stale = "before constructing the cache" in str(exc)
+check("a cache refuses a store that was quantised underneath it", refused_stale,
+      "the pool's width and dtype come from the store's row geometry, so the "
+      "ordering is enforced instead of documented")
+
+try:
+    int8_store.quantize_int8(SPEC)
+    refused_twice = False
+except RuntimeError:
+    refused_twice = True
+check("quantising twice is refused", refused_twice,
+      "the second round would compound the error while reporting only its own")
+
+del fp16_store, int8_store, int8_cache, oracle, stale_store, stale_cache
 
 print("\nAccess logging (Stage 1e)")
 

@@ -254,18 +254,63 @@ exempting it clears the bar:
 
     variant                        slots  MB/exp    hit   pred t/s   agreement
     fp16 (today)                     238   12.58  54.4%       7.55   99.42% (control)
-    int8 gate+up, fp16 down          357    8.39  67.6%      11.00   99.13% PASSES
-    int8 all three                   476    6.29  78.3%      13.84   98.32% FAILS
+    int8 gate+up, fp16 down          357    8.39  67.6%      11.00   99.13%
+    int8 all three                   476    6.29  78.3%      13.84   98.32%
 
-So Stage 1e-2 ships **two of three projections quantised, +42% predicted**, and
-explicitly declines the +79% variant. The extra 37 points of throughput cost
-more output quality than this project's own accepted floor.
+Every number in that table is a *prediction*, and the two that mattered were
+both wrong. What the built path measured is below.
+
+STAGE 1E-2 — WHAT THE REAL PATH MEASURED
+----------------------------------------
+A row is now a mixed-dtype byte buffer: int8 for the quantised projections, the
+exempt one at full width, and the scales packed on the end so a fill stays
+exactly one `copy_`. `shape.row_dtype` and `shape.row_numel` drive every
+allocation, so the store, the pool and the byte counters all shrink without
+being told quantisation happened. `cache.gather()` is the only place that
+dequantises, which is why `_forward_grouped` needed no change at all.
+
+The correctness claim is the strong one: a `CachedMoEBlock` reading int8 is
+**bit-exact** against a stock `OlmoeSparseMoeBlock` holding the dequantised
+weights. Not within a tolerance — exactly, because the quantisation error is
+already present on both sides and anything left over would be the runtime's.
+
+    arm       slots  pool GB  free GB  decode t/s    hit  GB/tok  fill ms
+    fp16        238     2.79     0.96        7.09  47.2%   0.851     92.1
+    int8        200     1.56     2.35        7.66  36.6%   0.681     64.4
+    int8        238     1.86     2.05        8.32  47.3%   0.566     54.2   <-
+    int8        270     2.11     1.80        6.86  48.1%   0.557     53.4
+    int8        300     2.34     1.57        7.30  57.4%   0.458     44.1
+    int8        330     2.58     1.16        7.50  61.2%   0.417     40.7
+    int8        357     2.79     0.92        7.64  63.5%   0.392     38.2
+
+**Spending the savings on slots is not what pays.** The +42% prediction assumed
+357 slots; the measured peak is **+17% at 238**, where the pool is *smaller*
+than the fp16 one it replaces. The curve is not monotonic, and the 238-vs-270
+pair refuses every easy explanation: identical bytes per token, identical fill
+time, 18% different throughput. 26 ms/token goes somewhere that is neither
+transfer nor cache behaviour. That is an open question, not a mechanism.
+
+**The accuracy claim did not replicate.** At 48 documents, n=2,545 per arm:
+
+    int8 gate+up              98.82% +/- 0.21%   KL 0.00127
+    int8 gate+up (again)      98.70% +/- 0.22%   KL 0.00126
+    same weights, twice       99.72% +/- 0.10%   KL 0.00024
+
+Combined, 98.76% +/- 0.15% against the 99% bar. The 99.13% that qualified this
+stage was one draw at n=1,727, where the standard error is 0.31% — it was never
+distinguishable from the number that replaced it, and troubleshoot.md 4.8 says
+so in a section written before this measurement existed.
+
+The last row is the finding worth keeping. Two runs of *identical* arithmetic
+agree only to 99.72%: the grouped path's `index_add_` has no defined atomic
+ordering, and that alone eats a quarter of the gap between int8 and the bar.
+No agreement claim tighter than 0.28 points is measurable on this path.
 """
 
 from __future__ import annotations
 
 from flashforge.runtime.cache import CacheStats, ExpertCache
-from flashforge.runtime.store import ExpertStore
+from flashforge.runtime.store import ExpertShape, ExpertStore, QuantSpec
 from flashforge.runtime.block import CachedMoEBlock
 from flashforge.runtime.patch import PatchReport, install_expert_cache
 
@@ -273,7 +318,9 @@ __all__ = [
     "CacheStats",
     "CachedMoEBlock",
     "ExpertCache",
+    "ExpertShape",
     "ExpertStore",
     "PatchReport",
+    "QuantSpec",
     "install_expert_cache",
 ]

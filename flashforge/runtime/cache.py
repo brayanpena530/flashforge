@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from flashforge.runtime.store import PROJECTIONS, ExpertStore
+from flashforge.runtime.store import PROJECTIONS, ExpertStore, dequantize_matrix
 
 ExpertKey = tuple[int, int]
 
@@ -115,24 +115,37 @@ class ExpertCache:
         self.stats = CacheStats()
 
         shape = store.shape
+        # The pool mirrors a store row byte for byte, so it is int8 once the
+        # store is quantised and `self.dtype` is only the dtype the *math*
+        # happens in. Capacity rises for free: nothing here knows that a row
+        # got smaller, it just allocates `row_numel` of `row_dtype`.
+        self._shape = shape
         self._slots = torch.empty(
-            (self.capacity, shape.numel), dtype=self.dtype, device=self.device
+            (self.capacity, shape.row_numel), dtype=shape.row_dtype, device=self.device
         )
+
+        # Where each projection lives inside a row. Elements when the row is
+        # plain fp16, bytes once it is a packed mixed-dtype buffer — the two
+        # only coincide when every projection is one byte wide.
+        m = shape.matrix_numel
+        self._layout: dict[str, tuple[int, int, int | None, int | None, tuple[int, int]]] = {}
+        for i, name in enumerate(PROJECTIONS):
+            mshape = shape.matrix_shape(name)
+            if shape.quant is None:
+                self._layout[name] = (i * m, (i + 1) * m, None, None, mshape)
+                continue
+            wlo, whi = shape.spans[name]
+            if shape.is_quantized(name):
+                slo, shi = shape.spans[f"{name}.scale"]
+            else:
+                slo = shi = None
+            self._layout[name] = (wlo, whi, slo, shi, mshape)
 
         # Per-projection views over the whole pool, built once. `unflatten`
         # rather than `view` because a column slice of the pool is not
         # contiguous, and down_proj's (hidden, intermediate) shape is the
         # transpose of the other two — see ExpertStore._flatten_expert.
-        m = shape.matrix_numel
-        matrix_shapes = {
-            "gate_proj": (shape.intermediate_size, shape.hidden_size),
-            "up_proj": (shape.intermediate_size, shape.hidden_size),
-            "down_proj": (shape.hidden_size, shape.intermediate_size),
-        }
-        self._views = {
-            name: self._slots[:, i * m : (i + 1) * m].unflatten(1, matrix_shapes[name])
-            for i, name in enumerate(PROJECTIONS)
-        }
+        self._views = {name: self._unpack(self._slots, name) for name in PROJECTIONS}
 
         self._slot_of: OrderedDict[ExpertKey, int] = OrderedDict()
         self._free: list[int] = list(range(self.capacity))
@@ -183,14 +196,50 @@ class ExpertCache:
     def bytes_resident(self) -> int:
         return self.capacity * self.store.shape.nbytes
 
+    def _unpack(
+        self, rows: torch.Tensor, name: str
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Slice one projection out of a `(N, row_numel)` block: (weight, scale).
+
+        `scale` is None when the projection is stored at full width, in which
+        case `weight` is already in `self.dtype` and the caller is done. This is
+        the *only* place that knows the row layout; both the per-slot accessors
+        and `gather` go through it, so an int8 store cannot be half-supported.
+        """
+        wlo, whi, slo, shi, mshape = self._layout[name]
+        if slo is None:
+            weight = rows[:, wlo:whi]
+            if self._shape.quant is not None:
+                # A byte buffer holding an exempt projection: reinterpret, do
+                # not convert. `view` is legal here because a column slice keeps
+                # stride 1 on the last axis.
+                weight = weight.view(self.dtype)
+            return weight.unflatten(1, mshape), None
+        return (
+            rows[:, wlo:whi].unflatten(1, mshape),
+            rows[:, slo:shi].view(self.dtype).unflatten(1, (mshape[0], -1)),
+        )
+
+    def _projection(self, name: str, slot: int) -> torch.Tensor:
+        weight, scale = self._views[name]
+        if scale is None:
+            return weight[slot]
+        # A view when unquantised, a fresh tensor when not. Every caller is
+        # read-only, so that difference is invisible — but it is a difference,
+        # and the loop path's bit-exactness against the stock block is measured
+        # with it in place rather than assumed through it.
+        return dequantize_matrix(
+            weight[slot].unsqueeze(0), scale[slot].unsqueeze(0), self.dtype
+        )[0]
+
     def gate_proj(self, slot: int) -> torch.Tensor:
-        return self._views["gate_proj"][slot]
+        return self._projection("gate_proj", slot)
 
     def up_proj(self, slot: int) -> torch.Tensor:
-        return self._views["up_proj"][slot]
+        return self._projection("up_proj", slot)
 
     def down_proj(self, slot: int) -> torch.Tensor:
-        return self._views["down_proj"][slot]
+        return self._projection("down_proj", slot)
 
     def gather(self, slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Stack several slots into batched weights: (E,I,H), (E,I,H), (E,H,I).
@@ -204,17 +253,20 @@ class ExpertCache:
         of 3E kernel launches, and Stage 1's profile said launches were 95% of
         decode. Which of those two wins is a measurement, not an argument; see
         `ff-serve --grouped/--no-grouped`.
+
+        It is also where int8 becomes fp16. `_forward_grouped` needs no
+        knowledge of quantisation for exactly that reason: it was already paying
+        for a copy here, and dequantisation rides along inside it. The output is
+        the same fp16 (E,I,H) it always was, so the bmms and their transient
+        VRAM are unchanged — what changed is that the *input* to this copy is
+        half the size, which is the whole point.
         """
         rows = self._slots.index_select(0, slots)
-        shape = self.store.shape
-        m = shape.matrix_numel
-        # unflatten, not view: a column slice of `rows` is not contiguous. Same
-        # reason as the pool views above.
-        return (
-            rows[:, 0 * m : 1 * m].unflatten(1, (shape.intermediate_size, shape.hidden_size)),
-            rows[:, 1 * m : 2 * m].unflatten(1, (shape.intermediate_size, shape.hidden_size)),
-            rows[:, 2 * m : 3 * m].unflatten(1, (shape.hidden_size, shape.intermediate_size)),
-        )
+        out = []
+        for name in PROJECTIONS:
+            weight, scale = self._unpack(rows, name)
+            out.append(weight if scale is None else dequantize_matrix(weight, scale, self.dtype))
+        return tuple(out)
 
     # -- the hot path ------------------------------------------------------
 
@@ -225,6 +277,20 @@ class ExpertCache:
         the router's unique-expert list, and re-deriving uniqueness here would
         double the work on the hottest path in the model.
         """
+        if self.store.shape is not self._shape:
+            # Quantising the store rebuilds every row at a new width and dtype.
+            # A pool allocated against the old geometry would still accept the
+            # `copy_` — it is the same number of *elements* only by accident —
+            # and the model would read half an expert and half a neighbour.
+            # That is a silent wrong-output failure, so it is checked rather
+            # than documented.
+            raise RuntimeError(
+                f"The store's row geometry changed after this cache was built "
+                f"({self._shape.row_numel} x {self._shape.row_dtype} -> "
+                f"{self.store.shape.row_numel} x {self.store.shape.row_dtype}). "
+                "Quantise the store before constructing the cache."
+            )
+
         if len(experts) > self.capacity:
             raise ValueError(
                 f"Layer {layer} routes to {len(experts)} experts but the cache holds "
@@ -449,6 +515,22 @@ class ExpertCache:
         self._slot_of.clear()
         self._protected.clear()
         self._free = list(range(self.capacity))
+
+    def release(self) -> None:
+        """Free the slot pool. The cache is unusable afterwards.
+
+        A sweep loads one model per capacity and relies on the previous
+        capacity's pool being collected before the next one is allocated. That
+        worked until it didn't: three GB of VRAM survived `del model, report`
+        into the next iteration and the second arm of the first int8 A/B died
+        at `model.to(device)` with 0 bytes free. Whatever the surviving
+        reference is, dropping the pool by hand does not depend on finding it —
+        `_views` and `_layout` are views over `_slots`, so clearing them first
+        is what makes the storage actually reachable for free.
+        """
+        self.clear()
+        self._views.clear()
+        self._slots = torch.empty(0, dtype=self._shape.row_dtype, device=self.device)
 
     def describe(self) -> str:
         total_slots = len(self.store.layers) * self.store.num_experts

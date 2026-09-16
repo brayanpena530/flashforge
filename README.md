@@ -542,22 +542,69 @@ itself was the suspect, so it got a control: **loop vs grouped** — non-bit-exa
 since Stage 1b and shipping by default — scores **99.42% / 0.00041**. The bar
 was fair; int8's error is ~4x the reassociation noise already accepted.
 
-The fix was granularity, not a lower bar. `down_proj` consumes the product of
-two activations, so it sees the widest dynamic range of the three projections:
+The fix looked like granularity, not a lower bar. `down_proj` consumes the
+product of two activations, so it sees the widest dynamic range of the three
+projections, and exempting it scored 99.13% — a pass. **That pass did not
+survive being measured properly**; see below.
 
-| variant | slots | MB/expert | hit rate | predicted t/s | agreement | |
-|---|---|---|---|---|---|---|
-| fp16 *(today)* | 238 | 12.58 | 54.4% | 7.55 | 99.42% | control floor |
-| **int8 gate+up, fp16 down** | 357 | 8.39 | 67.6% | **11.00** *(+42%)* | 99.13% | **passes** |
-| int8 all three | 476 | 6.29 | 78.3% | 13.84 *(+79%)* | 98.32% | fails |
+| variant | slots | MB/expert | hit rate | predicted t/s | agreement (n=1,727) |
+|---|---|---|---|---|---|
+| fp16 *(today)* | 238 | 12.58 | 54.4% | 7.55 | 99.42% *(control floor)* |
+| int8 gate+up, fp16 down | 357 | 8.39 | 67.6% | 11.00 *(+42%)* | 99.13% |
+| int8 all three | 476 | 6.29 | 78.3% | 13.84 *(+79%)* | 98.32% |
 
-So Stage 1e-2 ships **two of three projections quantised** and explicitly
-declines the faster variant: the extra 37 points of throughput cost more output
-quality than this project's own accepted floor.
+## Stage 1e-2 — what the real path measured
+
+The plumbing shipped: int8 rows with the scales packed onto the end, `row_dtype`
+and `row_numel` driving every allocation, dequantisation inside `cache.gather()`.
+A `CachedMoEBlock` reading int8 is **bit-exact** against a stock
+`OlmoeSparseMoeBlock` holding the dequantised weights.
+
+Then the predictions were measured, on one model load with the store quantised
+in place between arms — `tools/int8_ab.py`, which exists because sweeping
+capacities by reloading the checkpoint does not fit on a machine that is already
+holding a 12 GB store.
+
+| arm | slots | pool GB | free GB | decode t/s | hit | GB/token | fill ms |
+|---|---|---|---|---|---|---|---|
+| fp16 | 238 | 2.79 | 0.96 | 7.09 | 47.2% | 0.851 | 92.1 |
+| int8 | 200 | 1.56 | 2.35 | 7.66 *(+8%)* | 36.6% | 0.681 | 64.4 |
+| **int8** | **238** | **1.86** | **2.05** | **8.32** *(+17%)* | 47.3% | 0.566 | 54.2 |
+| int8 | 270 | 2.11 | 1.80 | 6.86 *(−3%)* | 48.1% | 0.557 | 53.4 |
+| int8 | 300 | 2.34 | 1.57 | 7.30 *(+3%)* | 57.4% | 0.458 | 44.1 |
+| int8 | 330 | 2.58 | 1.16 | 7.50 *(+6%)* | 61.2% | 0.417 | 40.7 |
+| int8 | 357 | 2.79 | 0.92 | 7.64 *(+8%)* | 63.5% | 0.392 | 38.2 |
+
+Every arm is p≤0.027 over nine passes, and 238 was run twice (8.32, 8.29).
+
+**Spending the savings on slots is not what pays.** The predicted +42% assumed
+357 slots; the measured peak is **+17% at 238 slots**, where the pool is
+*smaller* than the fp16 one it replaces. The curve is not monotonic and the
+usual explanations do not survive the 238-vs-270 pair: identical bytes per token
+(0.566 vs 0.557), identical fill time (54.2 vs 53.4 ms), 18% different
+throughput. 26 ms/token goes somewhere that is neither transfer nor cache
+behaviour, and that is recorded as an open question rather than a mechanism.
+
+**The accuracy claim did not replicate.** At 48 documents (n=2,545 per arm):
+
+| | agreement | KL |
+|---|---|---|
+| int8 gate+up | 98.82% ± 0.21% | 0.00127 |
+| int8 gate+up *(again)* | 98.70% ± 0.22% | 0.00126 |
+| **same weights, twice** | **99.72% ± 0.10%** | 0.00024 |
+
+Combined, **98.76% ± 0.15% against a 99% bar**. The 99.13% above was one draw of
+a statistic measured at n=1,727, where the standard error is 0.31% — it was
+never distinguishable from the number that replaced it. The bar is missed.
+
+The last row is the more useful finding: two runs of *identical arithmetic*
+agree only to 99.72%. The grouped path's `index_add_` has no defined atomic
+ordering, and that nondeterminism alone consumes a quarter of the gap between
+int8 and the bar. No agreement claim tighter than 0.28 points is measurable on
+this path at all.
 
 ```bash
-ff-serve --capacity 256 --path grouped --fake-quant-int8 \
-         --quant-projections gate_proj,up_proj --divergence-prompts 16
+uv run python tools/int8_ab.py
 ```
 
 ## Stage 0 — instrumentation
@@ -864,7 +911,7 @@ is a custom module and will need its own branch in `discover_moe()`.
 - **Stage 1d — pinning** *(done, and the largest single gain in the project: **+38% decode, p=0.003**, from a flag that already existed and defaulted to off. 19.5x the measured baseline. The fill path now runs at 98% of this card's pinned PCIe rate, so transfer optimisation is **finished** — see "Stage 1d" above.)*
 - **Stage 1e — move fewer bytes.** Transfer is still 60% of a decode token, so eliminating it would be +150%, and every way of moving the same bytes *faster* is now exhausted.
   - **1e-1 — eviction policy** *(**closed negative**. Four candidates ranked offline on 147k decode lookups across 18 documents; the best beats LRU by 1.9 points, or +2.6% predicted — inside the harness's own noise. Nothing shipped. The useful finding is the conversion rate: Belady's 21.4-point gap is worth exactly 1.8x the cache, and capacity is purchasable where prophecy is not. See "Stage 1e" above.)*
-  - **1e-2 — quantised experts** *(**numerics qualified, plumbing next**. Fake-quantisation settled the risk before any of the cache work: int8 on all three projections predicts +79% but scores 98.32% teacher-forced agreement against a control floor of 99.42%, so it is declined. int8 on gate+up with fp16 down_proj predicts **+42%** at 99.13% and passes. Remaining work is the real thing — int8 slots, a resident scale table, dequant inside `cache.gather()` — see "Stage 1e-2" above.)*
+  - **1e-2 — quantised experts** *(**built and measured; throughput real, accuracy short of the bar**. int8 rows with the scales packed on the end, dequant inside `cache.gather()`, bit-exact against the stock block. Decode **+17% at 238 slots, p=0.003** — but the +42% prediction assumed 357 slots and 357 measures +8%, so spending the savings on capacity is not what pays and the curve is not monotonic. Agreement replicates at **98.76% ± 0.15%**, below the 99% bar; the 99.13% that qualified the stage was one draw at a 0.31% standard error. The grouped path's own nondeterminism is 0.28 points, a quarter of the gap. Open: fp32 scales, the one untried lever that could recover the bar. See "Stage 1e-2" above.)*
   - **1e-3 — Q7's CPU path** *(break-even is 10.8 routed tokens and decode has exactly 1, so every decode expert is on the wrong side of it. Computing a missed expert in place also overlaps GPU work instead of blocking it. Larger potential than 1e-2 and larger integration risk.)*
   - **1e-4 — prefill streaming** *(prefill moves 7.59 GB per prompt at a 9% hit rate — 59% of the whole model — because it touches every expert in every layer anyway. The LRU cache is pure overhead there; a fixed layer-order stream would do the same work without the eviction thrash.)*
 - **Stage 2** — Triton kernels: fused gather-GEMM, dequant, fused router. *Needs sm_80+.*

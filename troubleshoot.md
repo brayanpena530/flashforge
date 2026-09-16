@@ -510,6 +510,23 @@ control drawn from something already shipping. Without the first you cannot tell
 a result from noise; without the second you cannot defend the bar when the
 result you wanted fails it.
 
+**Postscript, and the reason this entry is not merely advice.** The bar was
+applied anyway, on 1,727 positions, and int8-on-gate+up scored 99.13% — a pass,
+written into the README and two docstrings and committed. Re-measured on the
+built path at 2,545 positions per arm it comes back at **98.76% ± 0.15%**, a
+miss. Nothing about the model changed; the first reading was one draw of a
+statistic whose standard error was 0.31%, which is exactly what the paragraph
+above warned about three commits earlier. Writing the rule down does not apply
+it. The instrument has to be sized before the number is quoted, not after it
+disagrees with itself.
+
+**Corollary:** measure the instrument's own floor, not just its sampling error.
+Running the *same weights at the same capacity twice* scored 99.72% — the
+grouped path's `index_add_` has no defined atomic ordering, so a quarter of the
+gap between int8 and a 99% bar is the harness talking to itself. A control drawn
+from shipping code (loop vs grouped, 99.42%) and a null control drawn from
+*identical* code are different instruments and you want both.
+
 **Corollary:** prefer the low-variance statistic for detecting change and the
 interpretable one for deciding. KL moved cleanly and monotonically with weight
 error across every variant; top-1 agreement is what anyone actually cares about
@@ -518,6 +535,32 @@ and is noisy. Report both, and do not read a rank ordering off the noisy one.
 **Corollary:** when the best available policy's gain lands inside the harness's
 own spread, that is not a small win to bank, it is a result you cannot measure.
 Ship nothing and say so. Stage 1e's +2.6% against a ±8% spread is the example.
+
+### 4.9 A design settled by reading is still a hypothesis
+
+Stage 1e-2's plumbing was designed from a careful read of `block.py`, and the
+design note was specific: int8 quantisation needs a scale per output channel,
+the scales for *every expert in the model* are only 8.4 MB, therefore keep them
+permanently resident on the GPU so they never cross PCIe, and a cache fill stays
+exactly one `copy_`. That reasoning is correct and the conclusion was wrong.
+
+It fell over on the first line of implementation. A resident scale table has to
+be indexed by `(layer, expert)`, but `gather` — the chokepoint the whole design
+depended on — receives *slots*. Closing that gap needs either a slot→key map
+maintained on the device or a second small pool written at fill time, and the
+second one costs the very thing the design was protecting: one `copy_` per miss.
+
+The alternative the design had dismissed without pricing turned out to be free.
+Append the scales to the expert's own row: 0.1% more bytes on the link at
+per-channel granularity, 1.5% at group-128, and a fill stays one `copy_` with
+one pool and no reverse map. The transfer was never the expensive part of a
+scale — the bookkeeping was, and bookkeeping is invisible until you write it.
+
+**Rule:** a design derived by reading code is a hypothesis about the code, and
+the cheapest test is usually the first hour of writing it. Record the reasoning
+so the reversal is legible, but do not promote the design to a decision — and in
+particular, do not let "this avoids a cost" stand as an argument until the cost
+it avoids has been compared against the cost it introduces.
 
 ---
 

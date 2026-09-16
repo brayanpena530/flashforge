@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import gc
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from torch import nn
@@ -41,12 +41,60 @@ PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 
 
 @dataclass(frozen=True)
+class QuantSpec:
+    """Which projections are int8, and how much weight shares a scale.
+
+    `group_size=0` is one scale per output channel. Anything else splits each
+    row into contiguous spans of that many *inputs*, so a scale covers a
+    stretch of the dot product rather than a slice across unrelated channels.
+    A row that does not divide evenly falls back to per-channel.
+
+    `projections` defaults to two of three. `down_proj` consumes the product of
+    two activations, so it sees the widest dynamic range and is the one worth
+    exempting first — quantising all three scored 98.32% teacher-forced top-1
+    agreement against a pre-committed 99% bar, exempting it scored 99.13%.
+
+    That 99.13% did not replicate. Measured on the real path at four times the
+    positions it comes back at **98.76% +/- 0.15%**, which misses the bar; the
+    earlier pass was one draw of a statistic whose standard error was 0.31%.
+    The default is kept because it is still the best of the variants measured
+    and the throughput win is real (+17%), but it is a *default*, not a
+    clearance. See the runtime package docstring before shipping it.
+    """
+
+    projections: tuple[str, ...] = ("gate_proj", "up_proj")
+    group_size: int = 0
+
+    def __post_init__(self) -> None:
+        unknown = set(self.projections) - set(PROJECTIONS)
+        if unknown:
+            raise ValueError(f"Not projections of a SwiGLU expert: {sorted(unknown)}")
+        if not self.projections:
+            raise ValueError("A QuantSpec that quantises nothing is not a quantised store.")
+
+
+@dataclass(frozen=True)
 class ExpertShape:
-    """Geometry of one expert, and how it is packed into a flat row."""
+    """Geometry of one expert, and how it is packed into a flat row.
+
+    WHY THE SCALES RIDE ALONG IN THE ROW
+    ------------------------------------
+    Stage 1e-2's design note said the scales would live in a table resident on
+    the GPU for every expert in the model — 8.4 MB, 0.26% of the pool — so that
+    they never crossed PCIe. Writing it settled the question the other way. A
+    resident table has to be indexed by `(layer, expert)`, but `gather` is
+    handed *slots*, so the cache would have to maintain a slot -> key mapping on
+    the device; and the alternative, a second small pool written at fill time,
+    costs a second `copy_` per miss. Appending the scales to the row instead
+    costs 0.1% more bytes on the link (1.5% at group_size=128) and keeps a fill
+    at exactly one `copy_`, one pool, and no reverse map. The transfer was never
+    the expensive part of a scale; the bookkeeping was.
+    """
 
     hidden_size: int
     intermediate_size: int
     dtype: torch.dtype
+    quant: QuantSpec | None = None
 
     @property
     def matrix_numel(self) -> int:
@@ -55,11 +103,108 @@ class ExpertShape:
 
     @property
     def numel(self) -> int:
+        """Weight elements in one expert. Unchanged by quantisation."""
         return len(PROJECTIONS) * self.matrix_numel
+
+    # -- per-projection geometry -------------------------------------------
+
+    def matrix_shape(self, name: str) -> tuple[int, int]:
+        """(out_features, in_features). down_proj is the transpose of the others."""
+        if name == "down_proj":
+            return (self.hidden_size, self.intermediate_size)
+        return (self.intermediate_size, self.hidden_size)
+
+    def is_quantized(self, name: str) -> bool:
+        return self.quant is not None and name in self.quant.projections
+
+    def groups(self, name: str) -> int:
+        """Scales per output channel. 0 when the projection is not quantised."""
+        if not self.is_quantized(name):
+            return 0
+        _, in_features = self.matrix_shape(name)
+        size = self.quant.group_size
+        return in_features // size if size and in_features % size == 0 else 1
+
+    def scale_numel(self, name: str) -> int:
+        out_features, _ = self.matrix_shape(name)
+        return out_features * self.groups(name)
+
+    @property
+    def item_size(self) -> int:
+        return torch.empty(0, dtype=self.dtype).element_size()
+
+    @property
+    def spans(self) -> dict[str, tuple[int, int]]:
+        """Byte ranges within a row: three weights, then the scales.
+
+        Keyed by projection name for the weights and `<name>.scale` for the
+        scales. Weights come first and in `PROJECTIONS` order so that an
+        unquantised store's layout is byte-for-byte what it was before this
+        existed — the scales region is simply empty.
+        """
+        spans: dict[str, tuple[int, int]] = {}
+        offset = 0
+        item = self.item_size
+        for name in PROJECTIONS:
+            width = self.matrix_numel * (1 if self.is_quantized(name) else item)
+            spans[name] = (offset, offset + width)
+            # Every span starts on an `item`-byte boundary. Reinterpreting a byte
+            # slice as fp16 needs its offset divisible by 2, and real expert
+            # matrices are large enough that this never pads — but the toy shapes
+            # the tests use are not, and an alignment bug there would surface as
+            # a shape error in a place that has nothing to do with alignment.
+            offset += -(-width // item) * item
+        for name in PROJECTIONS:
+            width = self.scale_numel(name) * self.item_size
+            spans[f"{name}.scale"] = (offset, offset + width)
+            offset += width
+        return spans
 
     @property
     def nbytes(self) -> int:
-        return self.numel * torch.empty(0, dtype=self.dtype).element_size()
+        return self.spans[f"{PROJECTIONS[-1]}.scale"][1]
+
+    # -- how a row is actually stored ---------------------------------------
+
+    @property
+    def row_dtype(self) -> torch.dtype:
+        """int8 once quantised, because a row is then a mixed-dtype byte buffer."""
+        return torch.int8 if self.quant is not None else self.dtype
+
+    @property
+    def row_numel(self) -> int:
+        return self.nbytes if self.quant is not None else self.numel
+
+
+def quantize_matrix(w: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric int8. `w` is (E, out, in); returns int8 (E, out, in) and scales
+    (E, out, groups).
+
+    The ungrouped case is handled by adding a length-1 group axis rather than
+    branching, so both paths produce a scale tensor of the same rank. That is
+    what lets `dequantize_matrix` be one expression, and it is why `groups()`
+    returns 1 rather than 0 for a per-channel quantised projection.
+    """
+    out_features, in_features = w.shape[1], w.shape[2]
+    grouped = bool(group_size) and in_features % group_size == 0
+    view = (
+        w.reshape(-1, out_features, in_features // group_size, group_size)
+        if grouped
+        else w.unsqueeze(2)
+    )
+    scale = view.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
+    q = (view / scale).round_().clamp_(-127, 127)
+    return q.reshape(w.shape).to(torch.int8), scale.squeeze(-1)
+
+
+def dequantize_matrix(
+    q: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype
+) -> torch.Tensor:
+    """Inverse of `quantize_matrix`, in `dtype`. (E, out, in)."""
+    experts, out_features, in_features = q.shape
+    groups = scale.shape[-1]
+    wide = q.reshape(experts, out_features, groups, in_features // groups).to(dtype)
+    return wide.mul_(scale.unsqueeze(-1).to(dtype)).reshape(q.shape)
 
 
 class ExpertStore:
@@ -74,7 +219,7 @@ class ExpertStore:
     def __init__(self, shape: ExpertShape, num_experts: int):
         self.shape = shape
         self.num_experts = num_experts
-        # layer index -> (num_experts, shape.numel) host tensor
+        # layer index -> (num_experts, shape.row_numel) host tensor
         self._layers: dict[int, torch.Tensor] = {}
         self._pinned: set[int] = set()
 
@@ -127,7 +272,9 @@ class ExpertStore:
             want_pinned = pinned_bytes + layer_bytes <= pin_budget_bytes
             try:
                 rows = torch.empty(
-                    (num_experts, shape.numel), dtype=shape.dtype, pin_memory=want_pinned
+                    (num_experts, shape.row_numel),
+                    dtype=shape.row_dtype,
+                    pin_memory=want_pinned,
                 )
             except RuntimeError as exc:
                 # Pinned host memory has its own ceiling, well below free RAM,
@@ -150,7 +297,7 @@ class ExpertStore:
                 )
                 pin_budget_bytes = pinned_bytes  # stop trying
                 want_pinned = False
-                rows = torch.empty((num_experts, shape.numel), dtype=shape.dtype)
+                rows = torch.empty((num_experts, shape.row_numel), dtype=shape.row_dtype)
             for expert_idx, expert in enumerate(experts):
                 rows[expert_idx] = _flatten_expert(expert, shape)
 
@@ -225,6 +372,141 @@ class ExpertStore:
         gc.collect()
         return len(self._pinned)
 
+    def quantize_int8(self, spec: QuantSpec | None = None) -> dict[str, float]:
+        """Convert every expert to int8 in place, for real this time.
+
+        Rows are rebuilt as mixed-dtype byte buffers: the quantised projections
+        as int8, any exempt projection still in `shape.dtype`, and the scales
+        appended on the end. `shape.row_dtype` becomes int8 and `shape.nbytes`
+        falls, which is the entire point — everything downstream sizes itself
+        off those two numbers, so the cache gets more slots and a miss moves
+        fewer bytes without any of it being told that quantisation happened.
+
+        **Call this before building the cache.** The pool is allocated from
+        `shape.row_numel`, so a cache built against the fp16 shape and then fed
+        int8 rows would be silently half-filled with garbage. The ordering is
+        enforced in `ExpertCache.__init__`, which rejects a store whose row
+        geometry has moved underneath it.
+
+        Peak overhead is one layer of each representation (~1.2 GB for OLMoE),
+        not the whole store: each layer is replaced before the next is touched.
+
+        Irreversible, like `fake_quantize_int8`. Returns the same weight-error
+        dict, which is a sanity check and *not* the acceptance test — see
+        `fake_quantize_int8` for what the acceptance test is and what it cost to
+        find out that greedy token ids were not it.
+        """
+        if self.shape.quant is not None:
+            raise RuntimeError(
+                f"Store is already quantised ({self.shape.quant}). Quantisation "
+                "is lossy and irreversible; quantising twice would compound the "
+                "error while reporting only the second round's."
+            )
+        spec = spec or QuantSpec()
+        source = self.shape
+        target = replace(source, quant=spec)
+        spans = target.spans
+        m = source.matrix_numel
+
+        squared_error = 0.0
+        squared_weight = 0.0
+        worst = 0.0
+        chunk = 8  # see fake_quantize_int8 for why the fp32 transient is bounded
+
+        for layer in self.layers:
+            old = self._layers[layer]
+            want_pinned = self.is_pinned(layer)
+            try:
+                fresh = torch.empty(
+                    (self.num_experts, target.nbytes),
+                    dtype=target.row_dtype,
+                    pin_memory=want_pinned,
+                )
+            except RuntimeError as exc:
+                # Same ceiling as `from_model` and `repin`, reached from a worse
+                # position: quantising a pinned store holds the old pinned layer
+                # and the new one at once, so the peak is above both stores'
+                # steady state. Degrade rather than lose an hour of model load.
+                # `install_expert_cache` avoids this entirely by quantising a
+                # pageable store and pinning afterwards.
+                if not want_pinned:
+                    raise
+                log.warning(
+                    "Could not pin quantised layer %d: %s\n"
+                    "Falling back to pageable for it; call repin() afterwards.",
+                    layer, str(exc).splitlines()[0],
+                )
+                self._pinned.discard(layer)
+                want_pinned = False
+                fresh = torch.empty(
+                    (self.num_experts, target.nbytes), dtype=target.row_dtype
+                )
+            for i, name in enumerate(PROJECTIONS):
+                lo, hi = spans[name]
+                slo, shi = spans[f"{name}.scale"]
+                for start in range(0, self.num_experts, chunk):
+                    stop = min(start + chunk, self.num_experts)
+                    flat = old[start:stop, i * m : (i + 1) * m]
+                    if not target.is_quantized(name):
+                        # Straight through, but into the new row's own offset:
+                        # an exempt projection sits after two int8 ones, so its
+                        # byte position is not the one it had in the fp16 row.
+                        fresh[start:stop, lo:hi].view(source.dtype).copy_(flat)
+                        continue
+
+                    w = flat.unflatten(1, target.matrix_shape(name)).to(torch.float32)
+                    q, scale = quantize_matrix(w, spec.group_size)
+                    fresh[start:stop, lo:hi].copy_(q.flatten(1))
+                    fresh[start:stop, slo:shi].view(source.dtype).copy_(
+                        scale.flatten(1).to(source.dtype)
+                    )
+
+                    # Measured against what the runtime will actually read back,
+                    # which is the fp16 round-trip of the scale, not the fp32
+                    # scale the quantiser computed.
+                    stored = fresh[start:stop, slo:shi].view(source.dtype)
+                    deq = dequantize_matrix(
+                        q, stored.unflatten(1, (w.shape[1], -1)).float(), torch.float32
+                    )
+                    error = deq - w
+                    squared_error += float(error.pow(2).sum())
+                    squared_weight += float(w.pow(2).sum())
+                    worst = max(worst, float(error.abs().max() / w.abs().max()))
+                    del w, q, scale, deq, error
+
+            self._layers[layer] = fresh
+            del old
+
+        self.shape = target
+        gc.collect()
+        rms = (squared_error / squared_weight) ** 0.5 if squared_weight else 0.0
+        return {"rel_rms_error": rms, "worst_channel_rel_error": worst}
+
+    def matrix(self, layer: int, expert: int, name: str) -> torch.Tensor:
+        """One projection of one expert, dequantised, as (out, in) in `shape.dtype`.
+
+        Host-side and deliberately slow. This is the reference the tests hold
+        the GPU path to, so it reconstructs from the stored bytes by the same
+        route the cache does rather than from anything kept on the side.
+        """
+        shape = self.shape
+        row = self.row(layer, expert)
+        mshape = shape.matrix_shape(name)
+        if shape.quant is None:
+            # An unquantised row is indexed in *elements*, not bytes; `spans`
+            # describes the packed byte layout and the two only coincide when
+            # every projection happens to be one byte wide.
+            start = PROJECTIONS.index(name) * shape.matrix_numel
+            return row[start : start + shape.matrix_numel].unflatten(0, mshape)
+        lo, hi = shape.spans[name]
+        if not shape.is_quantized(name):
+            return row[lo:hi].view(shape.dtype).unflatten(0, mshape)
+        out_features = mshape[0]
+        slo, shi = shape.spans[f"{name}.scale"]
+        q = row[lo:hi].unflatten(0, mshape).unsqueeze(0)
+        scale = row[slo:shi].view(shape.dtype).unflatten(0, (out_features, -1)).unsqueeze(0)
+        return dequantize_matrix(q, scale, shape.dtype)[0]
+
     def fake_quantize_int8(
         self, group_size: int = 0, projections: tuple[str, ...] = PROJECTIONS
     ) -> dict[str, float]:
@@ -266,12 +548,12 @@ class ExpertStore:
         (troubleshoot.md 4.6).
         """
         shape = self.shape
+        if shape.quant is not None:
+            raise RuntimeError(
+                "Store is already quantised for real; a fake round-trip on top "
+                "would measure the second rounding only."
+            )
         m = shape.matrix_numel
-        matrix_shapes = {
-            "gate_proj": (shape.intermediate_size, shape.hidden_size),
-            "up_proj": (shape.intermediate_size, shape.hidden_size),
-            "down_proj": (shape.hidden_size, shape.intermediate_size),
-        }
 
         squared_error = 0.0
         squared_weight = 0.0
@@ -298,25 +580,20 @@ class ExpertStore:
                     # over 2,048 elements and a division by a small scale both
                     # lose precision, and the measured error would then be the
                     # quantiser's rounding rather than int8's.
-                    w = block.unflatten(1, matrix_shapes[name]).to(torch.float32)
+                    w = block.unflatten(1, shape.matrix_shape(name)).to(torch.float32)
                     # Group along the *input* dimension, so a scale covers a
                     # contiguous span of the dot product rather than a slice
                     # across unrelated output channels. group_size=0, or a row
                     # that does not divide evenly, falls back to the whole row.
-                    rows_, cols = w.shape[1], w.shape[2]
-                    grouped = bool(group_size) and cols % group_size == 0
-                    view = w.reshape(-1, rows_, cols // group_size, group_size) if grouped else w
-                    scale = view.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
-                    deq = (view / scale).round_().clamp_(-127, 127).mul_(scale)
-                    if grouped:
-                        deq = deq.reshape(w.shape)
+                    q, scale = quantize_matrix(w, group_size)
+                    deq = dequantize_matrix(q, scale, torch.float32)
 
                     error = deq - w
                     squared_error += float(error.pow(2).sum())
                     squared_weight += float(w.pow(2).sum())
                     worst = max(worst, float(error.abs().max() / w.abs().max()))
                     block.copy_(deq.flatten(1).to(shape.dtype))
-                    del w, scale, deq, error
+                    del w, q, scale, deq, error
 
         rms = (squared_error / squared_weight) ** 0.5 if squared_weight else 0.0
         return {"rel_rms_error": rms, "worst_channel_rel_error": worst}

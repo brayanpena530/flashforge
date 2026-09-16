@@ -30,7 +30,7 @@ from torch import nn
 from flashforge.models import MoESpec, discover_moe
 from flashforge.runtime.block import CachedMoEBlock
 from flashforge.runtime.cache import ExpertCache
-from flashforge.runtime.store import ExpertStore
+from flashforge.runtime.store import ExpertStore, QuantSpec
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +63,7 @@ def install_expert_cache(
     pin_gb: float = 0.0,
     grouped: bool = True,
     prefetch: bool = False,
+    quant: QuantSpec | None = None,
 ) -> PatchReport:
     """Move experts to host RAM, front them with a GPU cache, return the wiring.
 
@@ -87,6 +88,12 @@ def install_expert_cache(
     ~5.8 GB/s, so decode speed is bandwidth / bytes-per-token, and speculation
     at 78.7% precision adds 23% more bytes. Overlap cannot pay for them.
 
+    `quant` selects Stage 1e-2's int8 experts. It is applied to the store before
+    the cache is built, because the cache sizes its pool from the store's row
+    geometry and `capacity` is in experts — so the *same* `capacity` costs 33%
+    less VRAM with the default two-of-three spec, and the caller is expected to
+    spend that by asking for more. `None` keeps fp16.
+
     It is kept because it is correct, cheap to re-test, and the conclusion is
     operating-point-specific: a machine with bandwidth to spare, or a store
     pinned well past this one's 9-of-16 layers, changes the arithmetic. Run
@@ -99,9 +106,31 @@ def install_expert_cache(
     spec = discover_moe(model)
     act_fn = _activation_of(model)
 
-    store = ExpertStore.from_model(model, spec.moe_layers, pin_gb=pin_gb)
+    # Loaded pageable when quantising, then pinned afterwards. Pinning first
+    # would page-lock 12 GB of fp16 rows that are about to be discarded, and
+    # then ask for the int8 copies *on top* — which is how the first quantised
+    # sweep died on the pinned ceiling at layer 6. Quantise, then pin what is
+    # left; `repin` already knows how to degrade when the ceiling is reached.
+    store = ExpertStore.from_model(
+        model, spec.moe_layers, pin_gb=0.0 if quant is not None else pin_gb
+    )
     gc.collect()
 
+    if quant is not None:
+        error = store.quantize_int8(quant)
+        log.info(
+            "int8 experts (%s, group %d): %.2f%% relative RMS weight error, "
+            "%.2f MB per expert",
+            "+".join(quant.projections), quant.group_size,
+            100 * error["rel_rms_error"], store.shape.nbytes / 1e6,
+        )
+        if pin_gb:
+            store.repin(pin_gb)
+            gc.collect()
+
+    # Built after quantisation, never before: the pool's width and dtype come
+    # from the store's row geometry, and `acquire` refuses a cache whose store
+    # moved underneath it rather than reading half an expert.
     cache = ExpertCache(store, capacity, device=device, dtype=store.shape.dtype)
 
     blocks: list[CachedMoEBlock] = []

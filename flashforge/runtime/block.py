@@ -212,8 +212,12 @@ class CachedMoEBlock(nn.Module):
             offset_list.append(offset_list[-1] + size)
 
         # The gather is the only large transient: one full expert row per expert
-        # in the chunk.
-        chunk = max(1, self.group_bytes // self.cache.store.shape.nbytes)
+        # in the chunk. Budgeted against the *dequantised* size, not the stored
+        # one — under int8 a row is 8.39 MB on the link but still 12.58 MB once
+        # gather has expanded it, and sizing the chunk from the smaller number
+        # would silently grant the gather 50% more VRAM than it was given.
+        shape = self.cache.store.shape
+        chunk = max(1, self.group_bytes // (shape.numel * shape.item_size))
 
         for start in range(0, len(routed), chunk):
             stop = min(start + chunk, len(routed))

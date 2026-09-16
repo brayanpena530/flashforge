@@ -931,6 +931,58 @@ def _measure_baseline_subprocess(args) -> float | None:
     return None
 
 
+def _teacher_forced(base_logits: list, other_logits: list) -> str:
+    """Score one path against another on next-token prediction. "" if unscorable.
+
+    An approximation cannot pass a bit-exactness test, so asking it to is a test
+    nothing can fail informatively. This is the bar for a path that is *meant*
+    to change the numbers: does it predict the same next token, position by
+    position, on real text?
+
+    Teacher-forced on purpose. The first version of this compared greedy
+    generations and was the wrong instrument — divergence compounds, so it
+    measures how early anything changed rather than how much, and it costs one
+    forward per token instead of one per document. Agreement and KL are
+    pre-committed thresholds (99%, 0.01 nats) so the verdict is not chosen after
+    seeing the number; the bar itself was checked against a control that already
+    ships, loop-vs-grouped, which scored 99.42%.
+    """
+    if not base_logits or len(base_logits) != len(other_logits):
+        return ""
+
+    agreed = positions = 0
+    kl_total = 0.0
+    worst_doc = 1.0
+    for mine, theirs in zip(base_logits, other_logits):
+        match = (mine.argmax(-1) == theirs.argmax(-1)).sum().item()
+        agreed += match
+        positions += mine.shape[0]
+        worst_doc = min(worst_doc, match / mine.shape[0])
+        # Logits may be stored fp16 to keep 48 documents in host RAM; the
+        # softmax and the KL are computed in fp32 regardless, because an fp16
+        # log_softmax over a 50k vocabulary loses more than the quantity being
+        # measured.
+        p = mine.float().log_softmax(-1)
+        q = theirs.float().log_softmax(-1)
+        kl_total += float((p.exp() * (p - q)).sum())
+
+    agreement = agreed / positions
+    kl = kl_total / positions
+    ok = agreement >= 0.99 and kl < 0.01
+    # The sampling error travels with the number. A bar applied to a statistic
+    # whose resolution is unstated is a coin flip dressed as a decision — the
+    # first pass of this measurement read 98.72% against a 99% bar at an SE of
+    # 0.31%, which is not a failure, it is an unreadable instrument.
+    stderr = (agreement * (1 - agreement) / positions) ** 0.5
+    return (
+        f"teacher-forced top-1 agreement {agreement:.2%} +/- {stderr:.2%} over "
+        f"{positions:,} positions in {len(base_logits)} documents, worst "
+        f"document {worst_doc:.2%}, mean KL {kl:.5f} nats — "
+        f"{'PASSES' if ok else 'FAILS'} the >=99% / <0.01 bar"
+        + (" (inside one SE of it)" if abs(agreement - 0.99) < stderr else "")
+    )
+
+
 def _permutation_p(a: list[float], b: list[float], trials: int = 20_000) -> float | None:
     """Two-sided permutation test on the difference of medians.
 
@@ -984,7 +1036,7 @@ def serve_main(argv: list[str] | None = None) -> int:
     import torch
 
     from . import hardware
-    from .runtime import install_expert_cache
+    from .runtime import QuantSpec, install_expert_cache
 
     parser = argparse.ArgumentParser(
         prog="ff-serve", description="Benchmark the offloaded MoE runtime."
@@ -1078,10 +1130,26 @@ def serve_main(argv: list[str] | None = None) -> int:
              "98.32%% agreement); 128 is the standard finer grid (1.6%%)",
     )
     parser.add_argument(
-        "--quant-projections", default="gate_proj,up_proj,down_proj",
-        help="which projections to quantise. Dropping down_proj costs capacity "
-             "(8.39 MB per expert instead of 6.29, so 384 slots instead of 512) "
-             "and buys back accuracy, because it sees the widest dynamic range",
+        "--quant-projections", default="gate_proj,up_proj",
+        help="which projections to quantise. The default exempts down_proj: it "
+             "costs capacity (8.39 MB per expert instead of 6.29, so 357 slots "
+             "instead of 476) and buys back the accuracy that decides the stage "
+             "— 99.13%% top-1 agreement against 98.32%% for all three, on a "
+             "pre-committed 99%% bar. Pass all three to see it fail",
+    )
+    parser.add_argument(
+        "--int8", action="store_true",
+        help="quantise the expert store for real: int8 rows with the scales "
+             "packed on the end, so a miss moves fewer bytes and --capacity "
+             "buys more slots for the same VRAM. Raise --capacity to spend it; "
+             "the pool is sized in experts, not bytes",
+    )
+    parser.add_argument(
+        "--int8-capacity", default=None, metavar="N[,N]",
+        help="append quantised runs at these capacities after the fp16 ones, in "
+             "the same invocation. This is how int8 is actually scored: the two "
+             "arms have to share one loaded machine, and the extra slots are "
+             "the point, so they cannot share a capacity either",
     )
     parser.add_argument(
         "--fake-quant-int8", action="store_true",
@@ -1160,8 +1228,36 @@ def serve_main(argv: list[str] | None = None) -> int:
     # appended here rather than being a `kind` so that no combination of flags
     # can put it in the middle of a sweep.
     if args.fake_quant_int8:
+        if args.int8:
+            print(
+                "--int8 and --fake-quant-int8 are the same experiment run two "
+                "ways. The fake one exists to answer the numerics question "
+                "before the real one exists; once --int8 works, it is the "
+                "measurement. Pick one."
+            )
+            return 1
         path_flags["q8sim"] = (True, None, pin_levels[-1])
         paths.append("q8sim")
+
+    quant = QuantSpec(
+        projections=tuple(p for p in args.quant_projections.split(",") if p.strip()),
+        group_size=args.quant_group,
+    )
+
+    # (capacity, spec|None). `--int8-capacity` appends quantised runs *after* the
+    # fp16 ones rather than replacing them, because the whole claim of Stage 1e-2
+    # is a comparison, and troubleshoot.md 1.8 is the record of what comparing
+    # across two invocations of this harness costs: free RAM fell 12.4 -> 5.8 GB
+    # over one sweep and the same capacity measured 2.77 against 5.53 tok/s. One
+    # invocation, one machine state, both arms.
+    runs: list[tuple[int, QuantSpec | None]] = [
+        (capacity, quant if args.int8 else None) for capacity in capacities
+    ]
+    runs += [
+        (int(value), quant)
+        for value in (args.int8_capacity or "").split(",")
+        if value.strip()
+    ]
 
     import gc
 
@@ -1215,7 +1311,7 @@ def serve_main(argv: list[str] | None = None) -> int:
     report = None
     first_free_gb = None
     dumped_trace = False
-    for i, capacity in enumerate(capacities):
+    for i, (capacity, run_quant) in enumerate(runs):
         # Each capacity needs a fresh model: install_expert_cache moves the
         # experts out, so the previous iteration left a hollow shell behind.
         #
@@ -1224,16 +1320,51 @@ def serve_main(argv: list[str] | None = None) -> int:
         # loading the next 13.8 GB checkpoint while both are still live would
         # exhaust host memory on any machine that can only just hold one copy.
         if i > 0:
+            # Released by hand, not left to the collector. `del` was enough
+            # until the int8 sweep, where 2.5 GB of the previous pool survived
+            # into the next iteration and the second arm OOM'd inside
+            # `model.to(device)` — reported as a *pinned-memory* failure first,
+            # because `cudaHostAlloc` needs a working CUDA context and says
+            # "out of memory" when the device has none left.
+            if report is not None:
+                report.cache.release()
             del model, report
             report = None
             gc.collect()
             torch.cuda.empty_cache()
+            # Pinned host memory has its *own* caching allocator, and
+            # `empty_cache()` does not touch it. Freeing a pinned store returns
+            # the pages to that cache, not to the operating system, so the next
+            # capacity in the sweep starts with the previous one's page-locked
+            # GB already spent: arm 1 pinned 6.75 GB, arm 2 then hit the system
+            # ceiling after 3.00 GB and silently ran at half the pin coverage.
+            # That is not a crash, it is a confound — the arm with less pinning
+            # measures slower, and pinning is the lever Stage 1d showed was
+            # worth 45%.
+            if hasattr(torch._C, "_host_emptyCache"):
+                torch._C._host_emptyCache()
+            held = torch.cuda.memory_allocated() / (1 << 30)
+            reserved = torch.cuda.memory_reserved() / (1 << 30)
+            # Printed every time, not only when it looks wrong. The failure this
+            # catches is cumulative and silent until the allocation that cannot
+            # fit, and by then the log says nothing about where the GB went.
+            # Host RAM belongs on this line as much as VRAM does. Pinning is
+            # allocated from it, and a pin budget that silently cannot be met
+            # is a confound rather than a crash: the arm with less page-locked
+            # memory measures slower, and Stage 1d priced that at 45%.
+            print(f"\n  released the previous capacity: {held:.2f} GB still "
+                  f"allocated, {reserved:.2f} GB reserved, "
+                  f"{hardware.available_ram_bytes() / (1 << 30):.1f} GB host RAM free")
             model, _ = load_model(
                 model_id, dtype=args.dtype, device_map=None, cache_dir=args.cache_dir
             )
 
-        report = install_expert_cache(model, capacity=capacity, device="cuda", pin_gb=args.pin_gb)
-        print(f"\n=== capacity {capacity}")
+        report = install_expert_cache(
+            model, capacity=capacity, device="cuda", pin_gb=args.pin_gb, quant=run_quant
+        )
+        grain = f"group-{args.quant_group}" if args.quant_group else "per-channel"
+        print(f"\n=== capacity {capacity}"
+              + (f" int8 ({'+'.join(run_quant.projections)}, {grain})" if run_quant else ""))
         print(report.describe())
 
         # The VRAM twin of the host-RAM check below, and it was added because
@@ -1471,6 +1602,7 @@ def serve_main(argv: list[str] | None = None) -> int:
 
             rows.append({
                 "capacity": capacity,
+                "quant": run_quant is not None,
                 "path": path,
                 "corpus_logits": corpus_logits,
                 "prefill_tok_s": _median(prefill_samples),
@@ -1549,7 +1681,11 @@ def serve_main(argv: list[str] | None = None) -> int:
         # only lever left is bytes. Stage 1c's prefetcher was rejected on this
         # column — it held at ~5.8 GB/s across paths whose throughput differed
         # by 14%, which is what "reordering transfers cannot help" looks like.
-        print(f"{row['capacity']:>7} {row['path']:>8} {row['vram_gb']:>8.2f} "
+        # The slots column carries the dtype, because "357" and "238" otherwise
+        # look like two points on a capacity sweep rather than two different
+        # machines' worth of expert.
+        slots = f"{row['capacity']}{'q8' if row['quant'] else ''}"
+        print(f"{slots:>7} {row['path']:>8} {row['vram_gb']:>8.2f} "
               f"{row['prefill_tok_s']:>12.1f} "
               f"{row['prefill_lo']:.1f}-{row['prefill_hi']:<8.1f} "
               f"{row['decode_tok_s']:>11.2f} "
@@ -1592,8 +1728,14 @@ def serve_main(argv: list[str] | None = None) -> int:
         base_path = paths[0]
         print(f"\n{'slots':>7} {'path':>9} {'phase':>8} {base_path + ' t/s':>12} "
               f"{'this t/s':>10} {'change':>9}  verdict")
-        for capacity in capacities:
-            by_path = {r["path"]: r for r in rows if r["capacity"] == capacity}
+        for capacity, run_quant in runs:
+            # Matched on quantisation as well as capacity: the same capacity can
+            # appear twice, once per dtype, and pairing across the two would
+            # compare a path change against a dtype change.
+            by_path = {
+                r["path"]: r for r in rows
+                if r["capacity"] == capacity and r["quant"] == (run_quant is not None)
+            }
             base = by_path.get(base_path)
             if base is None:
                 continue
@@ -1652,36 +1794,23 @@ def serve_main(argv: list[str] | None = None) -> int:
                 # predict the same next token, position by position, on real
                 # text? Agreement and KL are pre-committed thresholds — 99% and
                 # 0.01 nats — so the verdict is not chosen after seeing it.
-                base_logits, other_logits = base["corpus_logits"], other["corpus_logits"]
-                if base_logits and len(base_logits) == len(other_logits):
-                    import torch
-
-                    agreed = positions = 0
-                    kl_total = 0.0
-                    worst_doc = 1.0
-                    for mine, theirs in zip(base_logits, other_logits):
-                        match = (mine.argmax(-1) == theirs.argmax(-1)).sum().item()
-                        agreed += match
-                        positions += mine.shape[0]
-                        worst_doc = min(worst_doc, match / mine.shape[0])
-                        p = mine.log_softmax(-1)
-                        q = theirs.log_softmax(-1)
-                        kl_total += float((p.exp() * (p - q)).sum())
-                    agreement = agreed / positions
-                    kl = kl_total / positions
-                    ok = agreement >= 0.99 and kl < 0.01
-                    print(f"          {path}: teacher-forced top-1 agreement "
-                          f"{agreement:.2%} over {positions:,} positions in "
-                          f"{len(base_logits)} documents, worst document "
-                          f"{worst_doc:.2%}, mean KL {kl:.5f} nats — "
-                          f"{'PASSES' if ok else 'FAILS'} the >=99% / <0.01 bar")
+                scored = _teacher_forced(base["corpus_logits"], other["corpus_logits"])
+                if scored:
+                    print(f"          {path}: {scored}")
 
     # A capacity sweep is only informative if the differences it shows are
     # larger than the machine's own run-to-run variation. On this box they were
     # not, which is itself the answer: transfer volume is not what sets decode
     # speed here. Say it rather than leaving a 10% gap looking like a trend.
     for path in paths:
-        same_path = [r for r in rows if r["path"] == path and r["decode_tok_s"]]
+        # Same dtype as well as same path: an int8 row at 357 slots against an
+        # fp16 row at 238 is not a point on a capacity sweep, and averaging the
+        # two into one "spread across capacities" would hide the stage's result
+        # inside the noise estimate meant to qualify it.
+        same_path = [
+            r for r in rows
+            if r["path"] == path and r["decode_tok_s"] and not r["quant"]
+        ]
         if len(same_path) < 2:
             continue
         widest = max((r["decode_hi"] - r["decode_lo"]) / r["decode_tok_s"] for r in same_path)
@@ -1692,6 +1821,45 @@ def serve_main(argv: list[str] | None = None) -> int:
                   f"wider than the spread within one ({widest:.0%}).")
             print("        Capacity is not resolvably changing decode speed on this "
                   "machine — which is the finding, not a failed measurement.")
+
+    # Stage 1e-2's verdict. Quantisation is not a path and not a capacity, so
+    # neither table above scores it: it moves both at once, deliberately. The
+    # comparison that matters is the best fp16 row against the best int8 row on
+    # the same path, which is what a user would actually choose between.
+    for path in paths:
+        arms = {
+            quantised: max(
+                (r for r in rows
+                 if r["path"] == path and r["decode_tok_s"] and r["quant"] == quantised),
+                key=lambda r: r["decode_tok_s"], default=None,
+            )
+            for quantised in (False, True)
+        }
+        base, other = arms[False], arms[True]
+        if base is None or other is None:
+            continue
+        change = other["decode_tok_s"] / base["decode_tok_s"] - 1.0
+        p = _permutation_p(base["decode_samples"], other["decode_samples"])
+        verdict = (
+            "too few passes to test — raise --repeats" if p is None
+            else f"real (p={p:.3f}, {len(base['decode_samples'])} passes each)"
+            if p < 0.05 else f"not distinguishable from noise (p={p:.2f})"
+        )
+        print(f"\n[serve] int8 ({path}): {base['capacity']} fp16 slots at "
+              f"{base['decode_tok_s']:.2f} tok/s -> {other['capacity']} int8 slots "
+              f"at {other['decode_tok_s']:.2f} tok/s, {change:+.0%}. {verdict}")
+        print(f"        bytes per token {base['decode_gb_per_token']:.3f} -> "
+              f"{other['decode_gb_per_token']:.3f} GB, decode hit rate "
+              f"{base['decode_hit_rate']:.1%} -> {other['decode_hit_rate']:.1%}, "
+              f"VRAM {base['vram_gb']:.2f} -> {other['vram_gb']:.2f} GB.")
+        # Throughput and accuracy printed together, because separating them is
+        # how a stage ships a faster different model. The fp16 arm is the
+        # reference here, which is the right reference: it is the thing int8 is
+        # claiming to replace.
+        scored = _teacher_forced(base["corpus_logits"], other["corpus_logits"])
+        print(f"        {scored}" if scored else
+              "        accuracy not measured — pass --divergence-prompts N. A "
+              "throughput win that fails the bar is a different model, not a win.")
 
     # Stage 1c's go/no-go. A prefetcher can only ever remove fill time from the
     # critical path, so if that share is smaller than the run-to-run spread the
