@@ -607,6 +607,68 @@ this path at all.
 uv run python tools/int8_ab.py
 ```
 
+## Stage 1e-3 — closed negative: the CPU and the link are the same wire
+
+Q7 put a CPU expert at m=1 at **1.11 ms** against **1.212 ms** across PCIe, so
+`m* = 10.8` routed tokens and decode has exactly one — every decode expert is on
+the CPU's side of the line. The obvious move is to stop shipping missed experts
+and run them where they already live.
+
+Near-parity means neither path replaces the other, though, so the win was never
+"the CPU is faster". It was "the CPU is a *second channel*": split the ~58
+missed experts per token between the link and the cores and both finish sooner.
+At perfect overlap that is 54.2 ms of fill down to 29.3 ms, **+26% decode**.
+
+That argument has one assumption under it, and nothing in this project had ever
+measured it. The DMA engine reads expert weights out of host DRAM. So do the
+CPU cores. They are independent channels only if host memory bandwidth can feed
+both at once — and Q7 could not have answered that, because Q7 timed each path
+**alone**. So it got measured first, with no checkpoint and no runtime changes:
+
+```bash
+uv run python tools/cpu_channel.py
+```
+
+| CPU kernel | threads | link experts/s | CPU experts/s | η | predicted |
+|---|---:|---|---|---:|---:|
+| fp32 | 1 | 951 → 444 | 894 → 631 | 0.582 | +0.2% |
+| fp32 | 3 | 951 → 520 | 1028 → 675 | 0.604 | +5.0% |
+| **fp32** | **4** | 959 → 486 | 820 → 766 | **0.704** | **+7.0%** |
+| fp32 | 16 | 959 → 389 | 943 → 739 | 0.593 | +2.4% |
+| int8 + dequant | 4 | 959 → 436 | 224 → 187 | 0.527 | −24.5% |
+
+**η never clears 0.70.** The pre-committed bar was +15% — twice the harness's
+±8% pass-to-pass spread — and the best arm predicts **+7.0%**, which this
+project cannot measure even if it were real. Stage 1e-3 closes negative. No
+runtime code was written.
+
+Three things in that table are worth more than the verdict.
+
+**The link is the one that gets hurt, and it is not close.** Under load the CPU
+keeps 78–94% of its solo rate while the DMA keeps **40–52%**. The transfer
+engine is the polite one: the cores take DRAM bandwidth and the copy engine
+waits. Any future design that assumes "the CPU is idle during a fill, so CPU
+work is free" has this backwards — CPU work during a fill is charged directly to
+the link, which Stage 1d spent the whole stage getting to 98% of hardware.
+
+**One thread already reaches 894 experts/s; sixteen reach 943.** A 16× increase
+in cores buys 5%. The CPU expert at m=1 is not compute-bound at all, it is
+bound on reading 25 MB of weights out of DRAM — which is exactly why it
+contends with a DMA doing the same thing. Q7's β replicates here (1.02–1.22 ms
+against its 1.11), so the cost model was right; the composition of two correct
+cost models is what was never checked.
+
+**Stage 1e-2 made this worse, not better.** int8 weights have to be dequantised
+before a CPU GEMM that has no int8 kernel, and that pass runs at 1.41 GB/s —
+**4.4× slower** than reading fp32 directly. The store format that bought +17% on
+the link costs the CPU path more than the CPU path was ever worth. The two
+optimisations are not merely independent, they are opposed.
+
+What would reopen it: a machine where DRAM bandwidth genuinely exceeds PCIe by
+enough to feed both (η is a property of *this* box, and a server with more
+memory channels would score differently), or an int8 CPU kernel that reads the
+quantised weights without expanding them. Neither is reachable here.
+
 ## Stage 0 — instrumentation
 
 Answers eight questions, each of which gates a later design decision. Q1–Q6
@@ -912,7 +974,7 @@ is a custom module and will need its own branch in `discover_moe()`.
 - **Stage 1e — move fewer bytes.** Transfer is still 60% of a decode token, so eliminating it would be +150%, and every way of moving the same bytes *faster* is now exhausted.
   - **1e-1 — eviction policy** *(**closed negative**. Four candidates ranked offline on 147k decode lookups across 18 documents; the best beats LRU by 1.9 points, or +2.6% predicted — inside the harness's own noise. Nothing shipped. The useful finding is the conversion rate: Belady's 21.4-point gap is worth exactly 1.8x the cache, and capacity is purchasable where prophecy is not. See "Stage 1e" above.)*
   - **1e-2 — quantised experts** *(**built and measured; throughput real, accuracy short of the bar**. int8 rows with the scales packed on the end, dequant inside `cache.gather()`, bit-exact against the stock block. Decode **+17% at 238 slots, p=0.003** — but the +42% prediction assumed 357 slots and 357 measures +8%, so spending the savings on capacity is not what pays and the curve is not monotonic. Agreement replicates at **98.76% ± 0.15%**, below the 99% bar; the 99.13% that qualified the stage was one draw at a 0.31% standard error. The grouped path's own nondeterminism is 0.28 points, a quarter of the gap. Open: fp32 scales, the one untried lever that could recover the bar. See "Stage 1e-2" above.)*
-  - **1e-3 — Q7's CPU path** *(break-even is 10.8 routed tokens and decode has exactly 1, so every decode expert is on the wrong side of it. Computing a missed expert in place also overlaps GPU work instead of blocking it. Larger potential than 1e-2 and larger integration risk.)*
+  - **1e-3 — Q7's CPU path** *(**closed negative**, and qualified in two minutes with no runtime code. Q7's m\* = 10.8 does put every decode expert on the CPU's side, but near-parity means the win had to come from running both channels at once — and they are not two channels. CPU cores and the DMA engine both read expert weights out of host DRAM: overlap efficiency **η = 0.70 at best**, with the *link* absorbing the loss (40–52% of its solo rate, against the CPU's 78–94%). Best predicted gain **+7%** against a pre-committed +15% bar. int8 makes it worse — dequantising for a CPU GEMM runs 4.4x slower than reading fp32. See "Stage 1e-3" above.)*
   - **1e-4 — prefill streaming** *(prefill moves 7.59 GB per prompt at a 9% hit rate — 59% of the whole model — because it touches every expert in every layer anyway. The LRU cache is pure overhead there; a fixed layer-order stream would do the same work without the eviction thrash.)*
 - **Stage 2** — Triton kernels: fused gather-GEMM, dequant, fused router. *Needs sm_80+.*
 - **Stage 3** — scale to V4-Flash, where the routed pool may not fit in RAM either and experts stream disk→RAM→GPU. *Needs RAM and NVMe headroom.* Q8 is the go/no-go: if `t_disk` needs more lookahead than Q3 shows prediction surviving, the disk tier has to be driven by a longer-horizon signal rather than per-layer routing prediction.

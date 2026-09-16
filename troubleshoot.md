@@ -564,6 +564,41 @@ it avoids has been compared against the cost it introduces.
 
 ---
 
+### 4.10 Two cost models measured alone cannot tell you they compose
+
+Q7 timed a CPU expert (1.11 ms at m=1) and a PCIe transfer (1.212 ms). Both
+numbers replicate. `m* = 10.8` follows correctly from them, and decode's single
+token sits well inside it. Every step of that is right.
+
+Stage 1e-3's design then took one more step, silently: if each channel costs
+about the same, run *both at once* and split the misses. That step needs a
+number Q7 never produced, because Q7 measured each path with the other path
+idle. The DMA engine and the CPU cores both read expert weights out of host
+DRAM. Measured together on this box, overlap efficiency is **η ≤ 0.70**, and the
+loss lands almost entirely on the link — the copy engine drops to 40–52% of its
+solo rate while the cores keep 78–94% of theirs.
+
+The tell was visible in the isolated data and nobody read it that way: one CPU
+thread reaches 894 experts/s and sixteen reach 943. A 16× core increase buying
+5% means the kernel is not compute-bound, it is bound on DRAM reads — which is
+the same resource the transfer it was going to overlap with is bound on. A cost
+model that is memory-bound at both ends is a warning that the ends are the same
+end.
+
+**Rule:** before scheduling two measured costs concurrently, measure them
+concurrently. Write it as an efficiency ratio — combined throughput over the sum
+of isolated throughputs — so the answer is a single number with an obvious null
+(η = 1) and an obvious failure (η = 0.5, one channel wearing a hat). It cost two
+minutes and no runtime code here, against a stage's worth of integration.
+
+**Corollary:** an optimisation can make a *later* optimisation worse, and the
+roadmap will not show it. Stage 1e-2's int8 store cut link bytes 33% and cost
+the CPU path 4.4×, because a CPU GEMM with no int8 kernel has to expand the
+weights first. Ordering stages by individual payoff assumes they are
+independent; they are competing for the same machine.
+
+---
+
 ## Checklist before publishing a number
 
 1. Was the baseline measured in this run, by the same harness, same prompt?
