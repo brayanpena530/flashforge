@@ -866,6 +866,19 @@ def _corpus_input_ids(tokenizer, count: int, prompt_tokens: int) -> list:
     for item in load_prompts():
         by_domain.setdefault(item["domain"], []).append(item["text"])
     interleaved = [text for group in zip(*by_domain.values()) for text in group]
+    # Say so when the corpus cannot fill the request. `interleaved[:count]` is
+    # happy to return fewer and silently did: Stage 1e-2 raised its document
+    # budget from 12 to 48 *specifically* to quadruple n and make a 99% bar
+    # readable, got 24 because the built-in set has 24, and then reported "48
+    # documents" in the README against a standard error twice what it thought
+    # it had. A slice is not a request; it is a ceiling that agrees with you.
+    if count > len(interleaved):
+        log.warning(
+            "Asked for %d documents, corpus has %d. Every per-position "
+            "statistic below is computed at the smaller n. For a real corpus: "
+            "python tools/make_corpus.py corpus.jsonl && --prompts corpus.jsonl",
+            count, len(interleaved),
+        )
     return [
         tokenizer(text, return_tensors="pt").input_ids[:, :prompt_tokens].to("cuda")
         for text in interleaved[:count]
@@ -1136,8 +1149,10 @@ def serve_main(argv: list[str] | None = None) -> int:
         help="which projections to quantise. The default exempts down_proj: it "
              "costs capacity (8.39 MB per expert instead of 6.29, so 357 slots "
              "instead of 476) and buys back the accuracy that decides the stage "
-             "— 99.13%% top-1 agreement against 98.32%% for all three, on a "
-             "pre-committed 99%% bar. Pass all three to see it fail",
+             "— the default measures 98.767%% top-1 agreement (+/-0.070%%, "
+             "n=24,576), which misses the pre-committed 99%% bar by 0.233 "
+             "points. All three scored 98.32%% on a coarser instrument. Run "
+             "tools/int8_accuracy.py",
     )
     parser.add_argument(
         "--int8", action="store_true",

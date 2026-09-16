@@ -370,10 +370,14 @@ check("scales are not so coarse the channel collapses",
       f"{min(levels)} distinct values in the narrowest sampled channel")
 del quant_store
 
-# Exempting a projection is what took the model from 98.32% agreement (failing)
-# to 99.13% (passing), so "did it actually skip that projection" is load-bearing
-# rather than cosmetic. Check the exempted bytes are untouched and the others
-# are not.
+# The default exempts down_proj, and that choice is what the shipped path rests
+# on, so "did it actually skip that projection" is load-bearing rather than
+# cosmetic. The default measures 98.767% +/- 0.070% top-1 agreement over 24,576
+# positions (tools/int8_accuracy.py). All-three measured 98.32% — but on the old
+# instrument, at n=1,727 on the nondeterministic grouped path, where the
+# resolution was worse than the 0.45-point difference being read off it. The
+# ordering is almost certainly right and has not been re-measured; do not quote
+# the gap. Check the exempted bytes are untouched and the others are not.
 partial = ExpertStore.from_model(
     copy.deepcopy(model), list(range(L)), detach_from_model=False
 )
@@ -695,6 +699,25 @@ with torch.no_grad():
     _, new_logits = patched.layers[0].mlp(hidden_in)
 check("router logits are identical", torch.equal(ref_logits, new_logits),
       "the gate is the original module, so selection cannot drift")
+
+print("\nThe loop path is bit-reproducible, and the grouped path is not")
+# This is the property that makes `tools/int8_accuracy.py` able to resolve a
+# 0.233-point agreement gap at all, and it is a property of the accumulator, not
+# a lucky run: the loop calls `index_add_` once per expert over indices that
+# cannot collide, so there is no summation order to be free. Stage 1e-2 scored
+# the bar on the grouped path and read a 0.411-point floor as a fact about the
+# world. If this check ever fails, no accuracy number in this repo means what it
+# says. See troubleshoot.md 4.12.
+determinism = copy.deepcopy(model)
+install_expert_cache(determinism, capacity=L * E, device="cpu", grouped=False)
+loop_in = torch.randn(1, 8 * E, H)
+with torch.no_grad():
+    first = determinism(loop_in)
+    second = determinism(loop_in)
+check("the loop path reproduces bit-exactly across runs",
+      torch.equal(first, second),
+      "identical weights twice must be identical output, or the null control "
+      "in tools/int8_accuracy.py is not a null control")
 
 print("\n" + "=" * 62)
 if failures:

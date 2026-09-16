@@ -54,9 +54,17 @@ class QuantSpec:
     exempting first — quantising all three scored 98.32% teacher-forced top-1
     agreement against a pre-committed 99% bar, exempting it scored 99.13%.
 
-    That 99.13% did not replicate. Measured on the real path at four times the
-    positions it comes back at **98.76% +/- 0.15%**, which misses the bar; the
-    earlier pass was one draw of a statistic whose standard error was 0.31%.
+    That 99.13% did not replicate, and neither did the instrument that read it.
+    Scored on the deterministic loop path against 24,576 positions of the real
+    512-token corpus — where the null control reads exactly 100.000%, so the
+    harness contributes no noise at all — it comes back at **98.767% +/-
+    0.070%**, missing the bar by 0.233 points at 3.3 sigma.
+
+    Raising the scales to fp32 cannot fix it: measured on real expert matrices,
+    fp32 scales remove 0.00% of the 0.8886% relative RMS weight error, because
+    fp16's 11-bit mantissa is already three bits finer than the 256-level grid a
+    scale exists to place. The shortfall is int8 rounding itself.
+
     The default is kept because it is still the best of the variants measured
     and the throughput win is real (+17%), but it is a *default*, not a
     clearance. See the runtime package docstring before shipping it.

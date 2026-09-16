@@ -585,26 +585,94 @@ usual explanations do not survive the 238-vs-270 pair: identical bytes per token
 throughput. 26 ms/token goes somewhere that is neither transfer nor cache
 behaviour, and that is recorded as an open question rather than a mechanism.
 
-**The accuracy claim did not replicate.** At 48 documents (n=2,545 per arm):
-
-| | agreement | KL |
-|---|---|---|
-| int8 gate+up | 98.82% ± 0.21% | 0.00127 |
-| int8 gate+up *(again)* | 98.70% ± 0.22% | 0.00126 |
-| **same weights, twice** | **99.72% ± 0.10%** | 0.00024 |
-
-Combined, **98.76% ± 0.15% against a 99% bar**. The 99.13% above was one draw of
-a statistic measured at n=1,727, where the standard error is 0.31% — it was
-never distinguishable from the number that replaced it. The bar is missed.
-
-The last row is the more useful finding: two runs of *identical arithmetic*
-agree only to 99.72%. The grouped path's `index_add_` has no defined atomic
-ordering, and that nondeterminism alone consumes a quarter of the gap between
-int8 and the bar. No agreement claim tighter than 0.28 points is measurable on
-this path at all.
+**The accuracy claim did not replicate**, reading **98.76% ± 0.15%** against the
+99% bar. That verdict happened to be right and could not have been known to be.
+See the next section.
 
 ```bash
 uv run python tools/int8_ab.py
+```
+
+## Stage 1e-2b — the bar was missed, and the instrument could not have said so
+
+The 99% agreement bar was applied three times and re-read differently each time
+(99.13%, 98.82%, 98.70%). That is not a drifting quantity; it is a quantity
+being measured with a ruler coarser than the thing it measures. The gap to the
+bar is **0.233 points**, and the instrument had two independent error sources,
+each of them the same size or larger.
+
+**The path.** Agreement was collected with `grouped=True`. The grouped path
+sorts every (token, expert) pair and accumulates with one `index_add_` whose
+indices collide, and CUDA gives `index_add_` no defined summation order. So two
+runs of *identical arithmetic on identical weights* disagree — by **0.411
+points** on the real corpus, nearly twice the gap being measured.
+
+The loop path has no such floor. It also calls `index_add_`, but once per expert
+over that expert's own token list, where the indices are unique: no collisions,
+no ordering freedom. Timing needs the grouped path. *Scoring* does not, and the
+two questions had been conflated.
+
+**The corpus.** `int8_ab.py` set `DIVERGENCE_DOCS = 48` with a comment
+explaining that 48 documents put n near 5,300 and the standard error near 0.15%,
+"which is the resolution the decision actually needs." It never got 48.
+`_corpus_input_ids` reads `load_prompts()` with no path — the **built-in
+24-prompt starter set**, whose own docstring says it is "a starting set" and
+that publishable numbers need a real corpus. `interleaved[:48]` of a 24-item
+list is 24 items, silently, and those prompts median 104 tokens against a
+128-token window. n was **2,545**, and the README said "48 documents".
+
+The corpus the comment describes was already in the repo, unused by this
+measurement: `tools/make_corpus.py` writes 48 documents of 529–1,704 tokens.
+
+### What it reads once both are fixed
+
+| | agreement | n | KL |
+|---|---|---:|---|
+| **int8 gate+up vs fp16** | **98.767% ± 0.070%** | 24,576 | 0.00029 |
+| *control:* same weights twice, loop | **100.000% ± 0.000%** | 24,576 | — |
+| *control:* same weights twice, grouped | 99.589% ± 0.041% | 24,576 | — |
+
+**FAILS the 99% bar by 0.233 points, at 3.3σ.** Worst document 97.07%.
+
+The first control is the one that makes the row above it mean anything: the loop
+path reproduces *exactly*, so the int8 number carries sampling error and nothing
+else. The third is what the original measurement was reading through.
+
+Two things are worth noticing. The point estimate barely moved — 98.76% →
+98.767% — so the old conclusion was correct and merely unjustified, which is the
+most dangerous way to be right. And the KL fell 4.4x, from 0.00127 to 0.00029
+nats: most of the divergence attributed to quantisation was the accumulator.
+
+```bash
+uv run python tools/make_corpus.py corpus.jsonl
+uv run python tools/int8_accuracy.py
+```
+
+### fp32 scales: closed negative in three minutes, with no GPU
+
+That left one lever this README had been calling "the one untried lever that
+could recover the bar" — storing the per-channel scales fp32 instead of fp16.
+Before building it, measure what it could possibly be worth: read real expert
+matrices out of the safetensors shards and quantise each one both ways.
+
+| | relative RMS weight error |
+|---|---|
+| fp16 scales *(shipping)* | 0.8886% |
+| fp32 scales *(proposed)* | 0.8886% |
+| **removed by upgrading** | **0.00%** |
+
+Zero to four decimal places, over 64 real expert matrices across four layers.
+And it is obvious in hindsight: **a scale only needs enough precision to place a
+256-level grid, and fp16's 11-bit mantissa is already three bits finer than the
+grid it defines.** The scale is not where the error is. The error is int8
+rounding itself, which is the one thing an int8 path cannot give back.
+
+So the bar is missed for a reason with no remaining lever, and `--int8` stays
+opt-in on its throughput case alone: **+17% decode, 98.767% agreement, and you
+decide whether that trade is yours to make.**
+
+```bash
+uv run python tools/scale_precision.py
 ```
 
 ## Stage 1e-3 — closed negative: the CPU and the link are the same wire
@@ -1037,7 +1105,8 @@ is a custom module and will need its own branch in `discover_moe()`.
 - **Stage 1d — pinning** *(done, and the largest single gain in the project: **+38% decode, p=0.003**, from a flag that already existed and defaulted to off. 19.5x the measured baseline. The fill path now runs at 98% of this card's pinned PCIe rate, so transfer optimisation is **finished** — see "Stage 1d" above.)*
 - **Stage 1e — move fewer bytes.** Transfer is still 60% of a decode token, so eliminating it would be +150%, and every way of moving the same bytes *faster* is now exhausted.
   - **1e-1 — eviction policy** *(**closed negative**. Four candidates ranked offline on 147k decode lookups across 18 documents; the best beats LRU by 1.9 points, or +2.6% predicted — inside the harness's own noise. Nothing shipped. The useful finding is the conversion rate: Belady's 21.4-point gap is worth exactly 1.8x the cache, and capacity is purchasable where prophecy is not. See "Stage 1e" above.)*
-  - **1e-2 — quantised experts** *(**built and measured; throughput real, accuracy short of the bar**. int8 rows with the scales packed on the end, dequant inside `cache.gather()`, bit-exact against the stock block. Decode **+17% at 238 slots, p=0.003** — but the +42% prediction assumed 357 slots and 357 measures +8%, so spending the savings on capacity is not what pays and the curve is not monotonic. Agreement replicates at **98.76% ± 0.15%**, below the 99% bar; the 99.13% that qualified the stage was one draw at a 0.31% standard error. The grouped path's own nondeterminism is 0.28 points, a quarter of the gap. Open: fp32 scales, the one untried lever that could recover the bar. See "Stage 1e-2" above.)*
+  - **1e-2 — quantised experts** *(**built and measured; throughput real, accuracy short of the bar**. int8 rows with the scales packed on the end, dequant inside `cache.gather()`, bit-exact against the stock block. Decode **+17% at 238 slots, p=0.003** — but the +42% prediction assumed 357 slots and 357 measures +8%, so spending the savings on capacity is not what pays and the curve is not monotonic. Agreement replicates at **98.76% ± 0.15%**, below the 99% bar; the 99.13% that qualified the stage was one draw at a 0.31% standard error. See "Stage 1e-2" above.)*
+  - **1e-2b — make the bar measurable** *(**done, and the verdict now stands at 3.3σ**. The 99% bar had been applied with an instrument that could not resolve it: agreement was scored on the grouped path, whose `index_add_` nondeterminism is a **0.411-point** floor against a 0.233-point gap, and on the built-in 24-prompt starter set rather than the 512-token corpus already in the repo — `DIVERGENCE_DOCS = 48` was silently truncated to 24, so n was 2,545, not the 5,300 its own comment claimed. Fixed both: loop path, real corpus, **24,576 positions**, with a floor control that reads exactly **100.000%**. int8 scores **98.767% ± 0.070%, failing by 0.233 points**. The point estimate moved by 0.007 — the old conclusion was right and unjustified. **fp32 scales closed negative** in three minutes with no GPU: they remove **0.00%** of the weight error, because fp16's mantissa is already three bits finer than the 256-level grid it scales. No lever remains. See "Stage 1e-2b" above.)*
   - **1e-3 — Q7's CPU path** *(**closed negative**, and qualified in two minutes with no runtime code. Q7's m\* = 10.8 does put every decode expert on the CPU's side, but near-parity means the win had to come from running both channels at once — and they are not two channels. CPU cores and the DMA engine both read expert weights out of host DRAM: overlap efficiency **η = 0.70 at best**, with the *link* absorbing the loss (40–52% of its solo rate, against the CPU's 78–94%). Best predicted gain **+7%** against a pre-committed +15% bar. int8 makes it worse — dequantising for a CPU GEMM runs 4.4x slower than reading fp32. See "Stage 1e-3" above.)*
   - **1e-4 — prefill streaming** *(**closed negative**, and the most instructive failure in the project: the mechanism worked perfectly and the premise was wrong. Fetching the next layer's whole expert set on the side stream takes prefill's hit rate 7.1% → **95.0%** and its blocking fill 78.1% → **3.0%** — the stall is gone — and prefill still drops **−25% (p=0.011)**, because a prefill layer routes to **41.4** of 64 experts, not "nearly all", so fetch-all moves 1.58x the bytes. Stage 1c's arithmetic, reproduced by its own author three stages later. Kept, off, bit-exact. See "Stage 1e-4" above.)*
 - **Stage 2** — Triton kernels: fused gather-GEMM, dequant, fused router. *Needs sm_80+.*

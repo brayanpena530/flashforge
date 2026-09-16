@@ -44,7 +44,6 @@ from flashforge.cli import (  # noqa: E402
     _permutation_p,
     _run_phase,
     _setup_logging,
-    _teacher_forced,
 )
 from flashforge.models import DEFAULT_MODEL, load_model  # noqa: E402
 from flashforge.runtime import ExpertCache, QuantSpec, install_expert_cache  # noqa: E402
@@ -55,12 +54,20 @@ REPEATS = 9
 WARMUP = 1
 PIN_GB = 7.0
 
-# 48, not 12. The first pass scored 98.72% against a 99% bar at n=1,327, where
-# the binomial standard error is 0.31% — so "fails" and "passes" were within
-# half a standard error of each other and the reading was a coin flip. 48
-# documents put n near 5,300 and the SE near 0.15%, which is the resolution the
-# decision actually needs. troubleshoot.md 4.8 is the rule this implements.
-DIVERGENCE_DOCS = 48
+# Accuracy is no longer measured here. It was, and the reading was not
+# resolvable: this tool scored on the *grouped* path, whose `index_add_` has no
+# defined summation order, so two runs of identical arithmetic disagreed by 0.41
+# points — nearly twice the 0.233-point gap to the bar. And `DIVERGENCE_DOCS`
+# was set to 48 to push n to ~5,300, which it never did, because
+# `_corpus_input_ids` reads the built-in 24-prompt starter set and a slice of a
+# short list is silently short. n was 2,545.
+#
+# `tools/int8_accuracy.py` fixes both — loop path, real 512-token corpus, 24,576
+# positions, a floor control that reads exactly 100.000% — and settles it:
+# **98.767% +/- 0.070%, failing the 99% bar by 0.233 points at 3.3 sigma**.
+# Capacity cannot change that number, so there is nothing for a capacity sweep
+# to add. This tool keeps the question it can answer: throughput.
+DIVERGENCE_DOCS = 0
 
 # 238 fp16 slots is 3.0 GB, the shipping operating point. The int8 ladder exists
 # because the first measurement inverted the premise of the stage: 357 int8
@@ -72,12 +79,8 @@ DIVERGENCE_DOCS = 48
 # capacity and find the cliff rather than assuming either endpoint.
 FP16_SLOTS = 238
 INT8_SLOTS = (200, 238, 270, 300, 330, 357)
-# Capacity cannot change the arithmetic — the same weights are read either way —
-# so the logits are collected at one int8 capacity only. It is collected twice
-# at that capacity, because the grouped path's `index_add_` has no defined
-# atomic ordering and the two 12-document arms above disagreed by 0.08 points
-# for that reason alone. A bar cannot be applied without knowing that floor.
-SCORED_SLOTS = 238
+# `None` disables logit collection entirely; see the note on DIVERGENCE_DOCS.
+SCORED_SLOTS = None
 SPEC = QuantSpec(projections=("gate_proj", "up_proj"), group_size=0)
 
 
@@ -168,7 +171,7 @@ def main() -> int:
     )
     print(report.describe())
 
-    rows = [_arm(model, report, report.cache, input_ids, corpus, "fp16", score=True)]
+    rows = [_arm(model, report, report.cache, input_ids, corpus, "fp16")]
     print(f"  fp16 {rows[0]['decode_tok_s']:.2f} tok/s, "
           f"hit {rows[0]['hit_rate']:.1%}, {rows[0]['gb_per_token']:.3f} GB/token, "
           f"{rows[0]['vram_free_gb']:.2f} GB VRAM free")
@@ -211,7 +214,6 @@ def main() -> int:
             label = f"int8-{slots}" + ("'" if attempt else "")
             row = _arm(
                 model, report, cache, input_ids, corpus, label,
-                score=slots == SCORED_SLOTS,
             )
             rows.append(row)
             print(f"  {label}: {row['decode_tok_s']:.2f} tok/s, "
@@ -246,20 +248,10 @@ def main() -> int:
         print(f"[int8] {row['label']:>10}: {base['decode_tok_s']:.2f} -> "
               f"{row['decode_tok_s']:.2f} tok/s, {change:+5.0%}. {verdict}")
 
-    # Accuracy last and once, because capacity cannot change it. Printed with
-    # its own sampling error, so the bar is compared against a number whose
-    # resolution is stated rather than assumed.
-    print()
-    scored_rows = [r for r in rows[1:] if r["logits"]]
-    for row in scored_rows:
-        print(f"[bar]  {row['label']:>10}: "
-              f"{_teacher_forced(base['logits'], row['logits'])}")
-    if len(scored_rows) > 1:
-        # Two arms of identical arithmetic. Whatever they disagree by is the
-        # floor below which no agreement difference means anything.
-        print(f"[floor]            : {_teacher_forced(*[r['logits'] for r in scored_rows[:2]])}")
-        print("       ^ same weights, same capacity, twice. This is the grouped "
-              "path's own nondeterminism, not quantisation.")
+    print("\n[bar]  accuracy is not measured here. Run "
+          "tools/int8_accuracy.py — it scores on the deterministic loop path "
+          "against the 512-token corpus, where the instrument's own floor is "
+          "exactly 100.000% and the answer is 98.767% +/- 0.070%.")
     return 0
 
 

@@ -290,21 +290,39 @@ pair refuses every easy explanation: identical bytes per token, identical fill
 time, 18% different throughput. 26 ms/token goes somewhere that is neither
 transfer nor cache behaviour. That is an open question, not a mechanism.
 
-**The accuracy claim did not replicate.** At 48 documents, n=2,545 per arm:
+**The accuracy claim did not replicate, and then the instrument was rebuilt.**
+The bar was read three times as 99.13%, 98.82% and 98.70% — not a drifting
+quantity, but one measured with a ruler coarser than itself. Two independent
+faults, each at least as large as the 0.233-point gap being measured:
 
-    int8 gate+up              98.82% +/- 0.21%   KL 0.00127
-    int8 gate+up (again)      98.70% +/- 0.22%   KL 0.00126
-    same weights, twice       99.72% +/- 0.10%   KL 0.00024
+* scoring ran on the *grouped* path, whose `index_add_` accumulates over
+  colliding indices in no defined order, so identical weights scored twice
+  disagree by 0.411 points;
+* the corpus was the built-in 24-prompt starter set, not the 512-token corpus
+  `tools/make_corpus.py` writes. `DIVERGENCE_DOCS = 48` was silently truncated
+  to 24 by a list slice, so n was 2,545 rather than the 5,300 it assumed.
 
-Combined, 98.76% +/- 0.15% against the 99% bar. The 99.13% that qualified this
-stage was one draw at n=1,727, where the standard error is 0.31% — it was never
-distinguishable from the number that replaced it, and troubleshoot.md 4.8 says
-so in a section written before this measurement existed.
+Both fixed in `tools/int8_accuracy.py` — the loop path, which reproduces
+bit-exactly, and 48 real documents at a 512-token window:
 
-The last row is the finding worth keeping. Two runs of *identical* arithmetic
-agree only to 99.72%: the grouped path's `index_add_` has no defined atomic
-ordering, and that alone eats a quarter of the gap between int8 and the bar.
-No agreement claim tighter than 0.28 points is measurable on this path.
+    int8 gate+up vs fp16     98.767% +/- 0.070%   KL 0.00029   n = 24,576
+    control: loop, twice    100.000% +/- 0.000%                n = 24,576
+    control: grouped, twice  99.589% +/- 0.041%                n = 24,576
+
+**FAILS the 99% bar by 0.233 points, at 3.3 sigma.** The first control is what
+licenses the row above it: the loop path contributes exactly zero noise, so that
+number is sampling error and nothing else.
+
+The point estimate moved by 0.007 points. The old conclusion was right and
+unjustified, which is the hardest way to be wrong, because nothing downstream
+ever contradicts it. See troubleshoot.md 4.12.
+
+**fp32 scales are closed negative**, and that closes the stage. They were on
+record as the one untried lever that could recover the bar; quantising real
+expert matrices both ways removes **0.00%** of the 0.8886% relative RMS weight
+error. A scale only needs the precision to place a 256-level grid, and fp16's
+11-bit mantissa is already three bits finer than the grid it defines. The
+shortfall is int8 rounding itself, which an int8 path cannot give back.
 """
 
 from __future__ import annotations

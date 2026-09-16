@@ -527,6 +527,10 @@ gap between int8 and a 99% bar is the harness talking to itself. A control drawn
 from shipping code (loop vs grouped, 99.42%) and a null control drawn from
 *identical* code are different instruments and you want both.
 
+That corollary then drew the wrong conclusion from its own reading — "no
+agreement claim tighter than 0.28 points is measurable on this path at all."
+True of that path, and the path was a choice. See 4.12.
+
 **Corollary:** prefer the low-variance statistic for detecting change and the
 interpretable one for deciding. KL moved cleanly and monotonically with weight
 error across every variant; top-1 agreement is what anyone actually cares about
@@ -633,6 +637,56 @@ gets defeated by a wrong input, not by being forgotten, so the check that has
 teeth is on the input: **the number that exempts you from a known rule is the
 one to measure first.**
 
+### 4.12 A noise floor you can name is usually one you can remove
+
+4.8 measured the harness's own floor — the same weights scored twice through the
+grouped path agree to only 99.72% — and then treated it as a fact about the
+world: "no agreement claim tighter than 0.28 points is measurable on this path at
+all." The sentence is true and the conclusion drawn from it was wrong, because
+*this path* was a variable. The floor exists because the grouped accumulator
+calls `index_add_` once over colliding indices and CUDA fixes no summation
+order. The loop path, sitting in the same file, shipping, tested to bit-exactness
+since Stage 1, calls `index_add_` once per expert over indices that cannot
+collide. It reproduces **exactly**: 100.000% over 24,576 positions.
+
+Timing needs the grouped path; scoring never did. Two questions had been handed
+to one configuration because one configuration was what the tool already built.
+
+The sample size was wrong in a quieter way, and the mechanism deserves its own
+name. `int8_ab.py` set `DIVERGENCE_DOCS = 48`, with a comment explaining that 48
+puts n near 5,300 and the standard error near 0.15%, "which is the resolution the
+decision actually needs." It never got 48 documents. The corpus loader ends in
+`interleaved[:count]`, the built-in prompt set has 24 entries, and a slice of a
+short list is silently short. n was 2,545, the SE was 0.22%, and the README
+reported "48 documents". Meanwhile `tools/make_corpus.py` — 48 documents of
+529–1,704 tokens, already in the repo, written for Stage 0 — went unused.
+Measured properly it is 24,576 positions and an SE of **0.070%**.
+
+The verdict did not change: 98.76% → 98.767%, still a miss. That is the part to
+sit with. Being right is not evidence the instrument worked, and a correct
+conclusion drawn through a broken instrument is the hardest kind to catch,
+because nothing downstream ever contradicts it.
+
+**Rule:** when you measure a resolution limit, ask what *in your own code* sets
+it before you accept it as a bound. A nondeterministic accumulator, a truncated
+corpus, and a default argument are all limits you own. State the floor and the
+sampling error as separate numbers, and do not publish a margin smaller than
+either.
+
+**Corollary:** a slice is not a request; it is a ceiling that agrees with you.
+Anywhere you ask for `n` of something and the API can return fewer, either
+assert or warn — and print the `n` you actually got next to every statistic
+computed from it. `_corpus_input_ids` now warns.
+
+**Corollary:** before building the lever that might close a gap, compute its
+ceiling. fp32 scales were recorded as "the one untried lever that could recover
+the bar" for four commits. Reading real weights out of the safetensors shards
+and quantising them both ways took three minutes, no GPU, no checkpoint load,
+and returned **0.00%** — a scale only needs enough precision to place a 256-level
+grid, and fp16's mantissa is already three bits finer than the grid it defines.
+The lever could never have moved anything. Cost of measuring: three minutes.
+Cost of building first: a day, and a docstring claiming a mechanism.
+
 ---
 
 ## Checklist before publishing a number
@@ -649,3 +703,8 @@ one to measure first.**
    cover both places it can now be?
 9. Is every row in this table from its own invocation, or did a sweep hand you
    row three on a machine that row one had already used up?
+10. Is the margin you are claiming larger than *both* the sampling error and the
+    harness's own null-control floor — and did you check whether a different
+    path in your own code removes that floor entirely?
+11. Did you get the `n` you asked for? Print it; a slice returns fewer without
+    saying so.
